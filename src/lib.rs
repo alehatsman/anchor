@@ -4,6 +4,8 @@
 //! forward-only migrations, the session store, and a unix socket that answers
 //! `ping`. No PTY layer yet — that is M1.
 
+pub mod client;
+pub mod daemon;
 pub mod db;
 pub mod log;
 pub mod model;
@@ -14,6 +16,7 @@ pub mod server;
 pub mod session;
 pub mod store;
 pub mod stream;
+pub mod tty;
 
 /// Milliseconds since the unix epoch.
 ///

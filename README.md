@@ -22,7 +22,7 @@ noticed. That is the entire pitch.
 
 ## Status
 
-**M2 — labels and query.** `anchord` owns real PTY sessions: four threads
+**M3 — the socket protocol and the CLI.** `anchord` owns real PTY sessions: four threads
 each, an append-only output log addressable by byte offset, many bounded
 subscribers with backpressure, a control lease, and termination that reaps a
 child ignoring SIGHUP and SIGTERM. Ported from teleport along with its test
@@ -30,13 +30,23 @@ suite, which is the point — those fixtures are the behavioural spec.
 
 Labels are queryable: filter sessions by exact match on any key, which is
 the capability that moved this boundary out of teleport in the first place.
-The socket still answers only `ping` — nothing drives a session over the
-wire yet (M3). See
+The socket speaks the full control protocol, and `anchor` drives it:
+
+```sh
+anchor create --label wm.item=mr:218 -- claude
+anchor ls --label wm.item=mr:218
+anchor attach <id>          # raw passthrough, ~. to detach
+anchor logs <id> --from 0
+anchor kill <id>
+```
+
+Close the terminal, reconnect from another one, and the process never
+noticed. See
 [ROADMAP.md](ROADMAP.md), [docs/](docs/) and the open issues.
 
 ```sh
-cargo test          # 65: ported PTY/log/session fixtures, labels, store, socket
-cargo run --bin anchord
+cargo test          # 83: ported fixtures, protocol, CLI, restart recovery
+cargo run --bin anchord   # or: anchor daemon
 ```
 
 It is being extracted from [teleport](https://github.com/alehatsman/teleport),
