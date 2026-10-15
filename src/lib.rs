@@ -11,6 +11,7 @@ pub mod paths;
 pub mod proto;
 pub mod pty;
 pub mod server;
+pub mod session;
 pub mod store;
 
 /// Milliseconds since the unix epoch.
