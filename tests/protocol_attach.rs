@@ -365,3 +365,46 @@ async fn a_lease_frame_claims_control_and_the_loser_is_told() {
 
     setup.call("terminate", json!({ "session": &id }));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_frame_that_does_not_claim_changes_nothing() {
+    let (_dir, socket) = harness();
+    let mut setup = Conn::connect(&socket);
+    let id = create_shell(&mut setup);
+
+    let mut holder = Conn::connect(&socket);
+    holder.call(
+        "attach",
+        json!({ "session": &id, "from": 0, "control": true }),
+    );
+    assert_eq!(holder.frame().2, vec![1]);
+
+    let mut observer = Conn::connect(&socket);
+    observer.call("attach", json!({ "session": &id, "from": 0 }));
+    assert_eq!(observer.frame().2, vec![0]);
+    holder.read_until("ready");
+    observer.read_until("ready");
+
+    // Payload 0 is not a claim. Treating any lease frame as one would hand
+    // control to a client that asked for the opposite.
+    observer
+        .writer
+        .write_all(&frame::encode(frame::LEASE, 0, &[0]))
+        .unwrap();
+    observer.writer.flush().unwrap();
+
+    // The holder still holds it: its input still reaches the PTY, and the
+    // observer's still does not.
+    holder.send_input(b"still-mine\n");
+    holder.read_until("still-mine");
+
+    observer.send_input(b"not-yours\n");
+    holder.send_input(b"marker\n");
+    let seen = holder.read_until("marker");
+    assert!(
+        !seen.windows(9).any(|w| w == b"not-yours"),
+        "a lease frame with payload 0 must not grant control"
+    );
+
+    setup.call("terminate", json!({ "session": &id }));
+}

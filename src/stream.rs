@@ -74,6 +74,12 @@ pub async fn serve_attached(
 ) -> Result<()> {
     // Tell the client where it stands on the lease before any output, so it
     // never has to guess whether its keystrokes will be accepted.
+    // Subscribed before anything is announced. Subscribing after the
+    // attach's own lease decision leaves a gap in which another client's
+    // claim is never seen, and this connection goes on believing it may
+    // type — the one thing the lease exists to prevent.
+    let lease_changes = session.watch_lease();
+
     let holds_control = control_epoch.is_some();
     write_frame(&mut out, frame::LEASE, 0, &[u8::from(holds_control)]).await?;
 
@@ -107,7 +113,7 @@ pub async fn serve_attached(
     // there is no write to fail, so nothing would notice until the next
     // chunk — and the lease would stay held on a dead connection until then.
     let result = tokio::select! {
-        result = pump_output(&mut out, &session, from, &holder, &epoch) => result,
+        result = pump_output(&mut out, &session, from, &holder, &epoch, lease_changes) => result,
         _ = &mut input_task => Ok(()),
     };
     input_task.abort();
@@ -121,8 +127,8 @@ async fn pump_output(
     from: u64,
     holder: &str,
     epoch: &Arc<parking_lot::Mutex<Option<u64>>>,
+    mut lease_changes: tokio::sync::broadcast::Receiver<String>,
 ) -> Result<()> {
-    let mut lease_changes = session.watch_lease();
     let replay = session.attach(from).context("beginning the attach")?;
 
     // Catch up in bounded rounds. Each round is written to the client before
@@ -165,12 +171,29 @@ async fn pump_output(
                 // The lease moved. Tell this connection where it now
                 // stands, so a preempted client stops typing into a void
                 // and a bystander learns control is taken.
-                if let Ok(new_holder) = change {
-                    let mine = new_holder == holder;
-                    if !mine {
-                        *epoch.lock() = None;
+                match change {
+                    Ok(new_holder) => {
+                        let mine = new_holder == holder;
+                        if !mine {
+                            *epoch.lock() = None;
+                        }
+                        write_frame(out, frame::LEASE, 0, &[u8::from(mine)]).await?;
                     }
-                    write_frame(out, frame::LEASE, 0, &[u8::from(mine)]).await?;
+                    // Lagged past a change. The authoritative answer is the
+                    // lease itself, so re-read it rather than assume the
+                    // missed message did not matter: assuming is how a
+                    // preempted client keeps typing into a void.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let mine = epoch
+                            .lock()
+                            .is_some_and(|e| session.is_controller(holder, e));
+                        if !mine {
+                            *epoch.lock() = None;
+                        }
+                        write_frame(out, frame::LEASE, 0, &[u8::from(mine)]).await?;
+                    }
+                    // The session is tearing down; the other arms notice.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                 }
             },
             () = session.wait_exited() => {
@@ -259,8 +282,15 @@ async fn pump_input(
         // from a holder that has it. Attach never preempts — this is the
         // explicit act that does, which is why it is a separate request
         // rather than a flag on attach.
+        //
+        // The payload is checked, not assumed: docs/04-protocol.md defines
+        // `1` as the claim, and a daemon that treats every lease frame as
+        // one would hand control to a client that sent `0` meaning the
+        // opposite — or to a future frame this build does not understand.
         if tag == frame::LEASE {
-            *epoch.lock() = Some(session.claim_control(&holder));
+            if payload.first() == Some(&1) {
+                *epoch.lock() = Some(session.claim_control(&holder));
+            }
             continue;
         }
         if tag != frame::INPUT {

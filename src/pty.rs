@@ -236,6 +236,10 @@ pub fn spawn(
     let pid = child.process_id();
     let killer = child.clone_killer();
 
+    // From here until every thread is running, a failure would leave the
+    // child alive with nothing watching it. See `OrphanGuard`.
+    let orphan_guard = OrphanGuard { pid, armed: true };
+
     let reader = pair.master.try_clone_reader().context("clone pty reader")?;
     let writer = pair.master.take_writer().context("take pty writer")?;
 
@@ -270,6 +274,10 @@ pub fn spawn(
             move || control_thread_main(pair.master, pid, killer, &control_rx, &exit_tx, &state)
         })
         .context("spawning control thread")?;
+
+    // Every thread is up: the session can now be terminated through its own
+    // control path, so the guard stands down.
+    orphan_guard.disarm();
 
     Ok(SpawnedSession {
         session: PtySession {
@@ -539,5 +547,38 @@ fn pty_exit_from_wait(result: IoResult<ExitStatus>) -> PtyExit {
             status: None,
             lost_reason: Some(LostReason::WaitError),
         },
+    }
+}
+
+/// Kills a freshly spawned child if `spawn` cannot finish wiring it up.
+///
+/// Spawning the process and starting the threads that own it are not one
+/// atomic act, and everything between them can fail — cloning the master,
+/// or any of the four threads under memory or thread pressure. The child is
+/// already running by then, and nothing else holds a reference to it: no
+/// reaper to collect it, no control thread to signal it, no handle to find
+/// it by. It would outlive the daemon as an orphan holding a PTY.
+struct OrphanGuard {
+    pid: Option<u32>,
+    armed: bool,
+}
+
+impl OrphanGuard {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OrphanGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The whole group, as the termination policy does: the child leads
+        // it, so anything it already started goes with it.
+        match hard_kill_group(self.pid) {
+            Ok(()) => warn!(pid = ?self.pid, "killed a child whose session could not be started"),
+            Err(e) => warn!(pid = ?self.pid, error = %e, "killing a half-spawned child failed"),
+        }
     }
 }
