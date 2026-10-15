@@ -297,3 +297,40 @@ async fn an_oversized_line_is_answered_then_the_connection_is_closed() {
          desynchronised; got {rest:?}"
     );
 }
+
+/// A socket path too long to fit a unix address says so.
+///
+/// The kernel answers `EINVAL`, which carries no hint that length is the
+/// problem -- it reads as "that path is wrong" and sends you inspecting
+/// the directory rather than counting characters. The limit is 104 bytes
+/// on macOS and easy to cross by accident: a data dir under a long home,
+/// or a temp dir in a test, is most of the budget. Every CLI test in this
+/// repo already works around it by hand.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_socket_path_too_long_to_bind_is_named_as_too_long() {
+    let dir = tempfile::tempdir().unwrap();
+    // Nested until the path is certainly past the limit, whatever the
+    // temp dir's own length happens to be.
+    let mut path = dir.path().to_path_buf();
+    while path.as_os_str().len() <= 103 {
+        path.push("nested-directory-name");
+    }
+    std::fs::create_dir_all(&path).unwrap();
+    let socket = path.join("anchor.sock");
+
+    let err = anchor::server::bind(&socket).unwrap_err().to_string();
+    assert!(
+        err.contains("past the") && err.contains("limit"),
+        "expected the length to be named as the problem, got: {err}"
+    );
+}
+
+/// And a path that fits still binds, so the check cannot be a blanket
+/// refusal that happens to pass the test above.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_short_socket_path_still_binds() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("s.sock");
+    assert!(socket.as_os_str().len() <= 103, "the fixture itself is too long");
+    anchor::server::bind(&socket).expect("a short path must bind");
+}

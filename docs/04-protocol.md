@@ -254,6 +254,12 @@ anchor service install|uninstall|status
                                   service manager (07-lifecycle.md)
 ```
 
+A successful `terminate` reply means the child is dead **and** the exit is
+recorded: the reported `state` is always terminal, and a `purge` sent
+immediately after it will not be refused as still-running. The two are
+written by different threads, so the reply waits for the second — without
+it the obvious terminate-then-purge sequence races against itself.
+
 `attach` restores the terminal on the way out, including when it is
 **signalled** rather than exited — `SIGTERM` and `SIGHUP` restore the saved
 attributes and then re-raise, so the process still looks killed to whatever

@@ -52,7 +52,27 @@ const MAX_LINE_BYTES: u64 = 1024 * 1024;
 ///
 /// A socket file left behind by a dead daemon is stale: nothing accepts on
 /// it, so it is removed and rebound.
+/// The usable length of `sockaddr_un.sun_path`, minus the NUL.
+///
+/// 104 on macOS and the BSDs, 108 on Linux; the smaller is used on both
+/// because a daemon that starts here and not there is worse than one that
+/// gives the same answer everywhere.
+const MAX_SOCKET_PATH: usize = 103;
+
 pub fn bind(socket_path: &Path) -> Result<StdUnixListener> {
+    // Checked before anything else, because the kernel's own answer is
+    // `EINVAL` with no mention of length -- which reads as "the path is
+    // wrong" rather than "the path is too long", and sends you looking at
+    // the wrong half of it. The limit is small enough to hit by accident:
+    // a data dir under a long home or a temp dir is most of the budget.
+    let len = socket_path.as_os_str().as_encoded_bytes().len();
+    if len > MAX_SOCKET_PATH {
+        bail!(
+            "socket path is {len} bytes, past the {MAX_SOCKET_PATH}-byte limit              a unix socket address can hold: {}. Use a shorter directory              (XDG_RUNTIME_DIR, or --socket).",
+            socket_path.display()
+        );
+    }
+
     if socket_path.exists() {
         match std::os::unix::net::UnixStream::connect(socket_path) {
             // Someone is listening. Never remove it.
@@ -542,6 +562,20 @@ async fn op_terminate(id: u64, line: &str, state: &State) -> Value {
     let terminating = Arc::clone(&session);
     let result = tokio::task::spawn_blocking(move || terminating.terminate()).await;
 
+    // `terminate` returns once the child is reaped, but the session's
+    // recorded state is written by the thread draining the pty's exit
+    // channel -- a different thread, with nothing ordering the two. Replying
+    // before it lands means answering `"state": "closing"` to a successful
+    // terminate, and, worse, refusing the `purge` that a client sends next:
+    // `forget` requires a terminal state, so the obvious sequence races.
+    //
+    // The child is already dead here, so this is a wait for a store to
+    // catch up, not for a process. Bounded anyway: a reply that is merely
+    // stale beats one that never comes.
+    if result.is_ok() {
+        let _ = tokio::time::timeout(TERMINATE_SETTLE, session.wait_exited()).await;
+    }
+
     // Idempotent, including against an already-exited session.
     match result {
         Ok(Ok(())) => proto::ok(
@@ -571,6 +605,11 @@ struct LogReq {
 fn default_log_max() -> u64 {
     64 * 1024
 }
+
+/// How long `terminate` waits for the exit it already caused to be
+/// recorded. Not a wait for the child -- that has been reaped by this
+/// point -- only for the thread that writes the state to run.
+const TERMINATE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Hard ceiling on one `log` response whatever `max` asks for: the range is
 /// buffered whole into a JSON response, so it cannot be unbounded. Streaming

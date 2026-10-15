@@ -572,3 +572,46 @@ async fn an_oversized_log_range_is_clamped_not_refused() {
 
     client.call("terminate", json!({ "session": &id }));
 }
+
+/// Terminate, then purge, with nothing in between.
+///
+/// `terminate` returns once the child is reaped, but the session's state
+/// is written by the thread draining the pty's exit channel -- a different
+/// thread, with nothing ordering the two. A reply sent before that landed
+/// said `"state": "closing"` for a successful terminate, and refused the
+/// `purge` a client sends next, because `forget` requires a terminal
+/// state. The obvious two-call sequence raced against itself.
+///
+/// Honest about what this proves: it is a regression guard, not a
+/// reproduction. With the wait removed it still passes, because the exit
+/// is already in the channel by the time `terminate` returns and the
+/// writing thread almost always gets scheduled first. The ordering gap is
+/// real by construction and the fix closes it by construction; this test
+/// catches the gross regression -- a reply that reports `closing`, or a
+/// purge refused outright -- not the narrow interleaving.
+///
+/// Found from the client side by teleport, whose purge does exactly this
+/// with no wait between the two calls.
+#[tokio::test(flavor = "multi_thread")]
+async fn terminate_then_purge_never_races() {
+    let setup = harness();
+    let mut client = Client::connect(&setup.socket);
+
+    for round in 0..15 {
+        let id = create_echo(&mut client, "ready", json!({}));
+        wait_for_output(&mut client, &id, "ready");
+
+        let ended = client.call("terminate", json!({ "session": &id }));
+        assert_eq!(ended["ok"], true, "round {round}: {ended}");
+        assert!(
+            ["exited", "lost"].contains(&ended["state"].as_str().unwrap_or("")),
+            "round {round}: terminate reported a non-terminal state: {ended}"
+        );
+
+        let purged = client.call("purge", json!({ "session": &id }));
+        assert_eq!(
+            purged["ok"], true,
+            "round {round}: purge lost the race with terminate: {purged}"
+        );
+    }
+}

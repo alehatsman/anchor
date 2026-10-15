@@ -356,15 +356,29 @@ impl Session {
     }
 
     /// A point-in-time row for the store and the wire.
+    ///
+    /// Each lock is taken and released in turn, never nested. The fan-out
+    /// mutex is held across the blocking publish on the PTY reader thread,
+    /// so reaching for it while holding `runtime` made every `get` and
+    /// `list` able to block the reaper's state write behind a busy
+    /// session's output. Un-nesting also means no lock order exists to get
+    /// wrong later: the deadlock this would otherwise invite needs only
+    /// one future caller that takes them the other way round.
+    ///
+    /// The cost is that the row is assembled from three instants rather
+    /// than one. That was never a real guarantee -- `output_bytes` is
+    /// stale the moment the session writes again -- and nothing reads a
+    /// snapshot expecting its fields to agree to the byte.
     pub fn snapshot(&self) -> crate::model::Session {
-        let runtime = self.runtime.lock();
         let (output_bytes, log_capped_at) = {
             let fanout = self.fanout.lock();
             (fanout.log.next_offset(), fanout.log.log_capped_at())
         };
+        let labels = self.labels.lock().clone();
+        let runtime = self.runtime.lock();
         crate::model::Session {
             id: self.id.clone(),
-            labels: self.labels.lock().clone(),
+            labels,
             spec: self.spec.clone(),
             state: runtime.state,
             pid: self.pid,
