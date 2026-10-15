@@ -88,7 +88,15 @@ async fn resizes_are_coalesced_and_the_last_one_wins() {
 
     // Once the window closes the latest pending size is applied — not
     // dropped, which would leave the terminal at the wrong width.
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    //
+    // Polled rather than slept at: a flat wait asserts that the coalescing
+    // window closed faster than the sleep, which on a loaded machine is a
+    // claim about the machine. The deadline is generous and the assertion
+    // after it is the one that reports the real failure.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.size() != (140, 30) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(session.size(), (140, 30), "the last resize must win");
 
     session.terminate().unwrap();
