@@ -8,6 +8,7 @@ pub mod db;
 pub mod model;
 pub mod paths;
 pub mod proto;
+pub mod pty;
 pub mod server;
 pub mod store;
 
