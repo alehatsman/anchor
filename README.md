@@ -22,18 +22,20 @@ noticed. That is the entire pitch.
 
 ## Status
 
-**M1 — the PTY core is in.** `anchord` owns real PTY sessions: four threads
+**M2 — labels and query.** `anchord` owns real PTY sessions: four threads
 each, an append-only output log addressable by byte offset, many bounded
 subscribers with backpressure, a control lease, and termination that reaps a
 child ignoring SIGHUP and SIGTERM. Ported from teleport along with its test
 suite, which is the point — those fixtures are the behavioural spec.
 
-The socket still answers only `ping`. Labels are stored but not queryable
-(M2), and nothing drives a session over the wire yet (M3). See
+Labels are queryable: filter sessions by exact match on any key, which is
+the capability that moved this boundary out of teleport in the first place.
+The socket still answers only `ping` — nothing drives a session over the
+wire yet (M3). See
 [ROADMAP.md](ROADMAP.md), [docs/](docs/) and the open issues.
 
 ```sh
-cargo test          # 57: ported PTY/log/session fixtures, store, socket
+cargo test          # 65: ported PTY/log/session fixtures, labels, store, socket
 cargo run --bin anchord
 ```
 

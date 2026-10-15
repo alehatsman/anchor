@@ -148,11 +148,7 @@ impl Store {
     /// Replaces a session's labels wholesale, in one transaction.
     ///
     /// Validated by the caller — the store stores what it is given.
-    pub fn replace_labels(
-        &mut self,
-        id: &str,
-        labels: &BTreeMap<String, String>,
-    ) -> Result<()> {
+    pub fn replace_labels(&mut self, id: &str, labels: &BTreeMap<String, String>) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM labels WHERE session_id = ?1", [id])?;
         {

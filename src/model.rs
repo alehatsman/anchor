@@ -142,9 +142,7 @@ pub mod labels {
         KeyLength { key: String },
         #[error("label key {key:?} must match [a-z0-9_.-]")]
         KeyCharset { key: String },
-        #[error(
-            "label {key:?} has a value of {len} bytes (max {MAX_VALUE_BYTES})"
-        )]
+        #[error("label {key:?} has a value of {len} bytes (max {MAX_VALUE_BYTES})")]
         ValueLength { key: String, len: usize },
     }
 
@@ -152,7 +150,9 @@ pub mod labels {
     /// before labels are replaced, so an invalid set never reaches the store.
     pub fn validate(labels: &BTreeMap<String, String>) -> Result<(), InvalidLabel> {
         if labels.len() > MAX_PER_SESSION {
-            return Err(InvalidLabel::TooMany { count: labels.len() });
+            return Err(InvalidLabel::TooMany {
+                count: labels.len(),
+            });
         }
         for (key, value) in labels {
             validate_key(key)?;
@@ -170,13 +170,16 @@ pub mod labels {
     /// dependency for one pattern.
     pub fn validate_key(key: &str) -> Result<(), InvalidLabel> {
         if key.is_empty() || key.len() > MAX_KEY_LEN {
-            return Err(InvalidLabel::KeyLength { key: key.to_string() });
+            return Err(InvalidLabel::KeyLength {
+                key: key.to_string(),
+            });
         }
-        if !key
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-'))
-        {
-            return Err(InvalidLabel::KeyCharset { key: key.to_string() });
+        if !key.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+        }) {
+            return Err(InvalidLabel::KeyCharset {
+                key: key.to_string(),
+            });
         }
         Ok(())
     }

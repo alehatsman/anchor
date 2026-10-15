@@ -34,10 +34,14 @@ pub enum CreateError {
     ExecutableNotFound(String),
     #[error("too many sessions: {max} already running")]
     TooManySessions { max: usize },
+    #[error("invalid label: {0}")]
+    InvalidLabel(#[from] model::labels::InvalidLabel),
     #[error("opening the output log: {0}")]
     Log(#[from] anyhow::Error),
     #[error("spawning the child: {0}")]
     Spawn(#[source] anyhow::Error),
+    #[error("no such session")]
+    NotFound,
 }
 
 /// Holds every live session, plus everything a new one needs to exist.
@@ -132,6 +136,9 @@ impl SessionManager {
         if !resolve_executable(&spec.command, &spec.cwd, spec.login_shell) {
             return Err(CreateError::ExecutableNotFound(spec.command.clone()));
         }
+        // Checked before the log directory or the row exist, so a rejected
+        // label leaves nothing behind.
+        model::labels::validate(&labels)?;
 
         let id = model::new_session_id();
         let created_at = crate::now_ms();
@@ -248,6 +255,52 @@ impl SessionManager {
 
         self.sessions.lock().push(Arc::clone(&session));
         Ok(session)
+    }
+
+    /// Sets and removes labels on a live session, then persists the result.
+    ///
+    /// The whole set is validated after the edit is applied, not before: the
+    /// limits are properties of the resulting set, and a client that removes
+    /// one label while adding another must not be judged on the intermediate.
+    pub fn label(
+        &self,
+        id: &str,
+        set: BTreeMap<String, String>,
+        remove: &[String],
+    ) -> Result<BTreeMap<String, String>, CreateError> {
+        let session = self.get(id).ok_or(CreateError::NotFound)?;
+
+        let mut labels = session.labels.lock().clone();
+        for key in remove {
+            labels.remove(key);
+        }
+        labels.extend(set);
+        model::labels::validate(&labels)?;
+
+        session.set_labels(labels.clone());
+        if let Some(store) = &self.store {
+            let mut store = lock(store);
+            if let Err(e) = store.replace_labels(id, &labels) {
+                warn!(session = %id, error = %e, "persisting labels failed");
+            }
+        }
+        Ok(labels)
+    }
+
+    /// Live sessions whose labels match every pair in `filter`.
+    ///
+    /// The in-memory twin of [`Store::list_filtered`](crate::store::Store::list_filtered):
+    /// same AND-across-keys rule, against sessions this manager still holds.
+    pub fn list_filtered(&self, filter: &BTreeMap<String, String>) -> Vec<Arc<Session>> {
+        self.sessions
+            .lock()
+            .iter()
+            .filter(|s| {
+                let labels = s.labels.lock();
+                filter.iter().all(|(k, v)| labels.get(k) == Some(v))
+            })
+            .map(Arc::clone)
+            .collect()
     }
 
     /// One session by id, live or exited, until it is purged.
