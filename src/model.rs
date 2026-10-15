@@ -45,6 +45,11 @@ impl State {
         }
     }
 
+    /// True once the session can produce no more output.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, State::Exited | State::Lost)
+    }
+
     /// True while the daemon is expected to hold a live PTY for this session.
     /// These are the rows a restart turns into `lost`.
     pub fn is_live(self) -> bool {

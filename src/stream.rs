@@ -32,6 +32,30 @@ use crate::session::{ReplayStep, Session};
 /// avoids making the viewer reconnect to see the last line.
 const EXIT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
+/// Default for how long one frame write may take before the connection is
+/// closed.
+///
+/// The queue budget protects a *registered* subscriber, but it cannot help a
+/// client that stops reading during catch-up: there is no slot to drop yet,
+/// so the write simply blocks and the connection parks a task forever. The
+/// PTY is never affected — catch-up runs off the fan-out mutex — but a
+/// client that is not reading is not a client. Closing it is the same remedy
+/// backpressure applies, for the same reason: reconnect and replay.
+const WRITE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
+
+/// `WRITE_TIMEOUT_DEFAULT`, or `ANCHOR_WRITE_TIMEOUT_MS` when set.
+///
+/// An operator knob rather than a hidden constant: the right value depends
+/// on how slow the slowest legitimate client is, and a fixture needs a
+/// smaller one to prove the behaviour without waiting half a minute.
+fn write_timeout() -> Duration {
+    std::env::var("ANCHOR_WRITE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(WRITE_TIMEOUT_DEFAULT)
+}
+
 /// Serves one attached connection until it ends.
 ///
 /// `holder` identifies this connection for the control lease. One connection
@@ -113,14 +137,16 @@ async fn pump_output(out: &mut OwnedWriteHalf, session: &Arc<Session>, from: u64
     }
 
     let mut subscription = attach.subscription;
+    let mut exited = false;
     loop {
         tokio::select! {
             chunk = subscription.recv() => match chunk {
                 Some(chunk) => {
                     write_frame(out, frame::OUTPUT, chunk.offset, &chunk.bytes).await?;
                 }
-                // The fan-out is gone: the session is over and there is
-                // nothing left to drain.
+                // The subscription ended. Either the session is over, or
+                // this subscriber fell behind and was dropped — and those
+                // are not the same thing to tell a client.
                 None => break,
             },
             () = session.wait_exited() => {
@@ -130,9 +156,22 @@ async fn pump_output(out: &mut OwnedWriteHalf, session: &Arc<Session>, from: u64
                 while let Some(chunk) = subscription.try_recv() {
                     write_frame(out, frame::OUTPUT, chunk.offset, &chunk.bytes).await?;
                 }
+                exited = true;
                 break;
             }
         }
+    }
+
+    // A subscriber dropped for falling behind must not be told the session
+    // exited: it is still running, and an exit frame would send the client
+    // off to render a dead session instead of reconnecting from its last
+    // offset. Closing the connection is the whole message.
+    if !exited && !session.state().is_terminal() {
+        tracing::debug!(
+            session = %session.id,
+            "subscriber dropped for falling behind; closing without an exit frame"
+        );
+        return Ok(());
     }
 
     let snapshot = session.snapshot();
@@ -216,11 +255,17 @@ async fn pump_input(
 }
 
 async fn write_frame(out: &mut OwnedWriteHalf, tag: u8, offset: u64, payload: &[u8]) -> Result<()> {
-    out.write_all(&frame::encode(tag, offset, payload))
-        .await
-        .context("writing a frame")?;
-    out.flush().await.context("flushing a frame")?;
-    Ok(())
+    let frame = frame::encode(tag, offset, payload);
+    // Bounded: see WRITE_TIMEOUT. A client that is not draining its socket
+    // must not hold a task indefinitely.
+    let write = async {
+        out.write_all(&frame).await.context("writing a frame")?;
+        out.flush().await.context("flushing a frame")
+    };
+    match tokio::time::timeout(write_timeout(), write).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("the client stopped reading; closing the connection"),
+    }
 }
 
 /// Releases this connection's control lease when the connection ends.

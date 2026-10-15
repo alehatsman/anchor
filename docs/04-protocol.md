@@ -119,6 +119,18 @@ framing.
 Backpressure: if a subscriber's queue overflows, the daemon closes that
 connection. That is normal. Reconnect and replay.
 
+The connection is **closed, not sent `exit`**. A subscriber dropped for
+falling behind is watching a session that is still running, and an `exit`
+frame would send it off to render a dead session instead of reconnecting
+from its last offset. `exit` means the session ended, and nothing else.
+
+The queue budget only protects a client that has been *registered*. One that
+stops reading during catch-up has no slot to drop yet, so its write simply
+blocks — the PTY is unaffected, because catch-up runs off the fan-out mutex,
+but the connection would park a task indefinitely. A frame write is
+therefore bounded (30s, or `ANCHOR_WRITE_TIMEOUT_MS`), and a client that
+exceeds it is closed the same way and for the same reason.
+
 ## CLI
 
 A thin client over the same socket, for humans and scripts.
