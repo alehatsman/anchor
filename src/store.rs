@@ -93,6 +93,79 @@ impl Store {
         }
     }
 
+    /// Sessions whose labels match every pair in `filter`, newest first.
+    ///
+    /// Exact match on value, AND across keys — the filter narrows, it never
+    /// widens. An empty filter is every session, so this is the general form
+    /// of [`list`](Self::list).
+    ///
+    /// This is the query that replaces an orchestrator's side-table: a client
+    /// asks "which session is for X?" with the same labels it set.
+    pub fn list_filtered(&self, filter: &BTreeMap<String, String>) -> Result<Vec<Session>> {
+        if filter.is_empty() {
+            return self.list();
+        }
+
+        // One EXISTS per pair: a session matches only if every pair is
+        // present on it. Indexed by labels(key, value).
+        let clauses = (0..filter.len())
+            .map(|i| {
+                let k = i * 2 + 1;
+                format!(
+                    "EXISTS (SELECT 1 FROM labels l WHERE l.session_id = s.id \
+                     AND l.key = ?{} AND l.value = ?{})",
+                    k,
+                    k + 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+
+        let sql = format!(
+            "SELECT s.id, s.state, s.pid, s.exit_code, s.lost_reason, s.command, s.args_json,
+                    s.cwd, s.env_json, s.login_shell, s.cols, s.rows, s.spec_cols, s.spec_rows,
+                    s.output_bytes, s.log_capped_at, s.created_at, s.exited_at
+               FROM sessions s
+              WHERE {clauses}
+              ORDER BY s.id DESC"
+        );
+
+        let params: Vec<&dyn rusqlite::ToSql> = filter
+            .iter()
+            .flat_map(|(k, v)| [k as &dyn rusqlite::ToSql, v as &dyn rusqlite::ToSql])
+            .collect();
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut sessions = stmt
+            .query_map(params.as_slice(), session_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for session in &mut sessions {
+            session.labels = self.labels_for(&session.id)?;
+        }
+        Ok(sessions)
+    }
+
+    /// Replaces a session's labels wholesale, in one transaction.
+    ///
+    /// Validated by the caller — the store stores what it is given.
+    pub fn replace_labels(
+        &mut self,
+        id: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM labels WHERE session_id = ?1", [id])?;
+        {
+            let mut stmt =
+                tx.prepare("INSERT INTO labels (session_id, key, value) VALUES (?1, ?2, ?3)")?;
+            for (key, value) in labels {
+                stmt.execute(rusqlite::params![id, key, value])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// All sessions, newest first. ULIDs sort by creation time.
     pub fn list(&self) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
