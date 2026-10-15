@@ -7,9 +7,10 @@
 
 #![cfg(unix)]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anchor::client::Client;
@@ -68,18 +69,27 @@ impl Drop for Daemon {
     }
 }
 
-/// Runs `anchor attach`, sends `stdin_bytes` after `settle`, and returns
-/// its stdout once it exits — panicking if it outlives `timeout`, which is
+/// Runs `anchor attach`, waits until `await_marker` has actually appeared
+/// on its stdout, then sends `stdin_bytes` and returns everything it
+/// printed once it exits — panicking if it outlives `timeout`, which is
 /// the failure this is for.
 ///
-/// The delay matters: `~.` typed instantly detaches before any replay
-/// arrives, which is correct behaviour and tests nothing. Waiting first is
-/// what a person does, and what makes the replay assertion meaningful.
+/// The wait matters, and it must be on the output rather than on a clock:
+/// `~.` typed before any replay arrives detaches correctly and tests
+/// nothing, so a test that sleeps a fixed interval first is really
+/// asserting that the replay beat the sleep. Under a loaded suite it does
+/// not always, and the test fails claiming lost output when nothing was
+/// lost.
+///
+/// Waiting for the marker keeps both directions honest. If the handover
+/// really does drop what the client was owed, the marker never arrives,
+/// the wait burns its deadline, and the caller's assertion fails on the
+/// empty stdout — which is the bug this test exists to catch.
 fn run_attach(
     socket: &PathBuf,
     id: &str,
     stdin_bytes: &[u8],
-    settle: Duration,
+    await_marker: &str,
     timeout: Duration,
 ) -> String {
     let mut child = Command::new(bin("anchor"))
@@ -93,7 +103,39 @@ fn run_attach(
         .spawn()
         .expect("spawning anchor attach");
 
-    std::thread::sleep(settle);
+    // Drained on its own thread: the child keeps running, so reading to
+    // EOF here would deadlock against the `~.` this has not sent yet.
+    let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let mut stdout = child.stdout.take().expect("stdout");
+    let collector = {
+        let seen = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                seen.lock().expect("stdout buffer").extend_from_slice(&buf[..n]);
+            }
+        })
+    };
+
+    // Up to `timeout` for the replay to land. Exceeding it is not failed
+    // here: the caller's assertion on the returned stdout is the error
+    // message worth reading.
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let has_marker = {
+            let seen = seen.lock().expect("stdout buffer");
+            seen.windows(await_marker.len())
+                .any(|w| w == await_marker.as_bytes())
+        };
+        if has_marker {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
     child
         .stdin
         .as_mut()
@@ -119,8 +161,9 @@ fn run_attach(
         }
     }
 
-    let output = child.wait_with_output().expect("output");
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    collector.join().expect("stdout collector");
+    let seen = seen.lock().expect("stdout buffer");
+    String::from_utf8_lossy(&seen).into_owned()
 }
 
 #[test]
@@ -174,7 +217,7 @@ fn tilde_dot_detaches_from_an_idle_session() {
         &daemon.socket(),
         &id,
         b"~.",
-        Duration::from_millis(500),
+        "banner",
         Duration::from_secs(10),
     );
 
@@ -228,12 +271,23 @@ fn an_attach_replays_history_without_losing_the_first_frames() {
         &daemon.socket(),
         &id,
         b"~.",
-        Duration::from_millis(800),
+        // The last line: detaching only once it has arrived is what makes
+        // "every line, in order" a statement about the handover rather
+        // than about how fast the replay happened to be.
+        "line-199",
         Duration::from_secs(10),
     );
 
-    // Every line, in order and without a gap. A dropped frame at the
-    // handover shows up as a missing line in the middle, not at the edges.
+    // Every line, in order and without a gap.
+    //
+    // This is an end-to-end smoke test, not the evidence for the handover
+    // bug it was written after: whether the first frames land in the same
+    // read as the attach response is a timing accident, so passing here
+    // does not mean the buffered bytes were kept. Reintroducing that bug
+    // leaves this test green. The discriminating test is
+    // `client::tests::the_attach_handover_keeps_bytes_that_arrived_with_the_response`,
+    // which drives both sides of a socket pair and fails the moment the
+    // buffer is dropped.
     for i in 0..200 {
         assert!(
             stdout.contains(&format!("line-{i}")),
