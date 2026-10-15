@@ -362,3 +362,112 @@ fn attach_returns_when_the_session_exits() {
         }
     }
 }
+
+/// A terminal left in raw mode outlives the process that did it: no echo,
+/// no line editing, and a blind `reset` the only way back. `Drop` restores
+/// it, but `Drop` is exactly what does not run when a process is
+/// signalled -- and a client attached to a long-running session is the
+/// thing someone kills from another window.
+///
+/// Driven through a real pty because that is the only way the behaviour
+/// exists at all: under the pipes every other test here uses, stdin is not
+/// a terminal, `RawMode::enter` returns `None`, and the whole path is
+/// skipped. A test that proved this over pipes would be proving nothing.
+#[test]
+fn a_signalled_attach_leaves_the_terminal_usable() {
+    let daemon = Daemon::start("sigterm-raw");
+    let mut client = daemon.client();
+    let created = client
+        .call(
+            "create",
+            json!({
+                "spec": {
+                    "command": "/bin/sh",
+                    "args": ["-c", "stty raw -echo; echo banner; cat"],
+                    "cwd": "/tmp",
+                },
+            }),
+        )
+        .expect("create");
+    let id = created["session"].as_str().expect("a session id").to_string();
+
+    let (master, slave) = open_pty();
+    let echoes = |label: &str| -> bool {
+        // SAFETY: tcgetattr on the master of a pty this test owns; both
+        // ends share one termios.
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(master, &mut t) },
+            0,
+            "reading terminal attributes ({label})"
+        );
+        t.c_lflag & libc::ECHO != 0
+    };
+    assert!(echoes("before"), "a fresh pty echoes");
+
+    // SAFETY: `slave` is a live fd; each `Stdio` takes its own dup.
+    let (stdin, stdout) = unsafe {
+        use std::os::fd::FromRawFd;
+        (
+            Stdio::from(std::os::fd::OwnedFd::from_raw_fd(libc::dup(slave))),
+            Stdio::from(std::os::fd::OwnedFd::from_raw_fd(libc::dup(slave))),
+        )
+    };
+    let mut attach = Command::new(bin("anchor"))
+        .args(["--socket", daemon.socket().to_str().unwrap(), "attach", &id])
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning anchor attach");
+
+    // Wait for raw mode to actually be on, rather than for a span of time:
+    // signalling before it engages would restore nothing and pass.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while echoes("waiting") {
+        assert!(
+            Instant::now() < deadline,
+            "attach never entered raw mode, so this proves nothing"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // SAFETY: signalling a child this test spawned.
+    assert_eq!(unsafe { libc::kill(attach.id() as i32, libc::SIGTERM) }, 0);
+    let status = attach.wait().expect("waiting for attach");
+
+    assert!(
+        echoes("after"),
+        "a signalled attach left the terminal with no echo"
+    );
+    // And it still looks killed to whoever was waiting on it: restoring
+    // the terminal must not turn a fatal signal into a clean exit.
+    assert_eq!(
+        status.code(),
+        None,
+        "attach exited normally instead of dying of SIGTERM: {status:?}"
+    );
+
+    // SAFETY: fds this test opened.
+    unsafe {
+        libc::close(master);
+        libc::close(slave);
+    }
+}
+
+fn open_pty() -> (i32, i32) {
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty fills two fds we own; null for the optional name,
+    // termios and winsize arguments.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed");
+    (master, slave)
+}

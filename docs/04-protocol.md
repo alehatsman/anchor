@@ -234,6 +234,15 @@ anchor service install|uninstall|status
                                   service manager (07-lifecycle.md)
 ```
 
+`attach` restores the terminal on the way out, including when it is
+**signalled** rather than exited — `SIGTERM` and `SIGHUP` restore the saved
+attributes and then re-raise, so the process still looks killed to whatever
+was waiting on it. A terminal left raw outlives the process that did it,
+and a client attached to a long-running session is the thing someone kills
+from another window. `SIGINT` and `SIGQUIT` are deliberately not handled:
+in raw mode ^C and ^\ are bytes for the session, not signals to the
+client.
+
 `attach` is raw-mode passthrough: local keystrokes go to the PTY as the exact
 bytes the local terminal produced, and output goes to stdout unparsed. **No VT
 emulator** — the user's terminal already is one. Lift the shape from
