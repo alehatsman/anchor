@@ -33,8 +33,8 @@ impl Store {
                 id, state, pid, exit_code, lost_reason,
                 command, args_json, cwd, env_json, login_shell,
                 cols, rows, spec_cols, spec_rows,
-                output_bytes, created_at, exited_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                output_bytes, log_capped_at, created_at, exited_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             rusqlite::params![
                 session.id,
                 session.state.as_str(),
@@ -51,6 +51,7 @@ impl Store {
                 session.spec.cols,
                 session.spec.rows,
                 session.output_bytes as i64,
+                session.log_capped_at.map(|v| v as i64),
                 session.created_at,
                 session.exited_at,
             ],
@@ -74,7 +75,7 @@ impl Store {
             .query_row(
                 "SELECT id, state, pid, exit_code, lost_reason, command, args_json, cwd,
                         env_json, login_shell, cols, rows, spec_cols, spec_rows,
-                        output_bytes, created_at, exited_at
+                        output_bytes, log_capped_at, created_at, exited_at
                  FROM sessions WHERE id = ?1",
                 [id],
                 session_from_row,
@@ -96,7 +97,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, state, pid, exit_code, lost_reason, command, args_json, cwd,
                     env_json, login_shell, cols, rows, spec_cols, spec_rows,
-                    output_bytes, created_at, exited_at
+                    output_bytes, log_capped_at, created_at, exited_at
              FROM sessions ORDER BY id DESC",
         )?;
         let mut sessions = stmt
@@ -120,10 +121,10 @@ impl Store {
         Ok(labels)
     }
 
-    pub fn set_output_bytes(&self, id: &str, bytes: u64) -> Result<()> {
+    pub fn set_output_bytes(&self, id: &str, bytes: u64, capped_at: Option<u64>) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET output_bytes = ?2 WHERE id = ?1",
-            rusqlite::params![id, bytes as i64],
+            "UPDATE sessions SET output_bytes = ?2, log_capped_at = ?3 WHERE id = ?1",
+            rusqlite::params![id, bytes as i64, capped_at.map(|v| v as i64)],
         )?;
         Ok(())
     }
@@ -141,20 +142,34 @@ impl Store {
         Ok(n)
     }
 
-    /// Startup step: the output log file is authoritative for content, so the
-    /// cached `output_bytes` is corrected against its real length. A missing
-    /// file means zero bytes. Returns the number of rows corrected.
+    /// Startup step: reconcile each session's cached offset against its log
+    /// file.
+    ///
+    /// The larger of the two wins, never the file alone. For an uncapped log
+    /// the file is authoritative and this corrects a length a crash left
+    /// stale. For a capped one the file stopped growing while the stream kept
+    /// counting, so taking the file length would rewind `output_bytes` below
+    /// offsets clients already hold. A stream ahead of its file is itself a
+    /// cap, recorded here if no row said so — same rule as `OutputLog::open`.
+    ///
+    /// Returns the number of rows corrected.
     pub fn reconcile_output_bytes(&self, paths: &Paths) -> Result<usize> {
-        let mut stmt = self.conn.prepare("SELECT id, output_bytes FROM sessions")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, output_bytes, log_capped_at FROM sessions")?;
         let rows = stmt
             .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut corrected = 0;
-        for (id, cached) in rows {
-            let actual = match std::fs::metadata(paths.output_log(&id)) {
+        for (id, cached, stored_cap) in rows {
+            let file_len = match std::fs::metadata(paths.output_log(&id)) {
                 Ok(meta) => meta.len(),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
                 Err(e) => {
@@ -162,9 +177,24 @@ impl Store {
                         .with_context(|| format!("stat {}", paths.output_log(&id).display()))
                 }
             };
-            if actual != cached {
-                tracing::warn!(session = %id, cached, actual, "output_bytes corrected from log file");
-                self.set_output_bytes(&id, actual)?;
+
+            let output_bytes = file_len.max(cached);
+            let capped_at = match stored_cap {
+                Some(at) => Some(at),
+                None if output_bytes > file_len => Some(file_len),
+                None => None,
+            };
+
+            if output_bytes != cached || capped_at != stored_cap {
+                tracing::warn!(
+                    session = %id,
+                    cached,
+                    file_len,
+                    output_bytes,
+                    ?capped_at,
+                    "output offset reconciled against the log file"
+                );
+                self.set_output_bytes(&id, output_bytes, capped_at)?;
                 corrected += 1;
             }
         }
@@ -204,6 +234,9 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
         cols: row.get("cols")?,
         rows: row.get("rows")?,
         output_bytes: row.get::<_, i64>("output_bytes")? as u64,
+        log_capped_at: row
+            .get::<_, Option<i64>>("log_capped_at")?
+            .map(|v| v as u64),
         created_at: row.get("created_at")?,
         exited_at: row.get("exited_at")?,
     })

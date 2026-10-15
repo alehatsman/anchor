@@ -13,8 +13,9 @@ struct Session {
     lost_reason: Option<String>,
     cols: u16,
     rows: u16,
-    output_bytes: u64,          // authoritative log length
-    created_at: i64,
+    output_bytes: u64,          // authoritative stream length; never rewinds
+    log_capped_at: Option<u64>, // where persistence stopped, if it did
+    created_at: i64,            // milliseconds since the unix epoch
     exited_at: Option<i64>,
 }
 
@@ -66,6 +67,10 @@ Rules:
 `LOST` carries `lost_reason`: `daemon_restart`, `spawn_failed`,
 `kill_timeout`.
 
+`io_error` is the fourth value and the odd one out: it records that writing
+`output.vt` failed, and it can be set **while the child is still running**.
+The session continues; only persistence stopped.
+
 **EXITED fires off the reaper's `wait()`, not off reader EOF.** A descendant
 that inherited the PTY can hold the master open long after the child is gone.
 These are two independent signals and conflating them is a known bug — see
@@ -77,7 +82,8 @@ SQLite, WAL, single writer. `$XDG_DATA_HOME/anchor/anchor.db`.
 
 ```text
 sessions    (id PK, state, pid, exit_code, lost_reason, command, args_json,
-             cwd, env_json, cols, rows, output_bytes, created_at, exited_at)
+             cwd, env_json, cols, rows, output_bytes, log_capped_at,
+             created_at, exited_at)
 labels      (session_id, key, value, PK(session_id, key))
             index on (key, value)
 meta        (key, value)
@@ -90,8 +96,23 @@ $XDG_DATA_HOME/anchor/sessions/<id>/output.vt
 ```
 
 Append-only, never rewritten. The **file is authoritative** for content;
-`sessions.output_bytes` is a cached length reconciled against the real file
-size at startup.
+`sessions.output_bytes` is a cached stream length reconciled against the real
+file size at startup.
+
+### The size cap
+
+A log warns at **256 MiB** and stops growing at **1 GiB**, recording
+`log_capped_at`. Past that point the file stops but **the offset stream keeps
+advancing**: live streaming continues, offsets stay authoritative, and only
+replay of the capped range is gone. A write failure caps the log the same way
+— the hole is recorded rather than silently interleaved into a byte stream
+whose offsets are an index.
+
+This is why reconciliation takes **`max(file length, output_bytes)`** and never
+the file alone. The file cannot lie about bytes it holds, but for a capped log
+it stopped growing while the stream kept counting, and taking the file length
+would rewind `output_bytes` below offsets live clients already hold. A stream
+found ahead of its file is itself a cap, recorded if no row said so.
 
 ## Startup sequence
 
@@ -103,6 +124,7 @@ open SQLite (WAL), migrate
 mark sessions still "running"/"closing" as LOST (reason=daemon_restart)
     ↓
 reconcile each output_bytes against actual output.vt length
+    (larger of the two wins; a stream ahead of its file is capped)
     ↓
 bind unix socket
     ↓

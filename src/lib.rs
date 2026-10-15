@@ -5,6 +5,7 @@
 //! `ping`. No PTY layer yet — that is M1.
 
 pub mod db;
+pub mod log;
 pub mod model;
 pub mod paths;
 pub mod proto;

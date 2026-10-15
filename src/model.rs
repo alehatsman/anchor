@@ -57,6 +57,9 @@ pub mod lost_reason {
     pub const DAEMON_RESTART: &str = "daemon_restart";
     pub const SPAWN_FAILED: &str = "spawn_failed";
     pub const KILL_TIMEOUT: &str = "kill_timeout";
+    /// Writing the output log failed. The only reason that can be set while
+    /// the child is still running — the session continues, unpersisted.
+    pub const IO_ERROR: &str = "io_error";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,9 +87,13 @@ pub struct Session {
     /// The effective PTY size, which may differ from `spec` after a resize.
     pub cols: u16,
     pub rows: u16,
-    /// Cached length of `output.vt`. The file is authoritative; this is
-    /// reconciled against the real size at startup.
+    /// Cached length of the byte stream. Never rewinds. Equal to the file
+    /// length unless the log was capped or a write failed, in which case the
+    /// stream kept advancing past what is on disk.
     pub output_bytes: u64,
+    /// Offset at which persistence stopped — a size cap or an I/O error.
+    /// `None` while the whole stream is readable from `output.vt`.
+    pub log_capped_at: Option<u64>,
     /// Milliseconds since the unix epoch.
     pub created_at: i64,
     pub exited_at: Option<i64>,
@@ -107,6 +114,7 @@ impl Session {
             cols,
             rows,
             output_bytes: 0,
+            log_capped_at: None,
             created_at: crate::now_ms(),
             exited_at: None,
         }

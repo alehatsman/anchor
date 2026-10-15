@@ -41,6 +41,11 @@ const MIGRATIONS: &[&str] = &[
 
     CREATE INDEX labels_key_value ON labels(key, value);
     "#,
+    // v2 — where persistence stopped, if it did. NULL means the whole byte
+    // stream is still on disk. See src/log.rs and docs/02-model.md.
+    r#"
+    ALTER TABLE sessions ADD COLUMN log_capped_at INTEGER;
+    "#,
 ];
 
 /// Open the database, apply pragmas, and migrate forward.
