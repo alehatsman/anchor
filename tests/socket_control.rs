@@ -251,3 +251,49 @@ async fn a_line_that_is_not_utf8_is_answered_not_dropped() {
     // answering worth more than closing.
     assert_eq!(client.send_raw(r#"{"id":2,"op":"ping"}"#)["ok"], true);
 }
+
+/// A control line past the 1 MiB cap is answered `too_large` and *then*
+/// the connection is closed.
+///
+/// Both halves matter and they pull in opposite directions. The answer is
+/// what tells the client its request was too big rather than leaving it to
+/// infer that from a dead socket. The close is because the rest of that
+/// line was never read: the daemon stops at the cap, so whatever follows
+/// would be parsed as the next request and every request after it would be
+/// off by one line. Answering and *staying* open is the broken combination,
+/// and it is the one a naive fix reaches for.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_line_is_answered_then_the_connection_is_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = serve(&dir);
+    let mut client = Client::connect(&socket);
+
+    // Well-formed JSON, just far too much of it: the size is what is being
+    // refused, not the contents.
+    // Well-formed JSON, just far too much of it: the size is what is being
+    // refused, not the contents.
+    let padding = "x".repeat(2 * 1024 * 1024);
+    let line = format!(r#"{{"id":7,"op":"ping","pad":"{padding}"}}\n"#);
+
+    // The write is expected to fail partway: the daemon answers and closes
+    // at the cap, long before the client has finished sending. A client
+    // must drain the reply anyway rather than reading `EPIPE` as "the
+    // daemon died" -- which is the mistake the answer exists to prevent.
+    let _ = client.writer.write_all(line.as_bytes());
+    let _ = client.writer.flush();
+
+    let mut response = String::new();
+    client.reader.read_line(&mut response).unwrap();
+    let reply: Value = serde_json::from_str(&response).expect("response is a JSON line");
+    assert_eq!(reply["ok"], false);
+    assert_eq!(reply["error"]["code"], "too_large");
+
+    // Nothing follows, because the daemon stopped reading mid-line.
+    let mut rest = String::new();
+    let read = client.reader.read_line(&mut rest).unwrap();
+    assert_eq!(
+        read, 0,
+        "the connection must end after `too_large`, not carry on \
+         desynchronised; got {rest:?}"
+    );
+}

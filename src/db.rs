@@ -133,3 +133,88 @@ fn set_schema_version(conn: &Connection, version: usize) -> rusqlite::Result<()>
     )
     .map(|_| ())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A v1 database, built the way a shipped build would have left one:
+    /// migration 1 applied and the version recorded, nothing more.
+    fn write_v1(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        set_schema_version(&conn, 1).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, state, command, args_json, cwd, env_json,
+                                   login_shell, cols, rows, spec_cols, spec_rows,
+                                   output_bytes, created_at)
+             VALUES ('01OLD', 'exited', '/bin/sh', '[]', '/tmp', '{}',
+                     0, 80, 24, 80, 24, 1234, 1700000000);
+             INSERT INTO labels (session_id, key, value) VALUES ('01OLD', 'wm.item', 'kept');",
+        )
+        .unwrap();
+    }
+
+    /// The upgrade a user actually experiences: a database written by an
+    /// older build is carried forward, not rebuilt. The row and its labels
+    /// must still be there afterwards -- a migration that dropped them
+    /// would lose every session a user had, and `CREATE TABLE` in v1 would
+    /// have failed loudly where `ALTER TABLE` in v2 succeeds silently.
+    #[test]
+    fn a_v1_database_upgrades_to_v2_without_losing_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anchor.db");
+        write_v1(&path);
+
+        let conn = open(&path).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), MIGRATIONS.len());
+
+        let (state, bytes, capped): (String, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT state, output_bytes, log_capped_at FROM sessions WHERE id = '01OLD'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "exited");
+        assert_eq!(bytes, 1234);
+        assert_eq!(
+            capped, None,
+            "a session migrated from v1 has a complete log: NULL, not 0, \
+             which would claim persistence stopped at the very first byte"
+        );
+
+        let label: String = conn
+            .query_row(
+                "SELECT value FROM labels WHERE session_id = '01OLD' AND key = 'wm.item'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(label, "kept");
+    }
+
+    /// Migrations are forward-only, so a database from a newer build is
+    /// unreadable by this one. Refusing is the point: running v1..v2
+    /// against a v3 schema would corrupt it far from the cause.
+    #[test]
+    fn a_database_from_a_newer_build_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anchor.db");
+        write_v1(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            set_schema_version(&conn, MIGRATIONS.len() + 1).unwrap();
+        }
+
+        let err = open(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("newer than this build supports"),
+            "expected a version complaint, got: {err}"
+        );
+    }
+}

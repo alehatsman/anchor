@@ -572,3 +572,72 @@ async fn a_session_that_exits_under_its_controller_still_sends_exit() {
         }
     }
 }
+
+/// An input frame claiming more than one PTY chunk ends that connection.
+///
+/// The length is a client's unverified claim about how much follows, and
+/// the daemon allocates on it. Without a cap, `len = 0xFFFFFFFF` is a 4 GiB
+/// allocation for free, from any client that can reach the socket. The
+/// limit is a chunk because that is the largest thing a legitimate client
+/// has to say: one PTY read is 64 KiB and a keystroke is a few bytes.
+///
+/// Both ends of the boundary are checked. 64 KiB exactly must still work --
+/// a paste is a real thing a client does -- so an off-by-one that turned
+/// `>` into `>=` would break ordinary use while still passing a test that
+/// only looked at the oversized case.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_input_frame_larger_than_a_chunk_ends_the_connection() {
+    let (_dir, socket) = harness();
+    let mut setup = Conn::connect(&socket);
+    let id = create_shell(&mut setup);
+
+    let mut controller = Conn::connect(&socket);
+    controller.call(
+        "attach",
+        json!({ "session": &id, "from": 0, "control": true }),
+    );
+    assert_eq!(controller.frame().2, vec![1]);
+    controller.read_until("ready");
+
+    // Exactly a chunk is legal, and the connection carries on after it.
+    controller.send_input(&vec![b'.'; 64 * 1024]);
+    controller.send_input(b"\x04"); // EOT: ends `cat`'s current line
+    controller.send_input(b"still-here\n");
+    controller.read_until("still-here");
+
+    // One byte more is not, and the daemon drops the connection on the
+    // header alone -- it never waits for a payload it has already refused,
+    // which is the whole point of checking before allocating.
+    let mut header = frame::encode(frame::INPUT, 0, &[]);
+    let len = (64 * 1024u32 + 1).to_be_bytes();
+    let at = header.len() - 4;
+    header[at..].copy_from_slice(&len);
+    controller.writer.write_all(&header).unwrap();
+    controller.writer.flush().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match controller.try_frame() {
+            None => break,
+            Some(_) => assert!(
+                Instant::now() < deadline,
+                "the connection outlived an oversized input frame"
+            ),
+        }
+    }
+
+    // And the session itself is untouched: one client's bad frame must not
+    // take down a PTY every other client is watching. The lease is free
+    // again, because that connection ended.
+    let mut next = Conn::connect(&socket);
+    let reply = next.call(
+        "attach",
+        json!({ "session": &id, "from": 0, "control": true }),
+    );
+    assert_eq!(reply["control"], true, "the lease was not released: {reply}");
+    assert_eq!(next.frame().2, vec![1]);
+    next.send_input(b"alive\n");
+    next.read_until("alive");
+
+    setup.call("terminate", json!({ "session": &id }));
+}

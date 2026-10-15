@@ -73,7 +73,15 @@ usable. `invalid_spec` means the request parsed and its contents
 were wrong. If the line carried a usable `id` the response echoes it;
 otherwise the response carries `id: 0`. A control line longer than 1 MiB is
 answered `too_large`, and that connection is closed rather than left
-desynchronised mid-line.
+desynchronised mid-line: the rest of that line was never read, so anything
+following it would be parsed as the next request and every request after
+would be off by one.
+
+A client sending one will usually see its own write fail before it finishes
+— the daemon answers and closes at the cap, with megabytes still in flight.
+The reply is already on the wire. **Read it before acting on the write
+error**, or the one case the daemon took care to report arrives looking
+exactly like the daemon dying.
 
 ## Attach
 
@@ -107,6 +115,14 @@ payload stays little-endian because it is an `i32` as the host writes it.
 
 A `u32` caps one frame at 4 GiB, which no PTY read approaches: the reader
 chunks at 64 KiB.
+
+**An inbound frame is capped at 64 KiB, and the connection is dropped on
+the header alone if it claims more.** Downstream the length is the daemon's
+own; upstream it is an unverified claim the daemon would allocate on, so
+`len = 0xFFFFFFFF` would be a 4 GiB allocation for free. One chunk is the
+largest thing a real client has to say — a keystroke is a few bytes and a
+paste is bounded by what the PTY will take — so the cap costs nothing and
+closing is right: a client that sent it is not speaking this protocol.
 
 Offsets are the recovery mechanism. A client that drops reconnects with
 `from` set to **one past the last byte it received** and loses nothing.
