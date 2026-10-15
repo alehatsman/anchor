@@ -54,16 +54,46 @@ const MAX_LINE_BYTES: u64 = 1024 * 1024;
 /// it, so it is removed and rebound.
 pub fn bind(socket_path: &Path) -> Result<StdUnixListener> {
     if socket_path.exists() {
-        if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
-            bail!("anchord is already running on {}", socket_path.display());
+        match std::os::unix::net::UnixStream::connect(socket_path) {
+            // Someone is listening. Never remove it.
+            Ok(_) => bail!("anchord is already running on {}", socket_path.display()),
+            // Nothing is accepting: a socket file a dead daemon left behind.
+            // This is the *only* error that means stale.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                tracing::warn!(socket = %socket_path.display(), "removing stale socket");
+                std::fs::remove_file(socket_path)
+                    .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
+            }
+            // Anything else — a permissions problem, a path that is not a
+            // socket at all — says nothing about whether a daemon is alive.
+            // Treating it as stale would delete a running daemon's socket
+            // and silently take over its clients.
+            Err(e) => bail!(
+                "cannot determine whether a daemon owns {}: {e}. \
+                 Refusing to remove it; move it aside if it really is stale.",
+                socket_path.display()
+            ),
         }
-        tracing::warn!(socket = %socket_path.display(), "removing stale socket");
-        std::fs::remove_file(socket_path)
-            .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
     }
 
-    let listener = StdUnixListener::bind(socket_path)
-        .with_context(|| format!("binding {}", socket_path.display()))?;
+    // Permissions are the security boundary here, so the window where the
+    // socket exists with umask-derived permissions must be closed before
+    // anything can connect. Binding under a 0077 umask means it is never
+    // group- or world-accessible, even for the instant before the chmod.
+    //
+    // `umask` is process-global and not thread-safe, which is acceptable
+    // precisely here: this runs once at startup before the daemon serves
+    // anything, and the temporary value is strictly *more* restrictive — a
+    // file another thread created in this window would come out tighter
+    // than intended, never looser.
+    //
+    // SAFETY: `umask` takes and returns a mode and touches no memory.
+    let previous = unsafe { libc::umask(0o077) };
+    let bound = StdUnixListener::bind(socket_path);
+    // SAFETY: as above, restoring what we read.
+    unsafe { libc::umask(previous) };
+
+    let listener = bound.with_context(|| format!("binding {}", socket_path.display()))?;
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("setting 0600 on {}", socket_path.display()))?;
     Ok(listener)

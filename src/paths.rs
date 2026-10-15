@@ -71,9 +71,15 @@ impl Paths {
     }
 
     /// Create the data and sessions directories if they do not exist.
+    ///
+    /// Owner-only. The data dir holds every session's output log, which is
+    /// a verbatim transcript of a terminal — anything typed or printed in
+    /// it, credentials included. The socket is already 0600 and the session
+    /// directories under here are 0700; leaving the root at whatever the
+    /// umask gives would make all of that readable to anyone on the machine.
     pub fn ensure_dirs(&self) -> Result<()> {
-        std::fs::create_dir_all(self.sessions_dir())
-            .with_context(|| format!("creating {}", self.sessions_dir().display()))?;
+        create_owner_only(&self.data_dir)?;
+        create_owner_only(&self.sessions_dir())?;
         if let Some(parent) = self.socket_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -84,4 +90,16 @@ impl Paths {
 
 fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// Creates a directory and narrows it to `0700`.
+///
+/// The permissions are applied whether or not this call created it: a data
+/// dir from an older build, or one a careless `mkdir` left at `0755`, is
+/// exactly the case worth correcting.
+fn create_owner_only(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("setting owner-only permissions on {}", dir.display()))
 }

@@ -103,13 +103,20 @@ fn migrate(conn: &Connection) -> Result<()> {
 }
 
 pub fn schema_version(conn: &Connection) -> Result<usize> {
-    let raw: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
+    // `QueryReturnedNoRows` is the fresh-database case and means zero.
+    // Every other error is a real failure — a corrupt file, a locked
+    // database, an I/O error — and must not be reported as "version 0",
+    // which would re-run every migration against a database that already
+    // has them and fail far from the cause.
+    let raw: Option<String> = match conn.query_row(
+        "SELECT value FROM meta WHERE key = 'schema_version'",
+        [],
+        |r| r.get(0),
+    ) {
+        Ok(value) => Some(value),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e).context("reading the schema version"),
+    };
     match raw {
         None => Ok(0),
         Some(s) => s

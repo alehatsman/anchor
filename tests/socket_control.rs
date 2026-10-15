@@ -175,3 +175,45 @@ async fn a_stale_socket_file_is_replaced() {
     let mut client = Client::connect(&socket);
     assert_eq!(client.send_raw(r#"{"id":1,"op":"ping"}"#)["ok"], true);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_socket_that_cannot_be_probed_is_never_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("anchor.sock");
+
+    // Not a socket at all: a plain file where one is expected. Connecting
+    // fails, but not with "nobody is listening" — and anything other than
+    // that says nothing about whether a daemon is alive. Deleting it on a
+    // guess is how a running daemon loses its socket and its clients.
+    std::fs::write(&socket, b"not a socket").unwrap();
+
+    let err = anchor::server::bind(&socket).unwrap_err().to_string();
+    assert!(err.contains("cannot determine"), "unexpected error: {err}");
+    assert!(socket.exists(), "a socket we could not probe must survive");
+    assert_eq!(
+        std::fs::read(&socket).unwrap(),
+        b"not a socket",
+        "and must be left untouched"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_data_directory_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    // Pre-created wide open, as an older build or a stray mkdir would.
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let paths = anchor::paths::Paths::new(&data, dir.path().join("anchor.sock"));
+    paths.ensure_dirs().unwrap();
+
+    // Session logs are verbatim terminal transcripts; the directory holding
+    // them must not be readable by anyone else on the machine.
+    for path in [data.clone(), paths.sessions_dir()] {
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{} is {mode:o}, not 0700", path.display());
+    }
+}
