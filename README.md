@@ -22,14 +22,18 @@ noticed. That is the entire pitch.
 
 ## Status
 
-**M0 — skeleton.** `anchord` resolves its data dir, migrates its SQLite
-schema, recovers sessions left behind by a restart, and answers `ping` on a
-unix socket. No PTY layer yet; that is M1, and it is the milestone this
-project lives or dies on. See [ROADMAP.md](ROADMAP.md), [docs/](docs/) and
-the open issues.
+**M1 — the PTY core is in.** `anchord` owns real PTY sessions: four threads
+each, an append-only output log addressable by byte offset, many bounded
+subscribers with backpressure, a control lease, and termination that reaps a
+child ignoring SIGHUP and SIGTERM. Ported from teleport along with its test
+suite, which is the point — those fixtures are the behavioural spec.
+
+The socket still answers only `ping`. Labels are stored but not queryable
+(M2), and nothing drives a session over the wire yet (M3). See
+[ROADMAP.md](ROADMAP.md), [docs/](docs/) and the open issues.
 
 ```sh
-cargo test          # store round-trip, migrations, restart recovery, socket
+cargo test          # 57: ported PTY/log/session fixtures, store, socket
 cargo run --bin anchord
 ```
 
