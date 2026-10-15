@@ -4,9 +4,13 @@
 //! Order matters, per docs/02-model.md:
 //!
 //! ```text
-//! resolve data dir -> open SQLite (WAL), migrate -> mark live sessions LOST
-//! -> reconcile output_bytes -> bind unix socket -> serve
+//! resolve data dir -> open SQLite (WAL), migrate -> bind unix socket
+//! -> mark live sessions LOST -> reconcile output_bytes -> serve
 //! ```
+//!
+//! The bind comes before the recovery writes, not after. See the comment on
+//! it: recovery is destructive, and only the process that holds the socket
+//! has the right to perform it.
 
 use std::sync::{Arc, Mutex};
 
@@ -32,6 +36,16 @@ pub async fn run(paths: &Paths) -> Result<()> {
         "schema ready"
     );
 
+    // Bind before touching a single row. Startup recovery rewrites every
+    // live session to LOST, which is right after a crash and catastrophic
+    // otherwise: an accidental second launch — a stray `anchord` in a
+    // shell, a supervisor racing itself — would tell the running daemon's
+    // clients their sessions are gone while the PTYs are still running.
+    //
+    // Claiming the socket first makes that impossible: whoever holds it is
+    // the only process that may decide what a live row means.
+    let listener = crate::server::bind(paths.socket_path())?;
+
     // A restart means no PTY survived: anything still claiming to be live is
     // lost. The log files are intact and remain readable.
     let lost = store.mark_live_sessions_lost()?;
@@ -46,10 +60,6 @@ pub async fn run(paths: &Paths) -> Result<()> {
             "output offsets reconciled against log files"
         );
     }
-
-    // Bind before building the manager: if another daemon already holds the
-    // socket, fail before spawning anything.
-    let listener = crate::server::bind(paths.socket_path())?;
 
     let store = Arc::new(Mutex::new(store));
     let manager =

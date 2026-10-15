@@ -121,15 +121,24 @@ resolve data dir
     ↓
 open SQLite (WAL), migrate
     ↓
+bind unix socket            ← before any write: see below
+    ↓
 mark sessions still "running"/"closing" as LOST (reason=daemon_restart)
     ↓
 reconcile each output_bytes against actual output.vt length
     (larger of the two wins; a stream ahead of its file is capped)
     ↓
-bind unix socket
-    ↓
 serve
 ```
+
+**The bind comes before the recovery writes.** Recovery rewrites every live
+session to `lost`, which is correct after a crash and catastrophic
+otherwise. A second `anchord` started by accident — a stray one in a shell,
+a supervisor racing itself — would otherwise mark the *running* daemon's
+sessions lost and then exit, telling its clients their sessions are gone
+while the PTYs are still running. Claiming the socket first makes that
+impossible: whoever holds it is the only process entitled to decide what a
+live row means.
 
 ## Create sequence
 

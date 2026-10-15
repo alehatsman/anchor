@@ -212,3 +212,58 @@ fn a_second_daemon_refuses_to_displace_a_live_one() {
 
     daemon.kill();
 }
+
+#[test]
+fn a_second_daemon_does_not_touch_the_live_one_s_sessions() {
+    let dir = DataDir::new("no-steal");
+    let mut daemon = Daemon::start(&dir);
+    let mut client = connect(&dir.socket());
+
+    let created = client
+        .call(
+            "create",
+            json!({
+                "spec": {
+                    "command": "/bin/sh",
+                    "args": ["-c", "stty raw -echo; echo alive; sleep 300"],
+                    "cwd": "/tmp",
+                },
+            }),
+        )
+        .expect("create");
+    let id = created["session"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
+
+    // A second daemon must refuse the socket *and change nothing*. Startup
+    // recovery rewrites every live row to LOST, so doing that before the
+    // bind check means an accidental second launch — a stray `anchord` in a
+    // shell, a supervisor racing itself — tells the running daemon's
+    // clients their sessions are gone while the PTYs are still running.
+    let second = Command::new(bin("anchord"))
+        .env("XDG_DATA_HOME", &dir.0)
+        .env("XDG_RUNTIME_DIR", dir.0.join("run"))
+        .env("ANCHOR_LOG", "error")
+        .output()
+        .expect("running a second anchord");
+    assert!(!second.status.success(), "the second daemon must refuse");
+
+    // Asserted against the row, not through the live daemon: `get` answers
+    // from its in-memory session and would mask a corrupted row until the
+    // next restart read it back.
+    let row = std::process::Command::new("sqlite3")
+        .arg(dir.0.join("anchor/anchor.db"))
+        .arg(format!(
+            "SELECT state, COALESCE(lost_reason,'') FROM sessions WHERE id='{id}';"
+        ))
+        .output()
+        .expect("reading the row with sqlite3");
+    let row = String::from_utf8_lossy(&row.stdout).trim().to_string();
+    assert_eq!(
+        row, "running|",
+        "a refused second daemon must not rewrite the live daemon's rows"
+    );
+
+    daemon.kill();
+}
