@@ -332,3 +332,38 @@ async fn log_serves_byte_ranges_from_an_offset() {
 
     client.ok("terminate", json!({ "session": &id }));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn purge_forgets_a_session_entirely() {
+    let h = harness();
+    let mut client = Client::connect(&h.socket);
+    let id = create_echo(&mut client, "purge-me", json!({ "wm.item": "mr:9" }));
+    wait_for_output(&mut client, &id, "purge-me");
+
+    // A running session is not purgeable: deleting the log of a live PTY
+    // would leave the reader appending to a file nobody can read.
+    let refused = client.call("purge", json!({ "session": &id }));
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["error"]["code"], "already_exited");
+
+    client.ok("terminate", json!({ "session": &id }));
+    let purged = client.ok("purge", json!({ "session": &id }));
+    assert_eq!(purged["purged"], true);
+
+    // Gone from get, from list, and from the filesystem.
+    let gone = client.call("get", json!({ "session": &id }));
+    assert_eq!(gone["error"]["code"], "not_found");
+    assert!(
+        client.ok("list", json!({ "filter": { "wm.item": "mr:9" } }))["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let gone_log = client.call("log", json!({ "session": &id, "from": 0 }));
+    assert_eq!(gone_log["error"]["code"], "not_found");
+
+    // Purging what was never there is a 404, so a typo is reported rather
+    // than silently succeeding.
+    let missing = client.call("purge", json!({ "session": "01JNOPE0000000000000000000" }));
+    assert_eq!(missing["error"]["code"], "not_found");
+}

@@ -255,6 +255,7 @@ fn dispatch(line: &str, state: &State) -> Value {
         "resize" => op_resize(request.id, line, state),
         "terminate" => op_terminate(request.id, line, state),
         "log" => op_log(request.id, line, state),
+        "purge" => op_purge(request.id, line, state),
         other => proto::error(
             request.id,
             ErrorCode::UnknownOp,
@@ -311,6 +312,7 @@ fn op_create(id: u64, line: &str, state: &State) -> Value {
                 | CreateError::ExecutableNotFound(_)
                 | CreateError::InvalidSize { .. } => ErrorCode::InvalidSpec,
                 CreateError::NotFound => ErrorCode::NotFound,
+                CreateError::StillRunning => ErrorCode::AlreadyExited,
                 // A cap refusal and a failed spawn are both "it did not
                 // start"; the message says which.
                 CreateError::TooManySessions { .. }
@@ -528,6 +530,25 @@ fn op_log(id: u64, line: &str, state: &State) -> Value {
             )
         }
         Err(e) => proto::error(id, ErrorCode::InvalidSpec, format!("reading the log: {e}")),
+    }
+}
+
+fn op_purge(id: u64, line: &str, state: &State) -> Value {
+    let req: SessionReq = match parse(id, line) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    // Nothing to forget is not a failure to forget it, but an id that was
+    // never known is still a 404 — a client purging a typo should hear so.
+    if lookup(&req.session, state).is_none() {
+        return proto::error(id, ErrorCode::NotFound, "no such session");
+    }
+    match state.manager.forget(&req.session) {
+        Ok(_) => proto::ok(id, json!({ "purged": true })),
+        Err(e @ CreateError::StillRunning) => {
+            proto::error(id, ErrorCode::AlreadyExited, e.to_string())
+        }
+        Err(e) => proto::error(id, ErrorCode::InvalidSpec, e.to_string()),
     }
 }
 

@@ -213,6 +213,17 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes a session's row. Labels go with it via `ON DELETE CASCADE`.
+    ///
+    /// Returns whether a row was there to delete, so a caller can tell a
+    /// purge of a real session from one of an id that never existed.
+    pub fn delete(&self, id: &str) -> Result<bool> {
+        let rows = self
+            .conn
+            .execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+        Ok(rows > 0)
+    }
+
     /// Records the size actually applied to a session's PTY.
     pub fn set_size(&self, id: &str, cols: u16, rows: u16) -> Result<()> {
         self.conn.execute(

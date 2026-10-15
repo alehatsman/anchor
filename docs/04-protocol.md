@@ -23,7 +23,18 @@ Request:
 {"id":6,"op":"terminate","session":"01J..."}
 {"id":7,"op":"log","session":"01J...","from":0,"max":65536}
 {"id":8,"op":"attach","session":"01J...","from":12345,"control":true}
+{"id":9,"op":"purge","session":"01J..."}
 ```
+
+`terminate` ends a session; `purge` forgets it — its row, its labels and
+its `output.vt`. They are separate because an exited session is still worth
+listing and still worth replaying, often long after it ended. A client that
+wants the record gone asks for that explicitly.
+
+`purge` refuses a running session with `already_exited`: deleting the log
+of a live PTY would leave the reader thread appending to a file nobody can
+read. Terminate first. Purging an id that was never known is `not_found`,
+so a typo is reported rather than silently succeeding.
 
 Response:
 

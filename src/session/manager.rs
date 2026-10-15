@@ -48,6 +48,8 @@ pub enum CreateError {
     Spawn(#[source] anyhow::Error),
     #[error("no such session")]
     NotFound,
+    #[error("session is still running; terminate it first")]
+    StillRunning,
 }
 
 /// Holds every live session, plus everything a new one needs to exist.
@@ -345,6 +347,42 @@ impl SessionManager {
         let mut sessions = self.sessions.lock();
         let idx = sessions.iter().position(|s| s.id == id)?;
         Some(sessions.remove(idx))
+    }
+
+    /// Forgets a session entirely: its row, its labels and its output log.
+    ///
+    /// Refuses while the session is still running — a caller terminates
+    /// first. Deleting the log of a live PTY would leave the reader thread
+    /// appending to a file nobody can read, and the session still streaming
+    /// to subscribers from a log that no longer exists.
+    ///
+    /// Order matters: the directory goes first, then the row. A crash in
+    /// between leaves a row whose log is gone, which startup reconciliation
+    /// already handles (it reads zero bytes and caps there). The reverse
+    /// would leave an orphan directory nothing points at.
+    pub fn forget(&self, id: &str) -> Result<bool, CreateError> {
+        if let Some(session) = self.get(id) {
+            if !session.state().is_terminal() {
+                return Err(CreateError::StillRunning);
+            }
+            self.purge(id);
+        }
+
+        let dir = self.root.join(id);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(session = %id, error = %e, "removing the session directory failed");
+            }
+        }
+
+        match &self.store {
+            Some(store) => lock(store).delete(id).map_err(CreateError::Log),
+            // No store: the session existed only in memory, and purging it
+            // from the directory above is the whole of forgetting it.
+            None => Ok(true),
+        }
     }
 }
 
