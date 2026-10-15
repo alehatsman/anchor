@@ -4,6 +4,8 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -365,16 +367,42 @@ fn attach(
 
     // The reader half runs on its own thread: stdin and the socket both
     // block, and neither may wait for the other.
-    let output = std::thread::Builder::new()
-        .name("anchor-output".into())
-        .spawn(move || pump_output(frames))
-        .context("spawning the output thread")?;
+    //
+    // `ended` is how the stdin loop below learns the session is over.
+    // Nothing wakes a blocking `read` on stdin, so without it a controller
+    // sits there after the session exited until the user happens to press
+    // a key -- the session is gone, the output thread has finished, and
+    // the terminal still looks attached.
+    let ended = Arc::new(AtomicBool::new(false));
+    let output = {
+        let ended = Arc::clone(&ended);
+        std::thread::Builder::new()
+            .name("anchor-output".into())
+            .spawn(move || {
+                let result = pump_output(frames);
+                ended.store(true, Ordering::Release);
+                result
+            })
+            .context("spawning the output thread")?
+    };
 
     if has_control {
         let mut scanner = EscapeScanner::new();
         let mut stdin = std::io::stdin().lock();
         let mut buf = [0u8; 1024];
         loop {
+            // Wait for a keystroke *or* for the session to end, rather
+            // than only for a keystroke. The poll timeout is what bounds
+            // how long the check is deferred; it is not a poll interval
+            // for input, which arrives as readability.
+            if ended.load(Ordering::Acquire) {
+                break;
+            }
+            match stdin_readable(STDIN_POLL) {
+                Readable::Yes => {}
+                Readable::NotYet => continue,
+                Readable::Closed => break,
+            }
             let read = match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
@@ -401,6 +429,56 @@ fn attach(
     drop(writer);
     let _ = output.join();
     Ok(())
+}
+
+/// How long [`stdin_readable`] waits before returning so the caller can
+/// re-check whether the session ended. Short enough that a finished
+/// session closes the terminal promptly, long enough not to spin.
+const STDIN_POLL: libc::c_int = 100;
+
+/// Outcome of waiting for stdin to become readable.
+enum Readable {
+    /// There are bytes to read.
+    Yes,
+    /// The wait expired with nothing to read.
+    NotYet,
+    /// stdin is gone, or the wait failed in a way retrying will not fix.
+    Closed,
+}
+
+/// Waits up to `timeout_ms` for stdin to become readable.
+///
+/// `read` on stdin cannot be interrupted by another thread, so a blocking
+/// read would outlive the session it belongs to. Polling the descriptor
+/// leaves the read itself blocking-but-ready, which keeps the input path
+/// byte-for-byte what it was.
+fn stdin_readable(timeout_ms: libc::c_int) -> Readable {
+    let mut fds = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one initialised `pollfd`, and the count matches.
+    let ready = unsafe { libc::poll(&raw mut fds, 1, timeout_ms) };
+    if ready < 0 {
+        // EINTR is a signal, not a failure: the caller re-checks and waits
+        // again rather than treating a suspend/resume as end-of-input.
+        return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            Readable::NotYet
+        } else {
+            Readable::Closed
+        };
+    }
+    if ready == 0 {
+        return Readable::NotYet;
+    }
+    // HUP without data still means read() will report EOF, so let the
+    // caller's `read` observe it rather than deciding here.
+    if fds.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+        Readable::Yes
+    } else {
+        Readable::NotYet
+    }
 }
 
 /// Writes one input frame to the PTY.

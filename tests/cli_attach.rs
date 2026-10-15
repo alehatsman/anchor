@@ -295,3 +295,70 @@ fn an_attach_replays_history_without_losing_the_first_frames() {
         );
     }
 }
+
+/// `anchor attach` must come back on its own when the session ends.
+///
+/// The controller's stdin loop is a blocking read, and nothing wakes a
+/// blocking read on stdin — so before this, a controller whose session had
+/// exited sat there looking attached until the user happened to press a
+/// key. The session was gone and the output thread had already finished.
+///
+/// Deliberately sends **no** stdin at all: a test that typed something
+/// would unblock the read by hand and pass either way.
+#[test]
+fn attach_returns_when_the_session_exits() {
+    let daemon = Daemon::start("exit-returns");
+    let mut client = daemon.client();
+
+    // Exits on its own shortly after the attach has settled.
+    let created = client
+        .call(
+            "create",
+            json!({
+                "spec": {
+                    "command": "/bin/sh",
+                    "args": ["-c", "stty raw -echo; echo bye; sleep 1; exit 0"],
+                    "cwd": "/tmp",
+                },
+            }),
+        )
+        .expect("create");
+    let id = created["session"].as_str().expect("a session id").to_string();
+
+    let mut child = Command::new(bin("anchor"))
+        .arg("--socket")
+        .arg(daemon.socket())
+        .arg("attach")
+        .arg(&id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning anchor attach");
+
+    // Keep stdin open and silent for the whole wait: closing it would end
+    // the read via EOF, which is a different exit path than the one under
+    // test.
+    let _stdin = child.stdin.take().expect("stdin");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => {
+                assert!(status.success(), "attach exited with {status}");
+                break;
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "`anchor attach` did not return after its session exited — \
+                         a controller must not sit on a dead session waiting for a keystroke"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
