@@ -161,8 +161,16 @@ pub struct SpawnedSession {
 }
 
 /// The user's login shell. One resolution, one fallback, one place.
+///
+/// An **empty** `SHELL` is treated as unset. It is set that way by some
+/// service managers and container images, and taking it literally spawns
+/// the empty program -- which fails at exec with a message about `""`
+/// rather than about a shell, long after the useful place to notice.
 pub fn login_shell_path() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+    std::env::var("SHELL")
+        .ok()
+        .filter(|shell| !shell.trim().is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_string())
 }
 
 /// Builds the `(shell, argv)` pair that runs `spec.program` under a login

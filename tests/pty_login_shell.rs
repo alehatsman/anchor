@@ -187,6 +187,31 @@ fn login_shell_wraps_the_command_without_ever_building_a_shell_string() {
         "without login_shell $SHELL must never be invoked, got: {got}"
     );
 
+    // Case 4: an *empty* `SHELL` is unset, not a shell. Some service
+    // managers and container images export it that way, and taking it
+    // literally execs the empty program -- a failure that names `""`
+    // instead of naming the shell, at the least useful moment.
+    set_env("SHELL", "");
+    assert_eq!(
+        anchor::pty::login_shell_path(),
+        "/bin/sh",
+        "an empty $SHELL must fall back, not become the program"
+    );
+    let (_spawned, rx) = spawn("/bin/echo", &args, &dir, true);
+    let got = recv_until(&rx, DEFAULT_TIMEOUT, |acc| contains(acc, "*"));
+    assert!(
+        got.contains("a b *"),
+        "an empty $SHELL must still run the program, got: {got}"
+    );
+
+    // Whitespace is the same thing wearing a hat.
+    set_env("SHELL", "   ");
+    assert_eq!(
+        anchor::pty::login_shell_path(),
+        "/bin/sh",
+        "a blank $SHELL must fall back too"
+    );
+
     match orig_shell {
         Some(v) => set_env("SHELL", &v),
         None => remove_env("SHELL"),
