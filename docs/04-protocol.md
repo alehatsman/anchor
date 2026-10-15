@@ -192,6 +192,9 @@ anchor logs <id> [--from N]       dump output
 anchor kill <id>                  terminate
 anchor label <id> k=v             set/remove labels
 anchor daemon                     run anchord in the foreground
+anchor service install|uninstall|status
+                                  register anchord with the user's
+                                  service manager (07-lifecycle.md)
 ```
 
 `attach` is raw-mode passthrough: local keystrokes go to the PTY as the exact

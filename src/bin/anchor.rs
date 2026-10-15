@@ -80,10 +80,46 @@ enum Command {
     },
     /// Run anchord in the foreground.
     Daemon,
+    /// Register anchord with the user's service manager, so it outlives
+    /// any client (docs/07-lifecycle.md).
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Install the registration. Idempotent.
+    Install,
+    /// Remove it. Not an error when nothing is installed.
+    Uninstall,
+    /// Show what is registered and whether it is running.
+    Status,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Service management touches the user's service manager, not the
+    // daemon -- it has to work when nothing is running, which is the
+    // usual case the first time anyone runs it.
+    if let Command::Service { action } = &cli.command {
+        use anchor::service::Outcome;
+        match action {
+            ServiceAction::Install => match anchor::service::install()? {
+                Outcome::Installed(path) => println!("installed {}", path.display()),
+                other => println!("{other:?}"),
+            },
+            ServiceAction::Uninstall => match anchor::service::uninstall()? {
+                Outcome::Uninstalled(path) => println!("removed {}", path.display()),
+                Outcome::NotInstalled => println!("not installed; nothing to remove"),
+                other => println!("{other:?}"),
+            },
+            ServiceAction::Status => println!("{}", anchor::service::status()?),
+        }
+        return Ok(());
+    }
 
     // The daemon runs the same startup as `anchord`; it does not connect to
     // a socket, it binds one.
@@ -135,6 +171,7 @@ fn main() -> Result<()> {
         }
         Command::Label { id, changes } => label(&mut client, &id, &changes),
         Command::Daemon => unreachable!("handled above"),
+        Command::Service { .. } => unreachable!("handled above"),
     }
 }
 
