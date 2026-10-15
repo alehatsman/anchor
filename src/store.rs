@@ -224,6 +224,28 @@ impl Store {
         Ok(rows > 0)
     }
 
+    /// Records a session whose child never started.
+    ///
+    /// The row exists before the spawn — it has to, so the child can never
+    /// emit a byte that nothing is recorded for — which means a failed
+    /// spawn leaves a row claiming to be running with no process behind it.
+    /// Nothing would ever correct it: startup recovery would call it `lost`
+    /// after a restart, implying it ran and vanished, which it never did.
+    pub fn mark_spawn_failed(&self, id: &str, exited_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions
+                SET state = ?2, lost_reason = ?3, exited_at = ?4
+              WHERE id = ?1",
+            rusqlite::params![
+                id,
+                State::Exited.as_str(),
+                lost_reason::SPAWN_FAILED,
+                exited_at,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Records the size actually applied to a session's PTY.
     pub fn set_size(&self, id: &str, cols: u16, rows: u16) -> Result<()> {
         self.conn.execute(

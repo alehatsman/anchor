@@ -337,3 +337,51 @@ mod live {
         session.terminate().expect("terminate");
     }
 }
+
+/// A create whose child never starts must not leave a row claiming to be
+/// running — docs/02-model.md's create sequence: "spawn ← failure: row →
+/// EXITED, lost_reason=spawn_failed".
+///
+/// Driven at the store, deliberately. A bad command does not reach this
+/// path on Unix: `posix_spawn` forks first and the exec failure happens in
+/// the *child*, which writes its error to the PTY and exits — so the parent
+/// sees a successful spawn and an ordinary non-zero exit, which the reaper
+/// already records. What actually reaches the failure path is resource
+/// exhaustion — `openpty`, or a thread that cannot be spawned — and
+/// contriving that in a test would be far less honest than naming it.
+#[test]
+fn a_failed_spawn_leaves_no_phantom_running_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths(&dir);
+    let mut store = Store::open(&paths).unwrap();
+
+    // The row exists before the spawn, by design: the child must never be
+    // able to emit a byte that nothing is recorded for.
+    let session = session_with(BTreeMap::new());
+    store.insert(&session).unwrap();
+    assert_eq!(
+        store.get(&session.id).unwrap().unwrap().state,
+        anchor::model::State::Running
+    );
+
+    store
+        .mark_spawn_failed(&session.id, 1_700_000_000_000)
+        .unwrap();
+
+    let row = store.get(&session.id).unwrap().unwrap();
+    assert_eq!(
+        row.state,
+        anchor::model::State::Exited,
+        "a session whose child never started must not read as running"
+    );
+    assert_eq!(
+        row.lost_reason.as_deref(),
+        Some(anchor::model::lost_reason::SPAWN_FAILED)
+    );
+    assert_eq!(row.exited_at, Some(1_700_000_000_000));
+
+    // Not `lost`: lost means it ran and the daemon lost track of it. This
+    // one never ran, and a restart must not promote it to a session that
+    // once existed.
+    assert_ne!(row.state, anchor::model::State::Lost);
+}

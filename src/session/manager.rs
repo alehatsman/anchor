@@ -237,7 +237,7 @@ impl SessionManager {
                 }
             }
         })
-        .map_err(CreateError::Spawn)?;
+        .map_err(|e| self.fail_row(&id, CreateError::Spawn(e)))?;
 
         let (exited_tx, exited) = watch::channel(false);
         let (eof_tx, eof) = watch::channel(false);
@@ -283,9 +283,9 @@ impl SessionManager {
         // connection without an answer — which is exactly how this was
         // found, under thread pressure from a parallel test suite.
         spawn_exit_listener(Arc::clone(&session), spawned.exit_rx, self.store.clone())
-            .map_err(|e| CreateError::Spawn(e.into()))?;
+            .map_err(|e| self.fail_row(&id, CreateError::Spawn(e.into())))?;
         spawn_eof_listener(Arc::clone(&session), spawned.eof_rx)
-            .map_err(|e| CreateError::Spawn(e.into()))?;
+            .map_err(|e| self.fail_row(&id, CreateError::Spawn(e.into())))?;
 
         self.sessions.lock().push(Arc::clone(&session));
         Ok(session)
@@ -335,6 +335,22 @@ impl SessionManager {
             })
             .map(Arc::clone)
             .collect()
+    }
+
+    /// Marks a row whose child never started, and returns the error that
+    /// caused it unchanged.
+    ///
+    /// Every failure between inserting the row and having a live session
+    /// goes through here: the row is already visible to `get` and `list`,
+    /// and leaving it `running` would advertise a process that does not
+    /// exist and never did.
+    fn fail_row(&self, id: &str, error: CreateError) -> CreateError {
+        if let Some(store) = &self.store {
+            if let Err(e) = lock(store).mark_spawn_failed(id, crate::now_ms()) {
+                warn!(session = %id, error = %e, "recording a failed spawn failed");
+            }
+        }
+        error
     }
 
     /// One session by id, live or exited, until it is purged.
