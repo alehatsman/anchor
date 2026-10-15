@@ -477,6 +477,15 @@ fn op_resize(id: u64, line: &str, state: &State) -> Value {
     let Some(session) = state.manager.get(&req.session) else {
         return not_live(id, &req.session, state);
     };
+    // `resize` is deliberately not gated on the lease, and that is a known
+    // gap rather than an oversight — see docs/04-protocol.md.
+    //
+    // The lease is per-connection. A client holds it on its *attach*
+    // connection, and `resize` is a control op on a different one, which
+    // cannot prove anything about a lease it does not hold. Gating here
+    // would not restrict observers; it would make resize impossible for
+    // every client, including the controller. Closing this properly needs
+    // resize to travel on the attached connection as a frame.
     match session.resize(req.cols, req.rows) {
         Ok(()) => proto::ok(id, json!({ "cols": req.cols, "rows": req.rows })),
         Err(e) => proto::error(id, ErrorCode::AlreadyExited, e.to_string()),

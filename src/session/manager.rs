@@ -469,7 +469,14 @@ fn spawn_exit_listener(
             let exited_at = crate::now_ms();
             {
                 let mut runtime = session.runtime.lock();
-                runtime.state = State::Exited;
+                // A kill timeout means the child was signalled and never
+                // observed exiting, so the daemon cannot say how it ended:
+                // that is `lost`, not `exited`. See docs/02-model.md.
+                runtime.state = if reason == Some(lost_reason::KILL_TIMEOUT) {
+                    State::Lost
+                } else {
+                    State::Exited
+                };
                 runtime.exit_code = exit_code;
                 runtime.lost_reason = reason;
                 runtime.exited_at = Some(exited_at);
@@ -501,9 +508,18 @@ fn spawn_eof_listener(
     std::thread::Builder::new()
         .name("session-eof".into())
         .spawn(move || {
-            if eof_rx.recv().is_ok() {
-                let _ = session.eof_tx.send(true);
+            if eof_rx.recv().is_err() {
+                return;
             }
+            let _ = session.eof_tx.send(true);
+
+            // EOF on the master means no byte will ever follow, so the
+            // subscribers can be released. Without this their senders live
+            // as long as the session is listed, and `Subscription::recv`
+            // never returns `None` — every consumer has to infer the end
+            // from somewhere else, which is exactly the kind of implicit
+            // contract that gets a trailing chunk dropped.
+            session.close_subscribers();
         })
         .map(|_| ())
 }

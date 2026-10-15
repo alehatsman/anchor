@@ -64,12 +64,23 @@ Rules:
         any state, daemon restarted with no live PTY        ──▶ LOST
 ```
 
-`LOST` carries `lost_reason`: `daemon_restart`, `spawn_failed`,
-`kill_timeout`.
+**`EXITED` means the daemon can say how the session ended. `LOST` means it
+cannot.** That is the whole distinction, and it decides which state each
+reason belongs to:
 
-`io_error` is the fourth value and the odd one out: it records that writing
-`output.vt` failed, and it can be set **while the child is still running**.
-The session continues; only persistence stopped.
+| reason | state | why |
+|---|---|---|
+| `spawn_failed` | `EXITED` | it never started. That is a complete account. |
+| `kill_timeout` | `LOST` | it was killed and never observed exiting. The daemon does not know what happened to it. |
+| `daemon_restart` | `LOST` | the PTY died with the daemon; whatever the child did last was never seen. |
+| `io_error` | — | not terminal: persistence stopped while the session kept running (see the size cap). |
+
+An earlier version of this doc listed `spawn_failed` under `LOST` in one
+place and `EXITED` in another. The rule above is what resolves it.
+
+`io_error` is the odd one out: it records that writing `output.vt` failed,
+and it can be set **while the child is still running**. The session
+continues; only persistence stopped.
 
 **EXITED fires off the reaper's `wait()`, not off reader EOF.** A descendant
 that inherited the PTY can hold the master open long after the child is gone.

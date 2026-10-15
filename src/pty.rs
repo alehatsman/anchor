@@ -49,6 +49,15 @@ const WRITE_CHANNEL_CAPACITY: usize = 32;
 /// reference instead of a mutex. Control traffic is rare and short.
 const CONTROL_CHANNEL_CAPACITY: usize = 8;
 
+/// Longest a `write` will wait for room on the write channel.
+///
+/// The channel only fills when the child has stopped reading its PTY, and a
+/// caller holds the control lease across this call — so an unbounded wait
+/// there wedges every other lease operation behind a child that may never
+/// read again. A keystroke that cannot be delivered in this long is not
+/// going to be; saying so beats blocking.
+const WRITE_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// Bounded wait for the graceful signal before the hard kill.
 const GRACEFUL_WAIT: Duration = Duration::from_secs(5);
 /// Bounded wait for the hard kill before giving up.
@@ -68,10 +77,11 @@ const STATE_EXITED: u8 = 2;
 /// belongs here, not at the call site.
 pub trait TerminalSession {
     /// Enqueues `bytes` onto the write channel; the writer thread sends them
-    /// on. Normally returns immediately, but if the child never reads its PTY
-    /// and the channel is already full, this blocks the caller until it
-    /// drains or the session exits — unlike `terminate`, that bound is not
-    /// enforced here.
+    /// on. Normally returns immediately. If the child has stopped reading
+    /// its PTY and the channel is full, this waits up to
+    /// `WRITE_ENQUEUE_TIMEOUT` and then fails rather than blocking: callers
+    /// hold the control lease across this call, so an unbounded wait would
+    /// wedge every other lease operation behind an unresponsive child.
     ///
     /// Takes `&self`: every method here only sends on a channel or touches an
     /// atomic. A caller wrapping this in a mutex just to call `write` would
@@ -305,9 +315,27 @@ impl TerminalSession for PtySession {
         if self.state.load(Ordering::SeqCst) != STATE_RUNNING {
             bail!("session is closing or has exited; input rejected");
         }
-        self.write_tx
-            .send(bytes.to_vec())
-            .context("pty writer thread is gone")
+        // `SyncSender` has no bounded send, so the bound is explicit:
+        // retry until the deadline, then give up. The retry interval is
+        // short relative to the timeout, so a channel that drains is
+        // noticed promptly rather than after a fixed sleep.
+        let deadline = Instant::now() + WRITE_ENQUEUE_TIMEOUT;
+        let mut pending = bytes.to_vec();
+        loop {
+            match self.write_tx.try_send(pending) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Full(returned)) => {
+                    if Instant::now() >= deadline {
+                        bail!("the child is not reading its input; try again");
+                    }
+                    pending = returned;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    bail!("pty writer thread is gone")
+                }
+            }
+        }
     }
 
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {

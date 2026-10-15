@@ -202,7 +202,10 @@ impl Store {
               WHERE id = ?1",
             rusqlite::params![
                 session.id,
-                State::Exited.as_str(),
+                // Written from the snapshot rather than assumed: a kill
+                // timeout lands here as `lost`, because the daemon never
+                // saw the child exit (docs/02-model.md).
+                session.state.as_str(),
                 session.exit_code,
                 session.lost_reason,
                 session.exited_at,

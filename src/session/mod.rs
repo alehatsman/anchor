@@ -342,6 +342,14 @@ impl Session {
         self.lease_changes.subscribe()
     }
 
+    /// Releases every subscriber, ending their streams.
+    ///
+    /// Called once the PTY master reports EOF: no further output can exist,
+    /// so a subscriber waiting for more is waiting for nothing.
+    pub fn close_subscribers(&self) {
+        self.fanout.lock().subscribers.clear();
+    }
+
     /// Replaces this session's labels wholesale.
     pub fn set_labels(&self, labels: std::collections::BTreeMap<String, String>) {
         *self.labels.lock() = labels;

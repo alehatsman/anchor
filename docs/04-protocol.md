@@ -122,6 +122,18 @@ Every attached connection is told when the lease moves, not only the two
 involved: a bystander learns control is taken rather than discovering it
 when its own keystrokes stop working.
 
+**`resize` is not gated on the lease, and should be.** One effective PTY
+size means a resize belongs to whoever is typing, but the lease is
+per-connection: a client holds it on its *attach* connection, while
+`resize` is a control op issued on a different one that can prove nothing
+about it. Gating the control op would not stop an observer — it would stop
+everyone, the controller included.
+
+Closing this needs resize to travel on the attached connection, as a frame
+alongside `input`, where the lease is already known. Until then any client
+may resize any session, which is a real gap: an observer can reshape the
+terminal under the person working in it.
+
 **The lease is per-connection.** One connection is one client: the daemon
 identifies a holder by the connection itself, so there is no client id on
 the wire. The lease is released when that connection ends — including a
