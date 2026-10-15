@@ -98,6 +98,10 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
+    // One connection is one client, for the control lease. docs/04-protocol.md
+    // leaves lease identity to an open issue, and per-connection is the
+    // honest reading of "exactly one writer of input and size".
+    let holder = crate::model::new_session_id();
 
     loop {
         line.clear();
@@ -126,8 +130,105 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
             continue;
         }
 
+        // `attach` is the one op that can stop returning to this loop: on
+        // success the connection carries binary frames from here on. A
+        // refused attach is an ordinary error response and the connection
+        // stays a control connection.
+        if is_attach(&line) {
+            match attach_check(&line, &state) {
+                Err(err) => {
+                    respond(&mut write_half, err).await?;
+                    continue;
+                }
+                Ok((session, req)) => {
+                    // Attach never preempts: asking for control while
+                    // someone else holds it still attaches, as an observer.
+                    let epoch = if req.control {
+                        session.take_control(&holder)
+                    } else {
+                        None
+                    };
+                    respond(
+                        &mut write_half,
+                        proto::ok(
+                            req.id,
+                            json!({
+                                "offset": req.from,
+                                "control": epoch.is_some(),
+                                "next_offset": session.next_offset(),
+                            }),
+                        ),
+                    )
+                    .await?;
+
+                    // The reader may already hold bytes the client
+                    // pipelined after its attach line — `into_inner` would
+                    // drop them — so they are carried over.
+                    let buffered = reader.buffer().to_vec();
+                    return crate::stream::serve_attached(
+                        write_half,
+                        reader.into_inner(),
+                        buffered,
+                        session,
+                        req.from,
+                        holder,
+                        epoch,
+                    )
+                    .await;
+                }
+            }
+        }
+
         respond(&mut write_half, dispatch(&line, &state)).await?;
     }
+}
+
+/// Whether this line is an `attach`, decided before the op-specific parse so
+/// a malformed attach still gets a normal error response.
+fn is_attach(line: &str) -> bool {
+    serde_json::from_str::<Request>(line)
+        .map(|r| r.op == "attach")
+        .unwrap_or(false)
+}
+
+#[derive(Deserialize)]
+struct AttachReq {
+    id: u64,
+    session: String,
+    #[serde(default)]
+    from: u64,
+    #[serde(default)]
+    control: bool,
+}
+
+/// Validates an `attach` without touching the connection, so a refusal can
+/// be answered like any other error and the connection carries on.
+fn attach_check(
+    line: &str,
+    state: &State,
+) -> Result<(Arc<crate::session::Session>, AttachReq), Value> {
+    let req: AttachReq = serde_json::from_str(line).map_err(|e| {
+        let id = serde_json::from_str::<Request>(line)
+            .map(|r| r.id)
+            .unwrap_or(0);
+        proto::error(id, ErrorCode::InvalidSpec, e.to_string())
+    })?;
+
+    let Some(session) = state.manager.get(&req.session) else {
+        return Err(not_live(req.id, &req.session, state));
+    };
+
+    // An offset past the head is a client that has lost track of the
+    // stream. Say so rather than silently rewinding it.
+    let next_offset = session.next_offset();
+    if req.from > next_offset {
+        return Err(proto::error(
+            req.id,
+            ErrorCode::InvalidSpec,
+            format!("from {} is ahead of next_offset {next_offset}", req.from),
+        ));
+    }
+    Ok((session, req))
 }
 
 /// Answers one control request. Never panics, never drops the connection.

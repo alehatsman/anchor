@@ -99,6 +99,23 @@ log file uses, deliberately: **recover by offset, never by guessing.**
 observer and the response says `control:false`. A client takes the lease
 explicitly with a later `attach` or a dedicated `claim` — see issue.
 
+**The lease is per-connection.** One connection is one client: the daemon
+identifies a holder by the connection itself, so there is no client id on
+the wire. The lease is released when that connection ends — including a
+client that vanishes while the session is quiet, which is why an attached
+connection ends as soon as *either* direction does, rather than waiting for
+the next chunk to fail a write. A lease stranded on a dead connection would
+lock every other client out of typing.
+
+Input is checked against the lease **per frame**, so a connection preempted
+mid-stream stops being able to type immediately rather than at its next
+attach. An observer's input frames are read and discarded — the read is what
+makes its disconnect noticeable.
+
+A refused `attach` is an ordinary error response: the connection stays a
+control connection and may try again. Only a successful one switches
+framing.
+
 Backpressure: if a subscriber's queue overflows, the daemon closes that
 connection. That is normal. Reconnect and replay.
 
