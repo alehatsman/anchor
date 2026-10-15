@@ -105,6 +105,12 @@ pub struct Session {
     /// connection watches this so it learns it has been preempted, rather
     /// than discovering it when its next keystroke is silently dropped.
     pub(crate) lease_changes: tokio::sync::broadcast::Sender<String>,
+    /// Announces the size actually applied to the pty. Same reasoning as
+    /// `lease_changes`: a client resized by some *other* client would
+    /// otherwise keep rendering at a width the pty no longer has, with
+    /// nothing it can observe to tell it -- output is bytes, and geometry
+    /// is not in them.
+    pub(crate) size_changes: tokio::sync::broadcast::Sender<(u16, u16)>,
     created_at: i64,
     /// `true` once the exit listener has recorded a final state. A `watch`,
     /// not a one-shot: "has this exited yet" is a level, and a client that
@@ -300,6 +306,14 @@ impl Session {
         if let Some(persist) = &self.persist {
             persist.note_size(&self.id, cols, rows);
         }
+        // Announced from here, the one place both the control op and the
+        // resize frame reach, and only after the pty accepted it -- so
+        // what goes out is the size that is true, not the size that was
+        // asked for. An error above returns early and announces nothing.
+        //
+        // No subscribers is the ordinary case for an unattached session,
+        // not a failure.
+        let _ = self.size_changes.send((cols, rows));
         Ok(())
     }
 
@@ -351,6 +365,12 @@ impl Session {
     pub fn watch_lease(&self) -> tokio::sync::broadcast::Receiver<String> {
         self.lease_changes.subscribe()
     }
+
+    /// Subscribes to applied-size changes. See `size_changes`.
+    pub fn watch_size(&self) -> tokio::sync::broadcast::Receiver<(u16, u16)> {
+        self.size_changes.subscribe()
+    }
+
 
     /// Releases every subscriber, ending their streams.
     ///

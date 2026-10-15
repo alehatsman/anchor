@@ -269,6 +269,7 @@ impl SessionManager {
             // Capacity is small on purpose: lease changes are rare, and a
             // receiver that lagged past them resyncs from the next frame.
             lease_changes: tokio::sync::broadcast::channel(16).0,
+            size_changes: tokio::sync::broadcast::channel(16).0,
             created_at,
             exited,
             exited_tx,

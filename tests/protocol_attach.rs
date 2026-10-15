@@ -692,3 +692,116 @@ async fn a_resize_frame_is_clamped_like_the_control_op() {
 
     setup.call("terminate", json!({ "session": &id }));
 }
+
+/// Every attached client is told when the size changes, including the one
+/// that asked.
+///
+/// Output is bytes and geometry is not in them, so a client resized by
+/// some *other* client has nothing it can observe that says so -- it just
+/// keeps rendering at a width the pty no longer has. Same reasoning as the
+/// lease: anchor is opinionated about there being one effective size, so
+/// it owes every attached client the current one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resize_is_announced_to_everyone_attached() {
+    let (_dir, socket) = harness();
+    let mut setup = Conn::connect(&socket);
+    let id = create_shell(&mut setup);
+
+    let mut controller = Conn::connect(&socket);
+    let reply = controller.call(
+        "attach",
+        json!({ "session": &id, "from": 0, "control": true }),
+    );
+    // The reply carries the size, so a client starts from the truth rather
+    // than waiting for a change that may never come.
+    assert_eq!(reply["cols"], 80, "attach reply is missing the size: {reply}");
+    assert_eq!(reply["rows"], 24);
+    assert_eq!(controller.frame().2, vec![1]);
+    controller.read_until("ready");
+
+    let mut observer = Conn::connect(&socket);
+    let seen = observer.call("attach", json!({ "session": &id, "from": 0 }));
+    assert_eq!(seen["cols"], 80);
+    assert_eq!(observer.frame().2, vec![0]);
+
+    // The controller resizes; the observer must hear about it.
+    controller
+        .writer
+        .write_all(&frame::encode(
+            frame::RESIZE,
+            0,
+            &frame::encode_size(133, 51),
+        ))
+        .unwrap();
+    controller.writer.flush().unwrap();
+
+    assert_eq!(
+        next_resize(&mut observer),
+        (133, 51),
+        "a bystander was never told the terminal changed size"
+    );
+    // And the originator too: it must not assume what it asked for is what
+    // it got.
+    assert_eq!(next_resize(&mut controller), (133, 51));
+
+    setup.call("terminate", json!({ "session": &id }));
+}
+
+/// What is announced is the size that was *applied*, not the size that was
+/// asked for.
+///
+/// A client that asks past the clamp and is told its own request back
+/// would render at a width the pty refused -- the echo would be worse than
+/// silence, because it looks authoritative.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_announced_size_is_the_one_that_was_applied() {
+    let (_dir, socket) = harness();
+    let mut setup = Conn::connect(&socket);
+    let id = create_shell(&mut setup);
+
+    let mut controller = Conn::connect(&socket);
+    controller.call(
+        "attach",
+        json!({ "session": &id, "from": 0, "control": true }),
+    );
+    assert_eq!(controller.frame().2, vec![1]);
+    controller.read_until("ready");
+
+    controller
+        .writer
+        .write_all(&frame::encode(
+            frame::RESIZE,
+            0,
+            &frame::encode_size(5000, 5000),
+        ))
+        .unwrap();
+    controller.writer.flush().unwrap();
+
+    assert_eq!(
+        next_resize(&mut controller),
+        (1000, 1000),
+        "the client was told its own request back instead of the clamp"
+    );
+
+    setup.call("terminate", json!({ "session": &id }));
+}
+
+/// Reads frames until a resize arrives, returning its size. Output frames
+/// in between are ordinary -- the session is still running.
+fn next_resize(conn: &mut Conn) -> (u16, u16) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (tag, _offset, payload) = conn.frame();
+        if tag == frame::RESIZE {
+            assert_eq!(payload.len(), 4, "a resize payload is two u16s");
+            return (
+                u16::from_be_bytes([payload[0], payload[1]]),
+                u16::from_be_bytes([payload[2], payload[3]]),
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no resize frame arrived; last tag was {tag:#04x}"
+        );
+    }
+}

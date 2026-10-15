@@ -91,6 +91,10 @@ pub async fn serve_attached(
     // claim is never seen, and this connection goes on believing it may
     // type — the one thing the lease exists to prevent.
     let lease_changes = session.watch_lease();
+    // Subscribed before the first frame goes out, like the lease: a change
+    // landing in the gap between attaching and subscribing is a change
+    // this connection would never hear about.
+    let size_changes = session.watch_size();
 
     let holds_control = control_epoch.is_some();
     write_frame(&mut out, frame::LEASE, 0, &[u8::from(holds_control)]).await?;
@@ -130,7 +134,8 @@ pub async fn serve_attached(
         from,
         &holder,
         &epoch,
-        lease_changes
+        lease_changes,
+        size_changes
     ));
     let result = tokio::select! {
         result = output.as_mut() => result,
@@ -168,6 +173,7 @@ async fn pump_output(
     holder: &str,
     epoch: &Arc<parking_lot::Mutex<Option<u64>>>,
     mut lease_changes: tokio::sync::broadcast::Receiver<String>,
+    mut size_changes: tokio::sync::broadcast::Receiver<(u16, u16)>,
 ) -> Result<()> {
     let replay = session.attach(from).context("beginning the attach")?;
 
@@ -219,6 +225,29 @@ async fn pump_output(
                         tokio::time::timeout(EXIT_REAP_GRACE, session.wait_exited()).await;
                     exited = true;
                     break;
+                }
+            },
+            size = size_changes.recv() => {
+                // The pty's size changed, possibly at some other client's
+                // request. Everyone attached is told, the originator
+                // included: what goes out is the size actually applied, so
+                // a client that asked for more than the clamp allows
+                // learns what it really got.
+                match size {
+                    Ok((cols, rows)) => {
+                        write_frame(out, frame::RESIZE, 0, &frame::encode_size(cols, rows))
+                            .await?;
+                    }
+                    // Lagged past one or more changes. Only the latest
+                    // matters -- a size is a level, not an event -- so
+                    // read the current one rather than replaying history.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let (cols, rows) = session.size();
+                        write_frame(out, frame::RESIZE, 0, &frame::encode_size(cols, rows))
+                            .await?;
+                    }
+                    // The session is tearing down; the other arms notice.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                 }
             },
             change = lease_changes.recv() => {

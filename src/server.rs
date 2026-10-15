@@ -239,6 +239,11 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
                                 "offset": req.from,
                                 "control": epoch.is_some(),
                                 "next_offset": session.next_offset(),
+                                // So a client starts from the real size
+                                // rather than waiting for a change that
+                                // may never come. See docs/04-protocol.md.
+                                "cols": session.size().0,
+                                "rows": session.size().1,
                             }),
                         ),
                     )

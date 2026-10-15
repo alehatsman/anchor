@@ -119,13 +119,42 @@ Frame:
 │ u8 tag │ u64 off  │ u32 len  │ payload      │
 └────────┴──────────┴──────────┴──────────────┘
 
+client → daemon:
+
+tag 0x02  input    lease holder only
+tag 0x04  lease    payload 1 = claim control
+tag 0x05  resize   payload = cols,rows as u16 BE each; lease holder only
+
+daemon → client:
+
 tag 0x01  output   off = offset of first byte
-tag 0x02  input    (client → daemon, lease holder only)
-          0x04  lease    (client → daemon, payload 1 = claim control)
-tag 0x05  resize   (client → daemon, payload = cols,rows as u16 BE each)
 tag 0x03  exit     payload = exit code as i32 LE, or empty if unknown
 tag 0x04  lease    payload = 1 if this client now holds it, 0 if revoked
+tag 0x05  resize   payload = cols,rows as u16 BE each; the size now applied
 ```
+
+`0x04` and `0x05` travel in both directions and mean different things each
+way. Outbound they are statements of fact — this is who holds the lease,
+this is the size the pty now has. Inbound they are requests, honoured only
+from the lease holder.
+
+A client is told when the size changes, for the same reason it is told when
+the lease moves: one effective size is the thing anchor is opinionated about
+(docs/01-scope.md), so every attached client has to be able to learn the
+current one without asking. Without it, a client whose session is resized by
+some *other* client keeps rendering at a width the pty no longer has, and
+nothing it can observe says so — output is just bytes, and geometry is not
+in them.
+
+The frame carries the size **actually applied**: after clamping, and after
+the coalescing window closes. A client that sends `5000` and is told `1000`
+is being told the truth rather than its own request echoed back, and the
+originator is told too — a client must not assume the size it asked for is
+the size it got.
+
+The `attach` reply carries `cols` and `rows` for the same reason, so a
+client starts from the real size instead of waiting for a change that may
+never come.
 
 `tag` and `off` are followed by a **`u32` payload length**: a stream has no
 other boundary, and without it a reader cannot tell where one frame ends and
