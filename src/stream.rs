@@ -77,6 +77,11 @@ pub async fn serve_attached(
     let holds_control = control_epoch.is_some();
     write_frame(&mut out, frame::LEASE, 0, &[u8::from(holds_control)]).await?;
 
+    // Shared, because either half can change it: the input half when the
+    // client claims the lease, and the output half's view of whether this
+    // connection still holds it after someone else does.
+    let epoch = Arc::new(parking_lot::Mutex::new(control_epoch));
+
     // The lease is per-connection, so it must not outlive this one. A guard
     // rather than a line at the end: this returns on a client disconnect, a
     // write error and a normal exit alike, and a lease stuck on a dead
@@ -84,7 +89,7 @@ pub async fn serve_attached(
     let _lease = LeaseGuard {
         session: Arc::clone(&session),
         holder: holder.clone(),
-        epoch: control_epoch,
+        epoch: Arc::clone(&epoch),
     };
 
     // Input runs independently: a client that only observes never sends a
@@ -94,7 +99,7 @@ pub async fn serve_attached(
         std::io::Cursor::new(buffered).chain(input),
         Arc::clone(&session),
         holder.clone(),
-        control_epoch,
+        Arc::clone(&epoch),
     ));
 
     // Either half ending ends the connection. Waiting only on the output
@@ -102,7 +107,7 @@ pub async fn serve_attached(
     // there is no write to fail, so nothing would notice until the next
     // chunk — and the lease would stay held on a dead connection until then.
     let result = tokio::select! {
-        result = pump_output(&mut out, &session, from) => result,
+        result = pump_output(&mut out, &session, from, &holder, &epoch) => result,
         _ = &mut input_task => Ok(()),
     };
     input_task.abort();
@@ -110,7 +115,14 @@ pub async fn serve_attached(
 }
 
 /// Catch-up rounds, then the live subscription, then `exit`.
-async fn pump_output(out: &mut OwnedWriteHalf, session: &Arc<Session>, from: u64) -> Result<()> {
+async fn pump_output(
+    out: &mut OwnedWriteHalf,
+    session: &Arc<Session>,
+    from: u64,
+    holder: &str,
+    epoch: &Arc<parking_lot::Mutex<Option<u64>>>,
+) -> Result<()> {
+    let mut lease_changes = session.watch_lease();
     let replay = session.attach(from).context("beginning the attach")?;
 
     // Catch up in bounded rounds. Each round is written to the client before
@@ -148,6 +160,18 @@ async fn pump_output(out: &mut OwnedWriteHalf, session: &Arc<Session>, from: u64
                 // this subscriber fell behind and was dropped — and those
                 // are not the same thing to tell a client.
                 None => break,
+            },
+            change = lease_changes.recv() => {
+                // The lease moved. Tell this connection where it now
+                // stands, so a preempted client stops typing into a void
+                // and a bystander learns control is taken.
+                if let Ok(new_holder) = change {
+                    let mine = new_holder == holder;
+                    if !mine {
+                        *epoch.lock() = None;
+                    }
+                    write_frame(out, frame::LEASE, 0, &[u8::from(mine)]).await?;
+                }
             },
             () = session.wait_exited() => {
                 // Bounded wait for the reader thread to catch up, then mop
@@ -213,7 +237,7 @@ async fn pump_input(
     mut input: impl tokio::io::AsyncRead + Unpin,
     session: Arc<Session>,
     holder: String,
-    control_epoch: Option<u64>,
+    epoch: Arc<parking_lot::Mutex<Option<u64>>>,
 ) {
     let mut header = [0u8; frame::HEADER_LEN];
     loop {
@@ -231,17 +255,27 @@ async fn pump_input(
         if input.read_exact(&mut payload).await.is_err() {
             return;
         }
+        // A lease frame from the client is a claim: take control, even
+        // from a holder that has it. Attach never preempts — this is the
+        // explicit act that does, which is why it is a separate request
+        // rather than a flag on attach.
+        if tag == frame::LEASE {
+            *epoch.lock() = Some(session.claim_control(&holder));
+            continue;
+        }
         if tag != frame::INPUT {
-            continue; // only input flows this way
+            continue; // nothing else flows this way
         }
 
         // An observer reads its socket purely so a disconnect is noticed;
         // nothing it sends is ever applied.
-        let Some(epoch) = control_epoch else { continue };
+        let Some(current) = *epoch.lock() else {
+            continue;
+        };
 
         // Checked per frame: a connection preempted mid-stream stops being
         // able to type the moment the lease moves.
-        match session.write_if_controller(&holder, epoch, &payload) {
+        match session.write_if_controller(&holder, current, &payload) {
             Ok(()) => {}
             Err(None) => {
                 tracing::debug!(session = %session.id, "input from a non-controller; ignored");
@@ -276,12 +310,12 @@ async fn write_frame(out: &mut OwnedWriteHalf, tag: u8, offset: u64, payload: &[
 struct LeaseGuard {
     session: Arc<Session>,
     holder: String,
-    epoch: Option<u64>,
+    epoch: Arc<parking_lot::Mutex<Option<u64>>>,
 }
 
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
-        if let Some(epoch) = self.epoch {
+        if let Some(epoch) = *self.epoch.lock() {
             self.session.release_control(&self.holder, epoch);
         }
     }

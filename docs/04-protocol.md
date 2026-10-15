@@ -89,6 +89,7 @@ Frame:
 
 tag 0x01  output   off = offset of first byte
 tag 0x02  input    (client → daemon, lease holder only)
+          0x04  lease    (client → daemon, payload 1 = claim control)
 tag 0x03  exit     payload = exit code as i32 LE, or empty if unknown
 tag 0x04  lease    payload = 1 if this client now holds it, 0 if revoked
 ```
@@ -107,8 +108,19 @@ Offsets are the recovery mechanism. A client that drops reconnects with
 log file uses, deliberately: **recover by offset, never by guessing.**
 
 `control: true` requests the lease. If held, the attach still succeeds as an
-observer and the response says `control:false`. A client takes the lease
-explicitly with a later `attach` or a dedicated `claim` — see issue.
+observer and the response says `control:false`.
+
+**Claiming is a `lease` frame sent upstream.** A client that wants control
+from a holder sends tag `0x04` with payload `1` on its attached connection;
+the daemon moves the lease and tells both sides with `lease` frames — `1` to
+the new holder, `0` to the one that lost it. Attach deliberately never
+preempts, so this explicit act is the only thing that does, and it is a
+frame rather than a flag on `attach` because the connection is already
+streaming by the time a client decides to take over.
+
+Every attached connection is told when the lease moves, not only the two
+involved: a bystander learns control is taken rather than discovering it
+when its own keystrokes stop working.
 
 **The lease is per-connection.** One connection is one client: the daemon
 identifies a holder by the connection itself, so there is no client id on

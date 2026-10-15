@@ -101,6 +101,10 @@ pub struct Session {
     /// Queues the applied size for persistence, off this thread.
     persist: Option<crate::session::persist::OutputPersister>,
     pub(crate) control: Mutex<ControlLease>,
+    /// Announces the lease moving, carrying the new holder. Every attached
+    /// connection watches this so it learns it has been preempted, rather
+    /// than discovering it when its next keystroke is silently dropped.
+    pub(crate) lease_changes: tokio::sync::broadcast::Sender<String>,
     created_at: i64,
     /// `true` once the exit listener has recorded a final state. A `watch`,
     /// not a one-shot: "has this exited yet" is a level, and a client that
@@ -330,6 +334,12 @@ impl Session {
                 return;
             }
         }
+    }
+
+    /// Watches for the lease moving. The value carries the new holder's id,
+    /// so a connection can tell "I took it" from "someone took it from me".
+    pub fn watch_lease(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.lease_changes.subscribe()
     }
 
     /// Replaces this session's labels wholesale.

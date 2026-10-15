@@ -296,3 +296,72 @@ async fn attaching_past_the_head_is_refused() {
 
     control.call("terminate", json!({ "session": &id }));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_frame_claims_control_and_the_loser_is_told() {
+    let (_dir, socket) = harness();
+    let mut setup = Conn::connect(&socket);
+    let id = create_shell(&mut setup);
+
+    let mut first = Conn::connect(&socket);
+    first.call(
+        "attach",
+        json!({ "session": &id, "from": 0, "control": true }),
+    );
+    assert_eq!(first.frame().2, vec![1], "the lease was free");
+
+    // A second connection attaches as an observer — attach never preempts.
+    let mut second = Conn::connect(&socket);
+    second.call(
+        "attach",
+        json!({ "session": &id, "from": 0, "control": true }),
+    );
+    assert_eq!(second.frame().2, vec![0], "attach must not preempt");
+
+    first.read_until("ready");
+    second.read_until("ready");
+
+    // It claims control explicitly, which does preempt.
+    second
+        .writer
+        .write_all(&frame::encode(frame::LEASE, 0, &[1]))
+        .unwrap();
+    second.writer.flush().unwrap();
+
+    // The loser is told, rather than left typing into a void.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (tag, _, payload) = first.frame();
+        if tag == frame::LEASE {
+            assert_eq!(payload, vec![0], "the previous holder lost the lease");
+            break;
+        }
+        assert!(Instant::now() < deadline, "no revocation arrived");
+    }
+
+    // And the claimer is told it now holds it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (tag, _, payload) = second.frame();
+        if tag == frame::LEASE {
+            assert_eq!(payload, vec![1], "the claimer holds the lease");
+            break;
+        }
+        assert!(Instant::now() < deadline, "no grant arrived");
+    }
+
+    // Input now follows the lease: the claimer's reaches the PTY.
+    second.send_input(b"after-claim\n");
+    second.read_until("after-claim");
+
+    // The preempted connection's input is ignored from here on.
+    first.send_input(b"should-be-ignored\n");
+    second.send_input(b"marker-two\n");
+    let seen = second.read_until("marker-two");
+    assert!(
+        !seen.windows(17).any(|w| w == b"should-be-ignored"),
+        "a preempted connection must not be able to write"
+    );
+
+    setup.call("terminate", json!({ "session": &id }));
+}

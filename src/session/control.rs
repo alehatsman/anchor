@@ -36,11 +36,19 @@ impl Session {
 
     /// Takes the lease unconditionally, preempting the current holder.
     /// Returns the epoch this caller now holds.
+    ///
+    /// Announces the change, so the connection that just lost it is told
+    /// rather than left to discover it when its next keystroke vanishes.
     pub fn claim_control(&self, holder: &str) -> u64 {
-        let mut lease = self.control.lock();
-        lease.holder = Some(holder.to_string());
-        lease.epoch += 1;
-        lease.epoch
+        let epoch = {
+            let mut lease = self.control.lock();
+            lease.holder = Some(holder.to_string());
+            lease.epoch += 1;
+            lease.epoch
+        };
+        // Fails only when nothing is attached, which needs no announcement.
+        let _ = self.lease_changes.send(holder.to_string());
+        epoch
     }
 
     /// Releases the lease, if `holder` still holds it at `epoch`.

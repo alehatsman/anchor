@@ -266,6 +266,9 @@ impl SessionManager {
             }),
             persist: self.persister.clone(),
             control: Mutex::new(ControlLease::default()),
+            // Capacity is small on purpose: lease changes are rare, and a
+            // receiver that lagged past them resyncs from the next frame.
+            lease_changes: tokio::sync::broadcast::channel(16).0,
             created_at,
             exited,
             exited_tx,
