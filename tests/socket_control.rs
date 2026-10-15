@@ -6,15 +6,34 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use serde_json::Value;
+use std::sync::{Arc, Mutex};
 
 /// Serve on a socket in a temp dir for the duration of the test.
 fn serve(dir: &tempfile::TempDir) -> std::path::PathBuf {
     let socket = dir.path().join("anchor.sock");
     let listener = anchor::server::bind(&socket).unwrap();
+    let state = state(dir_paths(&socket));
     tokio::spawn(async move {
-        let _ = anchor::server::serve(listener).await;
+        let _ = anchor::server::serve(listener, state).await;
     });
     socket
+}
+
+/// A data dir beside the socket, so each test gets its own store and
+/// sessions root.
+fn dir_paths(socket: &std::path::Path) -> anchor::paths::Paths {
+    let data = socket.parent().unwrap().join("data");
+    let paths = anchor::paths::Paths::new(data, socket.to_path_buf());
+    paths.ensure_dirs().unwrap();
+    paths
+}
+
+fn state(paths: anchor::paths::Paths) -> anchor::server::State {
+    let store = Arc::new(Mutex::new(anchor::store::Store::open(&paths).unwrap()));
+    let manager = Arc::new(
+        anchor::session::SessionManager::new(paths.sessions_dir()).with_store(Arc::clone(&store)),
+    );
+    anchor::server::State::new(manager, store)
 }
 
 struct Client {
@@ -71,7 +90,9 @@ async fn an_unknown_op_is_an_error_not_a_disconnect() {
     let socket = serve(&dir);
     let mut client = Client::connect(&socket);
 
-    let reply = client.send_raw(r#"{"id":7,"op":"create"}"#);
+    // A name the daemon genuinely does not know. `create` was the stand-in
+    // for this before M3 implemented it.
+    let reply = client.send_raw(r#"{"id":7,"op":"teleport-me"}"#);
     assert_eq!(reply["id"], 7);
     assert_eq!(reply["ok"], false);
     assert_eq!(reply["error"]["code"], "unknown_op");
@@ -147,8 +168,9 @@ async fn a_stale_socket_file_is_replaced() {
     assert!(UnixStream::connect(&socket).is_err());
 
     let listener = anchor::server::bind(&socket).unwrap();
+    let state = state(dir_paths(&socket));
     tokio::spawn(async move {
-        let _ = anchor::server::serve(listener).await;
+        let _ = anchor::server::serve(listener, state).await;
     });
     let mut client = Client::connect(&socket);
     assert_eq!(client.send_raw(r#"{"id":1,"op":"ping"}"#)["ok"], true);

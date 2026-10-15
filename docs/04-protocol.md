@@ -28,9 +28,25 @@ Request:
 Response:
 
 ```json
+{"id":1,"ok":true,"session":"01J...","state":"running","pid":4242,"output_offset":0}
 {"id":2,"ok":true,"sessions":[{...}]}
 {"id":6,"ok":false,"error":{"code":"not_found","message":"no such session"}}
 ```
+
+`id` is the correlation id and nothing else. A session id travels as
+`session`, never as `id`, so a response is always answerable — `create`
+returning its new session under `id` would collide with the very field the
+client matches the response by.
+
+A session object omits `env`: a spec's environment can carry what a client
+passed in at create time, and echoing it back widens who can read it. The
+count goes out as `env_count`.
+
+`log` returns its range as a **byte array**, not a string. Raw PTY bytes are
+not UTF-8 in general — control sequences, and partial multi-byte characters
+at a chunk boundary — and a lossy conversion would corrupt the stream. One
+`log` response is capped at 4 MiB whatever `max` asks for; streaming is what
+`attach` is for.
 
 Error codes: `not_found`, `invalid_spec`, `invalid_label`, `spawn_failed`,
 `already_exited`, `lease_held`, `too_large`, `unknown_op`, `bad_request`.
@@ -56,15 +72,24 @@ desynchronised mid-line.
 Frame:
 
 ```text
-┌────────┬──────────┬──────────────┐
-│ u8 tag │ u64 off  │ payload      │
-└────────┴──────────┴──────────────┘
+┌────────┬──────────┬──────────┬──────────────┐
+│ u8 tag │ u64 off  │ u32 len  │ payload      │
+└────────┴──────────┴──────────┴──────────────┘
 
 tag 0x01  output   off = offset of first byte
 tag 0x02  input    (client → daemon, lease holder only)
 tag 0x03  exit     payload = exit code as i32 LE, or empty if unknown
 tag 0x04  lease    payload = 1 if this client now holds it, 0 if revoked
 ```
+
+`tag` and `off` are followed by a **`u32` payload length**: a stream has no
+other boundary, and without it a reader cannot tell where one frame ends and
+the next begins. `off` and `len` are big-endian — a header is read byte by
+byte off a socket and network order is the convention there. The `exit`
+payload stays little-endian because it is an `i32` as the host writes it.
+
+A `u32` caps one frame at 4 GiB, which no PTY read approaches: the reader
+chunks at 64 KiB.
 
 Offsets are the recovery mechanism. A client that drops reconnects with
 `from = last_offset + 1` and loses nothing. This is the same discipline the

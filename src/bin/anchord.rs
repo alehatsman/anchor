@@ -10,7 +10,11 @@
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
+use std::sync::{Arc, Mutex};
+
 use anchor::paths::Paths;
+use anchor::server::State;
+use anchor::session::SessionManager;
 use anchor::store::Store;
 
 #[tokio::main]
@@ -46,9 +50,16 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Bind before building the manager: if another daemon already holds the
+    // socket, fail before spawning anything.
     let listener = anchor::server::bind(paths.socket_path())?;
+
+    let store = Arc::new(Mutex::new(store));
+    let manager =
+        Arc::new(SessionManager::new(paths.sessions_dir()).with_store(Arc::clone(&store)));
+
     tracing::info!(socket = %paths.socket_path().display(), "listening");
-    anchor::server::serve(listener).await
+    anchor::server::serve(listener, State::new(manager, store)).await
 }
 
 /// Tracing from the first commit. `ANCHOR_LOG` overrides `RUST_LOG`.
