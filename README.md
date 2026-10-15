@@ -22,8 +22,16 @@ noticed. That is the entire pitch.
 
 ## Status
 
-**Design only. No code yet.** This repo currently holds the specification and
-roadmap. See [docs/](docs/) and the open issues.
+**M0 — skeleton.** `anchord` resolves its data dir, migrates its SQLite
+schema, recovers sessions left behind by a restart, and answers `ping` on a
+unix socket. No PTY layer yet; that is M1, and it is the milestone this
+project lives or dies on. See [ROADMAP.md](ROADMAP.md), [docs/](docs/) and
+the open issues.
+
+```sh
+cargo test          # store round-trip, migrations, restart recovery, socket
+cargo run --bin anchord
+```
 
 It is being extracted from [teleport](https://github.com/alehatsman/teleport),
 which already runs this subsystem in production as part of a larger product.

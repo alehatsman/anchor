@@ -1,0 +1,223 @@
+//! Session persistence. Single connection, single writer.
+//!
+//! Label *filtering* is M2; this layer stores and returns labels, nothing more.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, Row};
+
+use crate::model::{lost_reason, Session, SessionId, SpawnSpec, State};
+use crate::paths::Paths;
+
+pub struct Store {
+    conn: Connection,
+}
+
+impl Store {
+    pub fn open(paths: &Paths) -> Result<Self> {
+        let conn = crate::db::open(&paths.db_path())?;
+        Ok(Self { conn })
+    }
+
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Insert a session and its labels in one transaction.
+    pub fn insert(&mut self, session: &Session) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO sessions (
+                id, state, pid, exit_code, lost_reason,
+                command, args_json, cwd, env_json, login_shell,
+                cols, rows, spec_cols, spec_rows,
+                output_bytes, created_at, exited_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            rusqlite::params![
+                session.id,
+                session.state.as_str(),
+                session.pid,
+                session.exit_code,
+                session.lost_reason,
+                session.spec.command,
+                serde_json::to_string(&session.spec.args)?,
+                path_to_text(&session.spec.cwd),
+                serde_json::to_string(&session.spec.env)?,
+                session.spec.login_shell as i64,
+                session.cols,
+                session.rows,
+                session.spec.cols,
+                session.spec.rows,
+                session.output_bytes as i64,
+                session.created_at,
+                session.exited_at,
+            ],
+        )
+        .with_context(|| format!("inserting session {}", session.id))?;
+
+        {
+            let mut stmt =
+                tx.prepare("INSERT INTO labels (session_id, key, value) VALUES (?1, ?2, ?3)")?;
+            for (key, value) in &session.labels {
+                stmt.execute(rusqlite::params![session.id, key, value])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get(&self, id: &str) -> Result<Option<Session>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, state, pid, exit_code, lost_reason, command, args_json, cwd,
+                        env_json, login_shell, cols, rows, spec_cols, spec_rows,
+                        output_bytes, created_at, exited_at
+                 FROM sessions WHERE id = ?1",
+                [id],
+                session_from_row,
+            )
+            .optional()
+            .with_context(|| format!("reading session {id}"))?;
+
+        match row {
+            None => Ok(None),
+            Some(mut session) => {
+                session.labels = self.labels_for(&session.id)?;
+                Ok(Some(session))
+            }
+        }
+    }
+
+    /// All sessions, newest first. ULIDs sort by creation time.
+    pub fn list(&self) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, state, pid, exit_code, lost_reason, command, args_json, cwd,
+                    env_json, login_shell, cols, rows, spec_cols, spec_rows,
+                    output_bytes, created_at, exited_at
+             FROM sessions ORDER BY id DESC",
+        )?;
+        let mut sessions = stmt
+            .query_map([], session_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for session in &mut sessions {
+            session.labels = self.labels_for(&session.id)?;
+        }
+        Ok(sessions)
+    }
+
+    fn labels_for(&self, id: &str) -> Result<BTreeMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM labels WHERE session_id = ?1")?;
+        let labels = stmt
+            .query_map([id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+        Ok(labels)
+    }
+
+    pub fn set_output_bytes(&self, id: &str, bytes: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET output_bytes = ?2 WHERE id = ?1",
+            rusqlite::params![id, bytes as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Startup step: a daemon restart means no PTY survived, so every row
+    /// still claiming to be live is `lost`. Returns the number of rows moved.
+    pub fn mark_live_sessions_lost(&self) -> Result<usize> {
+        let now = crate::now_ms();
+        let n = self.conn.execute(
+            "UPDATE sessions
+                SET state = ?1, lost_reason = ?2, exited_at = COALESCE(exited_at, ?3)
+              WHERE state IN ('running', 'closing')",
+            rusqlite::params![State::Lost.as_str(), lost_reason::DAEMON_RESTART, now],
+        )?;
+        Ok(n)
+    }
+
+    /// Startup step: the output log file is authoritative for content, so the
+    /// cached `output_bytes` is corrected against its real length. A missing
+    /// file means zero bytes. Returns the number of rows corrected.
+    pub fn reconcile_output_bytes(&self, paths: &Paths) -> Result<usize> {
+        let mut stmt = self.conn.prepare("SELECT id, output_bytes FROM sessions")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut corrected = 0;
+        for (id, cached) in rows {
+            let actual = match std::fs::metadata(paths.output_log(&id)) {
+                Ok(meta) => meta.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("stat {}", paths.output_log(&id).display()))
+                }
+            };
+            if actual != cached {
+                tracing::warn!(session = %id, cached, actual, "output_bytes corrected from log file");
+                self.set_output_bytes(&id, actual)?;
+                corrected += 1;
+            }
+        }
+        Ok(corrected)
+    }
+}
+
+fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
+    let state_text: String = row.get("state")?;
+    let state = State::parse(&state_text).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            format!("unknown session state {state_text:?}").into(),
+        )
+    })?;
+
+    let args: Vec<String> = json_column(row, "args_json")?;
+    let env: BTreeMap<String, String> = json_column(row, "env_json")?;
+
+    Ok(Session {
+        id: row.get::<_, SessionId>("id")?,
+        labels: BTreeMap::new(), // filled in by the caller
+        spec: SpawnSpec {
+            command: row.get("command")?,
+            args,
+            cwd: PathBuf::from(row.get::<_, String>("cwd")?),
+            env,
+            cols: row.get("spec_cols")?,
+            rows: row.get("spec_rows")?,
+            login_shell: row.get::<_, i64>("login_shell")? != 0,
+        },
+        state,
+        pid: row.get("pid")?,
+        exit_code: row.get("exit_code")?,
+        lost_reason: row.get("lost_reason")?,
+        cols: row.get("cols")?,
+        rows: row.get("rows")?,
+        output_bytes: row.get::<_, i64>("output_bytes")? as u64,
+        created_at: row.get("created_at")?,
+        exited_at: row.get("exited_at")?,
+    })
+}
+
+fn json_column<T: serde::de::DeserializeOwned>(row: &Row<'_>, name: &str) -> rusqlite::Result<T> {
+    let raw: String = row.get(name)?;
+    serde_json::from_str(&raw).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+
+/// Paths are stored as text; a non-UTF-8 path is stored lossily. Rejecting
+/// one outright belongs in create-time validation, which arrives with `create`.
+fn path_to_text(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}

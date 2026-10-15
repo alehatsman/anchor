@@ -1,0 +1,24 @@
+[package]
+name = "anchor"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+description = "A local daemon that owns long-running PTY processes"
+repository = "https://github.com/alehatsman/anchor"
+publish = false
+
+[[bin]]
+name = "anchord"
+path = "src/bin/anchord.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ulid = "3.0.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

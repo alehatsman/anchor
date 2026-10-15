@@ -33,9 +33,16 @@ Response:
 ```
 
 Error codes: `not_found`, `invalid_spec`, `invalid_label`, `spawn_failed`,
-`already_exited`, `lease_held`, `too_large`, `unknown_op`.
+`already_exited`, `lease_held`, `too_large`, `unknown_op`, `bad_request`.
 
 An unknown `op` returns an error; it never drops the connection.
+
+`bad_request` is for a line that is not a request object at all — malformed
+JSON, or no `op`. `invalid_spec` means the request parsed and its contents
+were wrong. If the line carried a usable `id` the response echoes it;
+otherwise the response carries `id: 0`. A control line longer than 1 MiB is
+answered `too_large`, and that connection is closed rather than left
+desynchronised mid-line.
 
 ## Attach
 
