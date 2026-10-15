@@ -408,3 +408,75 @@ async fn a_lease_frame_that_does_not_claim_changes_nothing() {
 
     setup.call("terminate", json!({ "session": &id }));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resize_follows_the_lease() {
+    let (_dir, socket) = harness();
+    let mut setup = Conn::connect(&socket);
+    let id = create_shell(&mut setup);
+
+    // Nobody holds the lease yet: the control op is how a client sizes a
+    // session to its terminal before attaching to it.
+    let before = setup.call("resize", json!({ "session": &id, "cols": 100, "rows": 30 }));
+    assert_eq!(
+        before["ok"], true,
+        "a free lease permits the control op: {before}"
+    );
+
+    let mut controller = Conn::connect(&socket);
+    controller.call(
+        "attach",
+        json!({ "session": &id, "from": 0, "control": true }),
+    );
+    assert_eq!(controller.frame().2, vec![1]);
+    controller.read_until("ready");
+
+    // Now someone is typing. A bystander's control op must not reshape the
+    // terminal under them.
+    let refused = setup.call("resize", json!({ "session": &id, "cols": 40, "rows": 10 }));
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["error"]["code"], "lease_held");
+
+    // The holder resizes on its own connection, where the lease is known.
+    controller
+        .writer
+        .write_all(&frame::encode(
+            frame::RESIZE,
+            0,
+            &frame::encode_size(132, 50),
+        ))
+        .unwrap();
+    controller.writer.flush().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = setup.call("get", json!({ "session": &id }))["session"].clone();
+        if got["cols"] == 132 && got["rows"] == 50 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the holder's resize frame never applied; size is {}x{}",
+            got["cols"],
+            got["rows"]
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // And an observer's resize frame is ignored, like its input.
+    let mut observer = Conn::connect(&socket);
+    observer.call("attach", json!({ "session": &id, "from": 0 }));
+    assert_eq!(observer.frame().2, vec![0]);
+    observer
+        .writer
+        .write_all(&frame::encode(frame::RESIZE, 0, &frame::encode_size(20, 5)))
+        .unwrap();
+    observer.writer.flush().unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let got = setup.call("get", json!({ "session": &id }))["session"].clone();
+    assert_eq!(got["cols"], 132, "an observer must not resize");
+    assert_eq!(got["rows"], 50);
+
+    setup.call("terminate", json!({ "session": &id }));
+}

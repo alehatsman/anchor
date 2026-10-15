@@ -90,6 +90,7 @@ Frame:
 tag 0x01  output   off = offset of first byte
 tag 0x02  input    (client → daemon, lease holder only)
           0x04  lease    (client → daemon, payload 1 = claim control)
+tag 0x05  resize   (client → daemon, payload = cols,rows as u16 BE each)
 tag 0x03  exit     payload = exit code as i32 LE, or empty if unknown
 tag 0x04  lease    payload = 1 if this client now holds it, 0 if revoked
 ```
@@ -122,17 +123,17 @@ Every attached connection is told when the lease moves, not only the two
 involved: a bystander learns control is taken rather than discovering it
 when its own keystrokes stop working.
 
-**`resize` is not gated on the lease, and should be.** One effective PTY
-size means a resize belongs to whoever is typing, but the lease is
-per-connection: a client holds it on its *attach* connection, while
-`resize` is a control op issued on a different one that can prove nothing
-about it. Gating the control op would not stop an observer — it would stop
-everyone, the controller included.
+**Resize travels two ways, and which one is right depends on the lease.**
+One effective PTY size means a resize belongs to whoever is typing — but
+the lease is per-connection, so a `resize` control op arrives on a
+connection that can prove nothing about a lease held on another.
 
-Closing this needs resize to travel on the attached connection, as a frame
-alongside `input`, where the lease is already known. Until then any client
-may resize any session, which is a real gap: an observer can reshape the
-terminal under the person working in it.
+- **While someone holds the lease**, the holder resizes with a `resize`
+  frame (`0x05`) on its own attached connection, where the lease is already
+  known. The control op is refused with `lease_held`.
+- **While the lease is free**, the control op is accepted. That is the
+  case where a client sizes a session to its terminal *before* attaching,
+  and with no holder there is nobody to protect.
 
 **The lease is per-connection.** One connection is one client: the daemon
 identifies a holder by the connection itself, so there is no client id on

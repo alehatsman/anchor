@@ -293,6 +293,28 @@ async fn pump_input(
             }
             continue;
         }
+        // Resize travels here, where the lease is known. Checked per
+        // frame like input, so a preempted connection stops being able to
+        // reshape the terminal at the same instant it stops typing.
+        if tag == frame::RESIZE {
+            let Some(current) = *epoch.lock() else {
+                continue;
+            };
+            let Some((cols, rows)) = frame::decode_size(&payload) else {
+                tracing::debug!(session = %session.id, "malformed resize frame; ignored");
+                continue;
+            };
+            match session.resize_if_controller(&holder, current, cols, rows) {
+                Ok(()) => {}
+                Err(None) => {
+                    tracing::debug!(session = %session.id, "resize from a non-controller; ignored");
+                }
+                Err(Some(e)) => {
+                    tracing::debug!(session = %session.id, error = %e, "resize rejected");
+                }
+            }
+            continue;
+        }
         if tag != frame::INPUT {
             continue; // nothing else flows this way
         }

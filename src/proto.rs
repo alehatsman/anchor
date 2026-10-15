@@ -176,6 +176,14 @@ pub mod frame {
     pub const EXIT: u8 = 0x03;
     /// Lease state. Payload is 1 if this client holds it, 0 if revoked.
     pub const LEASE: u8 = 0x04;
+    /// Resize, client to daemon. Payload is cols then rows, both `u16`
+    /// big-endian. Lease holder only.
+    ///
+    /// A frame rather than a control op because the lease is
+    /// per-connection: a controller holds it on *this* connection, and a
+    /// control op arrives on a different one that can prove nothing about
+    /// it. Resize has to travel where the lease is already known.
+    pub const RESIZE: u8 = 0x05;
 
     /// Header size: tag, offset, payload length.
     pub const HEADER_LEN: usize = 1 + 8 + 4;
@@ -196,5 +204,20 @@ pub mod frame {
         let offset = u64::from_be_bytes(buf[1..9].try_into().expect("8 bytes"));
         let len = u32::from_be_bytes(buf[9..13].try_into().expect("4 bytes")) as usize;
         (tag, offset, len)
+    }
+
+    /// Encodes a resize payload: cols then rows, big-endian.
+    pub fn encode_size(cols: u16, rows: u16) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4);
+        out.extend_from_slice(&cols.to_be_bytes());
+        out.extend_from_slice(&rows.to_be_bytes());
+        out
+    }
+
+    /// Decodes a resize payload. `None` if it is not four bytes.
+    pub fn decode_size(payload: &[u8]) -> Option<(u16, u16)> {
+        let cols = u16::from_be_bytes(payload.get(0..2)?.try_into().ok()?);
+        let rows = u16::from_be_bytes(payload.get(2..4)?.try_into().ok()?);
+        Some((cols, rows))
     }
 }
