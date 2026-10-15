@@ -288,14 +288,7 @@ async fn attaching_past_next_offset_is_offset_ahead() {
     // alone, with nothing wrong in the product. Same precondition
     // `session_catchup.rs`'s D1 gate and `reconnect_storm.rs` already wait
     // on, for the same reason.
-    let deadline = std::time::Instant::now() + RECV_TIMEOUT;
-    while session.next_offset() < BURST {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the child never produced its burst"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    support::await_output(&session, BURST, "the burst precondition").await;
 
     let next_offset = session.next_offset();
     match session.attach(next_offset + 4096) {
@@ -350,14 +343,7 @@ async fn replay_across_a_cap_stops_at_the_cap_and_live_output_continues() {
     let session = spawn_emitting_forever(&manager);
 
     // Wait for the cap to actually be hit, then for output to run well past it.
-    let deadline = std::time::Instant::now() + RECV_TIMEOUT;
-    while session.next_offset() < CAP * 4 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "session never produced enough output to cap"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    support::await_output(&session, CAP * 4, "the past-the-cap precondition").await;
 
     assert_eq!(
         session.log_capped_at(),

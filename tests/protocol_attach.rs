@@ -241,14 +241,32 @@ async fn detach_and_reconnect_from_an_offset_has_no_gap() {
     drop(first);
 
     // Reconnect at the offset we had consumed: no gap, no duplicate.
-    let mut second = Conn::connect(&socket);
-    let ready = second.call(
-        "attach",
-        json!({ "session": &id, "from": resume_at, "control": true }),
-    );
-    assert_eq!(ready["ok"], true, "reconnect failed: {ready}");
-    // The lease was taken by a connection that is gone; a new one may take
-    // it, since the holder is per-connection.
+    //
+    // Retried, because the lease is released when the daemon *notices* the
+    // old connection is gone -- its read returns EOF and its task runs --
+    // and dropping a socket does not make that happen before the next line
+    // of this test. Asserting control on the first try asserted that the
+    // daemon had been scheduled in between, which is true on an idle
+    // machine and false under a loaded suite. A real client retries here
+    // too; attach never preempts, so there is nothing else it can do.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut second = loop {
+        let mut conn = Conn::connect(&socket);
+        let ready = conn.call(
+            "attach",
+            json!({ "session": &id, "from": resume_at, "control": true }),
+        );
+        assert_eq!(ready["ok"], true, "reconnect failed: {ready}");
+        if ready["control"] == true {
+            break conn;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the lease never became grantable after its holder vanished"
+        );
+        drop(conn);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
     assert_eq!(second.frame().2, vec![1], "the lease is grantable again");
 
     second.send_input(b"after-reconnect\n");

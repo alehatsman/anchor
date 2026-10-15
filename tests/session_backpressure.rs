@@ -17,6 +17,13 @@ use anchor::session::SessionManager;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The longest a healthy subscriber may go without a chunk while the
+/// session is actively producing. Generous against a loaded machine on
+/// purpose: a real backpressure failure parks the reader for the whole
+/// write timeout, which is far longer than this, so the bound does not
+/// need to be tight to catch it.
+const STALL_BOUND: Duration = Duration::from_secs(5);
+
 fn temp_dir() -> PathBuf {
     std::env::temp_dir()
 }
@@ -292,7 +299,23 @@ async fn slow_subscriber_is_disconnected_and_never_blocks_the_reader() {
     let (received_bytes, mut fast, _) = support::catch_up(replay, Duration::ZERO).await;
     let mut received = received_bytes.len();
 
-    let t0 = Instant::now();
+    // Measured as the longest *gap* between chunks, not as total elapsed
+    // time.
+    //
+    // The invariant is that the never-reading subscriber does not block the
+    // reader thread. When that breaks, the fast subscriber goes quiet while
+    // the reader sits in a write to the slow one -- a stall. It is not that
+    // everything runs proportionally slower, which is what CPU contention
+    // looks like.
+    //
+    // Total elapsed cannot tell those apart. A full-suite run under load
+    // drained this in 22s with nothing wrong, and the old assertion
+    // reported it as "reader looks backpressured" -- a load symptom wearing
+    // the costume of the bug. A long gap means the same thing whether the
+    // machine is idle or thrashing, which is what makes it the right
+    // instrument here.
+    let mut longest_gap = Duration::ZERO;
+    let mut last_chunk_at = Instant::now();
     while received < N {
         let chunk = tokio::time::timeout(DEFAULT_TIMEOUT, fast.subscription.recv())
             .await
@@ -300,12 +323,14 @@ async fn slow_subscriber_is_disconnected_and_never_blocks_the_reader() {
                 panic!("fast subscriber stalled after {received}/{N} bytes -- reader was blocked by the slow one")
             })
             .expect("fast subscriber disconnected before receiving all output");
+        longest_gap = longest_gap.max(last_chunk_at.elapsed());
+        last_chunk_at = Instant::now();
         received += chunk.bytes.len();
     }
-    let elapsed = t0.elapsed();
     assert!(
-        elapsed < Duration::from_secs(10),
-        "drain of {N} bytes took {elapsed:?}, reader looks backpressured"
+        longest_gap < STALL_BOUND,
+        "fast subscriber went quiet for {longest_gap:?} mid-stream; \
+         the reader was parked on the subscriber that never reads"
     );
 
     // The never-reading subscriber must have been dropped once it exceeded

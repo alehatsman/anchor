@@ -102,3 +102,43 @@ pub(crate) fn catch_up_allow_clamp(replay: Replay) -> (Vec<u8>, Attach, u32) {
         }
     }
 }
+
+/// How long a producer may make *no* progress before a fixture gives up.
+///
+/// Deliberately not a budget for the whole target: how long a real
+/// `/bin/sh` takes to push N megabytes through a pty depends on what else
+/// the machine is doing, and under a full-suite run it is competing with
+/// every other test binary doing the same thing.
+pub(crate) const PRODUCER_STALL: Duration = Duration::from_secs(10);
+
+/// Waits for a session to reach `target` bytes, failing only if it *stops
+/// making progress*.
+///
+/// For preconditions, never for assertions. A fixture that needs real
+/// output on disk before it can test anything is waiting on a shell, and a
+/// fixed deadline there converts CPU contention into a failure of whatever
+/// invariant the test guards. That is worse than an ordinary flake: the
+/// failure wears the costume of the thing you care about, so the next
+/// person to see it dismisses the real breakage too.
+///
+/// A genuinely dead producer still fails, and no slower than before: the
+/// deadline resets only when the offset actually moves.
+pub(crate) async fn await_output(session: &anchor::session::Session, target: u64, what: &str) {
+    let mut last = 0;
+    let mut stall_deadline = std::time::Instant::now() + PRODUCER_STALL;
+    loop {
+        let offset = session.next_offset();
+        if offset >= target {
+            return;
+        }
+        if offset > last {
+            last = offset;
+            stall_deadline = std::time::Instant::now() + PRODUCER_STALL;
+        }
+        assert!(
+            std::time::Instant::now() < stall_deadline,
+            "{what}: stopped producing at {offset} of {target} bytes"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
