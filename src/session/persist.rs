@@ -19,11 +19,17 @@ use crate::store::Store;
 /// only costs precision until the next update or the next restart.
 const QUEUE_CAPACITY: usize = 256;
 
-/// One update: where a session's output stream has reached.
-struct Update {
-    id: String,
-    output_bytes: u64,
-    log_capped_at: Option<u64>,
+/// One queued write. Both kinds are whole-value overwrites, so dropping one
+/// costs precision until the next, never correctness.
+enum Update {
+    /// Where a session's output stream has reached.
+    Output {
+        id: String,
+        output_bytes: u64,
+        log_capped_at: Option<u64>,
+    },
+    /// The size actually applied to the PTY.
+    Size { id: String, cols: u16, rows: u16 },
 }
 
 /// The handle the reader thread holds. Cloneable and cheap.
@@ -50,16 +56,20 @@ impl OutputPersister {
                         Ok(store) => store,
                         Err(poisoned) => poisoned.into_inner(),
                     };
-                    if let Err(e) = store.set_output_bytes(
-                        &update.id,
-                        update.output_bytes,
-                        update.log_capped_at,
-                    ) {
-                        tracing::warn!(
-                            session = %update.id,
-                            error = %e,
-                            "persisting the output offset failed"
-                        );
+                    let result = match &update {
+                        Update::Output {
+                            id,
+                            output_bytes,
+                            log_capped_at,
+                        } => store
+                            .set_output_bytes(id, *output_bytes, *log_capped_at)
+                            .map_err(|e| (id.clone(), e)),
+                        Update::Size { id, cols, rows } => store
+                            .set_size(id, *cols, *rows)
+                            .map_err(|e| (id.clone(), e)),
+                    };
+                    if let Err((id, e)) = result {
+                        tracing::warn!(session = %id, error = %e, "persisting a session row failed");
                     }
                 }
             })
@@ -69,10 +79,20 @@ impl OutputPersister {
 
     /// Queues an offset update. Never blocks: a full queue drops the update.
     pub fn note_output_bytes(&self, id: &str, output_bytes: u64, log_capped_at: Option<u64>) {
-        let _ = self.tx.try_send(Update {
+        let _ = self.tx.try_send(Update::Output {
             id: id.to_string(),
             output_bytes,
             log_capped_at,
+        });
+    }
+
+    /// Queues the applied size, so a restart does not report the size the
+    /// session was created at after it has been resized.
+    pub fn note_size(&self, id: &str, cols: u16, rows: u16) {
+        let _ = self.tx.try_send(Update::Size {
+            id: id.to_string(),
+            cols,
+            rows,
         });
     }
 }

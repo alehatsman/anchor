@@ -307,9 +307,9 @@ fn op_create(id: u64, line: &str, state: &State) -> Value {
         Err(e) => {
             let code = match &e {
                 CreateError::InvalidLabel(_) => ErrorCode::InvalidLabel,
-                CreateError::InvalidCwd(_) | CreateError::ExecutableNotFound(_) => {
-                    ErrorCode::InvalidSpec
-                }
+                CreateError::InvalidCwd(_)
+                | CreateError::ExecutableNotFound(_)
+                | CreateError::InvalidSize { .. } => ErrorCode::InvalidSpec,
                 CreateError::NotFound => ErrorCode::NotFound,
                 // A cap refusal and a failed spawn are both "it did not
                 // start"; the message says which.
@@ -425,7 +425,9 @@ fn op_resize(id: u64, line: &str, state: &State) -> Value {
     };
     // pty.rs clamps as a backstop; out of range is a protocol error here,
     // which is the layer that can actually tell the client about it.
-    if !(1..=1000).contains(&req.cols) || !(1..=1000).contains(&req.rows) {
+    if !crate::session::manager::SIZE_RANGE.contains(&req.cols)
+        || !crate::session::manager::SIZE_RANGE.contains(&req.rows)
+    {
         return proto::error(
             id,
             ErrorCode::InvalidSpec,

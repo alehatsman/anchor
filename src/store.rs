@@ -213,6 +213,15 @@ impl Store {
         Ok(())
     }
 
+    /// Records the size actually applied to a session's PTY.
+    pub fn set_size(&self, id: &str, cols: u16, rows: u16) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET cols = ?2, rows = ?3 WHERE id = ?1",
+            rusqlite::params![id, cols, rows],
+        )?;
+        Ok(())
+    }
+
     pub fn set_output_bytes(&self, id: &str, bytes: u64, capped_at: Option<u64>) -> Result<()> {
         self.conn.execute(
             "UPDATE sessions SET output_bytes = ?2, log_capped_at = ?3 WHERE id = ?1",

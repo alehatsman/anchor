@@ -32,6 +32,7 @@ pub use types::Chunk;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -52,6 +53,23 @@ pub(crate) struct Runtime {
     pub(crate) exited_at: Option<i64>,
     pub(crate) cols: u16,
     pub(crate) rows: u16,
+}
+
+/// At most one resize reaches the PTY per this window, and it is always the
+/// latest one asked for. A browser drag emits a resize per frame; each one
+/// is a `TIOCSWINSZ` plus a `SIGWINCH` the child has to handle, and a shell
+/// redrawing on every frame of a drag is the visible cost.
+const RESIZE_COALESCE_WINDOW: Duration = Duration::from_millis(100);
+
+/// Resize coalescing state. `pending` is what has been asked for but not yet
+/// applied; the flusher applies it when the window closes.
+#[derive(Debug)]
+pub(crate) struct ResizeState {
+    pub(crate) last_applied: Instant,
+    pub(crate) pending: Option<(u16, u16)>,
+    /// True while a flusher is scheduled, so a burst spawns one, not one per
+    /// resize.
+    pub(crate) flushing: bool,
 }
 
 /// Who may write input and resize. See `control.rs`.
@@ -79,6 +97,9 @@ pub struct Session {
     pid: Option<u32>,
     fanout: Arc<Mutex<Fanout>>,
     runtime: Mutex<Runtime>,
+    resize: Mutex<ResizeState>,
+    /// Queues the applied size for persistence, off this thread.
+    persist: Option<crate::session::persist::OutputPersister>,
     pub(crate) control: Mutex<ControlLease>,
     created_at: i64,
     /// `true` once the exit listener has recorded a final state. A `watch`,
@@ -189,13 +210,82 @@ impl Session {
         self.pty.write(bytes)
     }
 
-    /// Applies a new PTY size. There is exactly one effective size per
-    /// session; arbitrating between clients is the lease's job.
-    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+    /// Applies a new PTY size, coalesced to at most one per
+    /// [`RESIZE_COALESCE_WINDOW`], keeping the latest.
+    ///
+    /// There is exactly one effective size per session; arbitrating between
+    /// clients is the lease's job, not a negotiation between them.
+    ///
+    /// A resize inside the window is remembered and applied when it closes,
+    /// so the last size asked for always wins — dropping it would leave the
+    /// terminal at the wrong width after a drag ends.
+    pub fn resize(self: &Arc<Self>, cols: u16, rows: u16) -> Result<()> {
+        let schedule_in = {
+            let mut resize = self.resize.lock();
+            let elapsed = resize.last_applied.elapsed();
+            if elapsed >= RESIZE_COALESCE_WINDOW {
+                resize.last_applied = Instant::now();
+                resize.pending = None;
+                drop(resize);
+                return self.apply_resize(cols, rows);
+            }
+            resize.pending = Some((cols, rows));
+            if resize.flushing {
+                None // a flusher is already scheduled for this burst
+            } else {
+                resize.flushing = true;
+                Some(RESIZE_COALESCE_WINDOW - elapsed)
+            }
+        };
+
+        if let Some(delay) = schedule_in {
+            // Without a runtime there is nothing to schedule on — apply now
+            // rather than silently dropping the resize.
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    let session = Arc::clone(self);
+                    handle.spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        session.flush_pending_resize();
+                    });
+                }
+                Err(_) => {
+                    self.resize.lock().flushing = false;
+                    self.flush_pending_resize();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies whatever the last resize asked for, once the window closes.
+    fn flush_pending_resize(&self) {
+        let pending = {
+            let mut resize = self.resize.lock();
+            resize.flushing = false;
+            resize.last_applied = Instant::now();
+            resize.pending.take()
+        };
+        if let Some((cols, rows)) = pending {
+            if let Err(e) = self.apply_resize(cols, rows) {
+                tracing::debug!(session = %self.id, error = %e, "deferred resize failed");
+            }
+        }
+    }
+
+    /// The size actually reaching the PTY.
+    fn apply_resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.pty.resize(cols, rows)?;
-        let mut runtime = self.runtime.lock();
-        runtime.cols = cols;
-        runtime.rows = rows;
+        {
+            let mut runtime = self.runtime.lock();
+            runtime.cols = cols;
+            runtime.rows = rows;
+        }
+        // Persisted off this thread, so a restart reports the size the
+        // session actually has rather than the one it was created at.
+        if let Some(persist) = &self.persist {
+            persist.note_size(&self.id, cols, rows);
+        }
         Ok(())
     }
 

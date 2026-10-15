@@ -25,6 +25,10 @@ use super::{ControlLease, Runtime, Session};
 /// chunk.
 const OUTPUT_BYTES_PERSIST_INTERVAL_MS: i64 = 1_000;
 
+/// The one effective PTY size a session may have, per docs/02-model.md's
+/// create sequence. `pty.rs` clamps to the same range as a backstop.
+pub const SIZE_RANGE: std::ops::RangeInclusive<u16> = 1..=1000;
+
 /// Why a create was refused. Each maps onto a protocol error code.
 #[derive(Debug, thiserror::Error)]
 pub enum CreateError {
@@ -36,6 +40,8 @@ pub enum CreateError {
     TooManySessions { max: usize },
     #[error("invalid label: {0}")]
     InvalidLabel(#[from] model::labels::InvalidLabel),
+    #[error("cols and rows must be between 1 and 1000, got {cols}x{rows}")]
+    InvalidSize { cols: u16, rows: u16 },
     #[error("opening the output log: {0}")]
     Log(#[from] anyhow::Error),
     #[error("spawning the child: {0}")]
@@ -137,7 +143,15 @@ impl SessionManager {
             return Err(CreateError::ExecutableNotFound(spec.command.clone()));
         }
         // Checked before the log directory or the row exist, so a rejected
-        // label leaves nothing behind.
+        // spec leaves nothing behind. The PTY layer clamps the size as a
+        // backstop, but a caller that asked for 0 columns made a mistake and
+        // should be told, not silently given 1.
+        if !SIZE_RANGE.contains(&spec.cols) || !SIZE_RANGE.contains(&spec.rows) {
+            return Err(CreateError::InvalidSize {
+                cols: spec.cols,
+                rows: spec.rows,
+            });
+        }
         model::labels::validate(&labels)?;
 
         let id = model::new_session_id();
@@ -241,6 +255,14 @@ impl SessionManager {
                 cols: spec.cols,
                 rows: spec.rows,
             }),
+            resize: Mutex::new(super::ResizeState {
+                // The session has just been created at its spec size, so the
+                // window starts open: the first resize applies immediately.
+                last_applied: std::time::Instant::now() - std::time::Duration::from_secs(1),
+                pending: None,
+                flushing: false,
+            }),
+            persist: self.persister.clone(),
             control: Mutex::new(ControlLease::default()),
             created_at,
             exited,

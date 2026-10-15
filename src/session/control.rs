@@ -85,16 +85,21 @@ impl Session {
 
     /// Resizes under the same rule as [`write_if_controller`](Self::write_if_controller).
     pub fn resize_if_controller(
-        &self,
+        self: &std::sync::Arc<Self>,
         holder: &str,
         epoch: u64,
         cols: u16,
         rows: u16,
     ) -> Result<(), Option<anyhow::Error>> {
-        let lease = self.control.lock();
-        if lease.holder.as_deref() != Some(holder) || lease.epoch != epoch {
-            return Err(None);
+        {
+            let lease = self.control.lock();
+            if lease.holder.as_deref() != Some(holder) || lease.epoch != epoch {
+                return Err(None);
+            }
         }
+        // The lease is released before resizing: unlike a write, a resize
+        // can be deferred by coalescing, and holding the lease across that
+        // wait would block every other lease operation for the window.
         self.resize(cols, rows).map_err(Some)
     }
 }
