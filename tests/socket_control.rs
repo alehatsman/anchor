@@ -50,6 +50,17 @@ impl Client {
         }
     }
 
+    /// Sends bytes that are deliberately not valid UTF-8, which `send_raw`
+    /// cannot express because its argument is a `&str`.
+    fn send_bytes(&mut self, bytes: &[u8]) -> Value {
+        self.writer.write_all(bytes).unwrap();
+        self.writer.write_all(b"\n").unwrap();
+        self.writer.flush().unwrap();
+        let mut response = String::new();
+        self.reader.read_line(&mut response).unwrap();
+        serde_json::from_str(&response).expect("response is a JSON line")
+    }
+
     fn send_raw(&mut self, line: &str) -> Value {
         self.writer.write_all(line.as_bytes()).unwrap();
         self.writer.write_all(b"\n").unwrap();
@@ -216,4 +227,27 @@ async fn the_data_directory_is_owner_only() {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "{} is {mode:o}, not 0700", path.display());
     }
+}
+
+/// A line that is not even text is still a line that is not a request
+/// object, and docs/04-protocol.md says those are answered `bad_request`.
+///
+/// It used to be read straight into a `String`, so invalid UTF-8 failed
+/// the read itself and the connection was dropped with no reply -- which a
+/// client cannot tell from the daemon dying. The whole line is consumed
+/// either way, so the framing survives and the connection stays usable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_line_that_is_not_utf8_is_answered_not_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = serve(&dir);
+    let mut client = Client::connect(&socket);
+
+    // A lone continuation byte: valid in no UTF-8 sequence.
+    let reply = client.send_bytes(&[0x7b, 0x22, 0xff, 0xfe, 0x22, 0x7d]);
+    assert_eq!(reply["id"], 0);
+    assert_eq!(reply["error"]["code"], "bad_request");
+
+    // The connection is still usable, which is the half that makes
+    // answering worth more than closing.
+    assert_eq!(client.send_raw(r#"{"id":2,"op":"ping"}"#)["ok"], true);
 }

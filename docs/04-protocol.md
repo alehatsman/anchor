@@ -65,7 +65,11 @@ Error codes: `not_found`, `invalid_spec`, `invalid_label`, `spawn_failed`,
 An unknown `op` returns an error; it never drops the connection.
 
 `bad_request` is for a line that is not a request object at all — malformed
-JSON, or no `op`. `invalid_spec` means the request parsed and its contents
+JSON, no `op`, or bytes that are not valid UTF-8. The last one is answered
+rather than dropped for the same reason as the others: a closed connection
+is indistinguishable from the daemon dying, and the offending line has been
+consumed either way, so the framing survives and the connection stays
+usable. `invalid_spec` means the request parsed and its contents
 were wrong. If the line carried a usable `id` the response echoes it;
 otherwise the response carries `id: 0`. A control line longer than 1 MiB is
 answered `too_large`, and that connection is closed rather than left

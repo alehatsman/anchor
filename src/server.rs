@@ -127,19 +127,23 @@ pub async fn serve(listener: StdUnixListener, state: State) -> Result<()> {
 async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
+    // Bytes, not a `String`: a `read_line` into a `String` fails the whole
+    // read on invalid UTF-8, which drops the connection with no reply.
+    // docs/04-protocol.md promises a line that is not a request object is
+    // answered `bad_request`, and that has to include one that is not text.
+    let mut raw: Vec<u8> = Vec::new();
     // One connection is one client, for the control lease. docs/04-protocol.md
     // leaves lease identity to an open issue, and per-connection is the
     // honest reading of "exactly one writer of input and size".
     let holder = crate::model::new_session_id();
 
     loop {
-        line.clear();
+        raw.clear();
         // Bounded, so one client cannot make the daemon buffer without
         // limit. `take` counts bytes, not lines, and is reset per request.
         let read = (&mut reader)
             .take(MAX_LINE_BYTES + 1)
-            .read_line(&mut line)
+            .read_until(b'\n', &mut raw)
             .await
             .context("reading request")?;
 
@@ -156,6 +160,26 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
             // than desynchronising the framing.
             return Ok(());
         }
+        // Answered, not dropped. The whole line was consumed, so the
+        // framing is still intact and the connection stays usable --
+        // closing here would make a stray byte indistinguishable from the
+        // daemon dying.
+        let line = match std::str::from_utf8(&raw) {
+            Ok(line) => line.to_string(),
+            Err(_) => {
+                respond(
+                    &mut write_half,
+                    proto::error(
+                        0,
+                        ErrorCode::BadRequest,
+                        "request line is not valid UTF-8",
+                    ),
+                )
+                .await?;
+                continue;
+            }
+        };
+
         if line.trim().is_empty() {
             continue;
         }
