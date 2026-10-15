@@ -109,8 +109,25 @@ A `u32` caps one frame at 4 GiB, which no PTY read approaches: the reader
 chunks at 64 KiB.
 
 Offsets are the recovery mechanism. A client that drops reconnects with
-`from = last_offset + 1` and loses nothing. This is the same discipline the
-log file uses, deliberately: **recover by offset, never by guessing.**
+`from` set to **one past the last byte it received** and loses nothing.
+That is `off + len` of the last frame it got — not `off + 1`: a frame's
+`off` is the offset of its *first* byte, so adding one would re-request
+all but the first byte of a frame already delivered, and a client that
+did it would see duplicated output on every reconnect.
+
+`from` is inclusive: it is the first byte the client wants, and the first
+frame after an attach starts exactly there. `from == next_offset` is
+therefore legal and means "nothing yet, only what happens next". This is
+the same discipline the log file uses, deliberately: **recover by offset,
+never by guessing.**
+
+The attach response carries `next_offset`, the live head at the moment of
+the attach. A client that wants only what happens from now on attaches
+with `from` set to it; a client catching up compares it to its own last
+offset to know how far behind it is. It is a snapshot, not a promise —
+the head moves on as soon as the session writes again. Attaching past it
+is refused rather than silently clamped, because a `from` beyond the head
+means the client and the daemon disagree about what exists.
 
 `control: true` requests the lease. If held, the attach still succeeds as an
 observer and the response says `control:false`.

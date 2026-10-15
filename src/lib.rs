@@ -1,8 +1,15 @@
 //! anchor — a local daemon that owns long-running PTY processes.
 //!
-//! M0 is the skeleton: data directory resolution, SQLite schema with
-//! forward-only migrations, the session store, and a unix socket that answers
-//! `ping`. No PTY layer yet — that is M1.
+//! A session is a PTY plus an append-only output log, addressed by byte
+//! offset, outliving every client that attaches to it. Clients speak a
+//! newline-delimited JSON protocol over a unix socket, switching to binary
+//! framing once attached (docs/04-protocol.md).
+//!
+//! The daemon is meant to be started by the user's own service manager and
+//! never by a client, which is what lets a client be restarted — or shipped
+//! — without taking its sessions down (docs/07-lifecycle.md). That is the
+//! property the whole thing exists for; it does **not** extend to anchord
+//! crashing, which takes its PTYs with it.
 
 pub mod client;
 pub mod daemon;

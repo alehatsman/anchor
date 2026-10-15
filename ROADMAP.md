@@ -9,7 +9,7 @@ around it.
 
 ---
 
-## M0 — Skeleton
+## M0 — Skeleton ✅
 
 Scope: single crate; `anchord` binds the socket and answers `ping`; SQLite
 schema + forward-only migrations; data dir resolution; `tracing` from the
@@ -19,7 +19,7 @@ Exit: daemon starts, a client connects, a session row round-trips. No PTY yet.
 
 ---
 
-## M1 — PTY core, ported with its tests
+## M1 — PTY core, ported with its tests ✅
 
 The whole bet. Port teleport's PTY layer and, critically, **its test suite**.
 
@@ -43,7 +43,7 @@ under its own tests, stop.
 
 ---
 
-## M2 — Labels and query
+## M2 — Labels and query ✅
 
 The reason the boundary moved.
 
@@ -55,7 +55,7 @@ Exit: 500 sessions, filter by a label, correct results. A client can answer
 
 ---
 
-## M3 — Socket protocol and CLI
+## M3 — Socket protocol and CLI ✅
 
 Scope: full control ops and binary stream framing per
 [docs/04-protocol.md](docs/04-protocol.md); `anchor` CLI with raw-mode
@@ -67,7 +67,7 @@ correctly.
 
 ---
 
-## M4 — Teleport on anchor, behind a flag
+## M4 — Teleport on anchor, behind a flag ✅
 
 Scope: an anchor client in teleport; its session layer switchable; default
 **off**.
@@ -78,7 +78,18 @@ unchanged and it ships normally throughout.
 
 ---
 
-## M5 — Flip the default, prove the payoff
+## M5 — Flip the default, prove the payoff — in progress
+
+> Done: an agent survives teleport restarting under it (demonstrated by
+> `an_agent_survives_teleport_restarting_under_it`), anchord restarts without
+> teleport noticing beyond a reconnect, the updater restarts under load when
+> the daemon advertises `sessions_survive_restart`, `anchor service
+> install` gives anchord a lifecycle of its own, and an unreachable anchord
+> is reported rather than read as an empty session list.
+>
+> Open: flipping teleport's `use_anchor` default, and deleting teleport's
+> in-process PTY layer — which stays gated on a release having actually run
+> on the anchor path.
 
 Scope: default teleport to anchor; packaging so `anchord` is a separate
 launchd/systemd unit with its own lifecycle.

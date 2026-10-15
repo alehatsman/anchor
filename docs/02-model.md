@@ -93,12 +93,22 @@ SQLite, WAL, single writer. `$XDG_DATA_HOME/anchor/anchor.db`.
 
 ```text
 sessions    (id PK, state, pid, exit_code, lost_reason, command, args_json,
-             cwd, env_json, cols, rows, output_bytes, log_capped_at,
-             created_at, exited_at)
+             cwd, env_json, login_shell, cols, rows, spec_cols, spec_rows,
+             output_bytes, log_capped_at, created_at, exited_at)
 labels      (session_id, key, value, PK(session_id, key))
             index on (key, value)
 meta        (key, value)
 ```
+
+`cols`/`rows` are the size the PTY has **now**; `spec_cols`/`spec_rows` are
+the size it was created with. They are stored separately because a resize
+changes one and not the other, and losing the requested size would make a
+session that has been resized indistinguishable from one that asked for
+that size to begin with.
+
+`login_shell` records whether the command was wrapped in the user's login
+shell — it changes what actually ran, so it belongs on the row rather than
+being recoverable only from the original request.
 
 Output logs live outside the DB, one file per session:
 
