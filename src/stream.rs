@@ -32,6 +32,18 @@ use crate::session::{ReplayStep, Session};
 /// avoids making the viewer reconnect to see the last line.
 const EXIT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
+/// How long a stream waits for the reaper to record the exit after the PTY
+/// master reports EOF. EOF means the child's side of the pty is closed, so
+/// its `wait()` is already imminent; this only covers the scheduling gap
+/// between the two threads.
+const EXIT_REAP_GRACE: Duration = Duration::from_secs(5);
+
+/// How long the output half may keep going after the input half ends on a
+/// session that has already exited, so an exit frame already being written
+/// is not cancelled underneath it. A live session's detach does not wait:
+/// see the call site.
+const INPUT_END_GRACE: Duration = Duration::from_millis(250);
+
 /// Default for how long one frame write may take before the connection is
 /// closed.
 ///
@@ -112,9 +124,37 @@ pub async fn serve_attached(
     // half would miss a client that disconnects while the session is quiet:
     // there is no write to fail, so nothing would notice until the next
     // chunk — and the lease would stay held on a dead connection until then.
+    let mut output = std::pin::pin!(pump_output(
+        &mut out,
+        &session,
+        from,
+        &holder,
+        &epoch,
+        lease_changes
+    ));
     let result = tokio::select! {
-        result = pump_output(&mut out, &session, from, &holder, &epoch, lease_changes) => result,
-        _ = &mut input_task => Ok(()),
+        result = output.as_mut() => result,
+        _ = &mut input_task => {
+            // The input half ended. If the session is over, the output
+            // half may be mid-exit-frame: `select!` drops the losing future
+            // at its next await point, and dropping it there hands the
+            // client a closed stream instead of the exit it is owed. Give
+            // it a bounded chance to finish.
+            //
+            // Only when an exit is actually owed, though. On a live session
+            // this arm means the client detached, and the right response is
+            // to end now — the lease is released when the connection ends,
+            // and making the next attacher wait out a grace for a client
+            // that has already gone is the wrong trade.
+            if session.state().is_terminal() {
+                match tokio::time::timeout(INPUT_END_GRACE, output).await {
+                    Ok(result) => result,
+                    Err(_) => Ok(()),
+                }
+            } else {
+                Ok(())
+            }
+        }
     };
     input_task.abort();
     result
@@ -165,7 +205,21 @@ async fn pump_output(
                 // The subscription ended. Either the session is over, or
                 // this subscriber fell behind and was dropped — and those
                 // are not the same thing to tell a client.
-                None => break,
+                None => {
+                    if subscription.overflowed() {
+                        break;
+                    }
+                    // EOF: no byte can follow, so this connection is owed an
+                    // exit frame. The exit itself is recorded by the reaper
+                    // thread, which is not ordered against the EOF thread
+                    // that just closed this subscription — so wait for it
+                    // rather than reading a `state` that may still say
+                    // `running` and finalizing with an unknown exit code.
+                    let _ =
+                        tokio::time::timeout(EXIT_REAP_GRACE, session.wait_exited()).await;
+                    exited = true;
+                    break;
+                }
             },
             change = lease_changes.recv() => {
                 // The lease moved. Tell this connection where it now
@@ -213,7 +267,7 @@ async fn pump_output(
     // exited: it is still running, and an exit frame would send the client
     // off to render a dead session instead of reconnecting from its last
     // offset. Closing the connection is the whole message.
-    if !exited && !session.state().is_terminal() {
+    if !exited {
         tracing::debug!(
             session = %session.id,
             "subscriber dropped for falling behind; closing without an exit frame"
@@ -332,9 +386,14 @@ async fn pump_input(
             Err(None) => {
                 tracing::debug!(session = %session.id, "input from a non-controller; ignored");
             }
+            // The write failed, which on a session that just exited means
+            // the pty is gone. That is the *output* half's news to deliver,
+            // as an exit frame — returning here ends the connection through
+            // the outer select instead, cancelling that write mid-flight and
+            // closing the stream silently. Keep reading: this half exists to
+            // notice the client disconnecting, and the client has not.
             Err(Some(e)) => {
                 tracing::debug!(session = %session.id, error = %e, "input rejected");
-                return;
             }
         }
     }

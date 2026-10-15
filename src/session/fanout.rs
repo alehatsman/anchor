@@ -4,6 +4,7 @@
 //! module doc (`session/mod.rs`) for the design this implements; `replay.rs`
 //! is the other half of the story (catch-up reads off this same mutex).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -67,6 +68,12 @@ pub(super) struct SubscriberSlot {
     /// first). This is the whole bound: the channel's capacity is a
     /// backstop that cannot trip first (`MAX_QUEUE_CHUNKS`).
     budget: Arc<Semaphore>,
+    /// Set when `publish` drops this slot for exceeding its budget, and
+    /// never otherwise. Shared with the matching `Subscription` so a
+    /// consumer can tell *why* its stream ended: a slot closed at EOF and a
+    /// slot dropped for falling behind both surface as `recv() -> None`,
+    /// and those two mean opposite things to a client (docs/04-protocol.md).
+    overflowed: Arc<AtomicBool>,
 }
 
 /// The `{output log, subscribers}` pair, guarded by one short-held mutex
@@ -119,7 +126,10 @@ impl Fanout {
             let cost = u32::try_from(queue_cost(payload.len()))
                 .expect("a chunk cannot exceed pty.rs's READ_BUFFER_SIZE");
             let Ok(permit) = sub.budget.try_acquire_many(cost) else {
-                return false; // bound tripped -- disconnect, don't wait.
+                // Bound tripped -- disconnect, don't wait. Record *why*, so
+                // the stream closes without an exit frame.
+                sub.overflowed.store(true, Ordering::Release);
+                return false;
             };
             let chunk = Chunk {
                 offset: start,
@@ -132,8 +142,12 @@ impl Fanout {
                 }
                 // The Subscription was dropped (or, unreachably, the backstop
                 // capacity filled). `permit` drops here too, returning the
-                // budget it reserved.
-                Err(_) => false,
+                // budget it reserved. Flagged the same way: if a receiver is
+                // still there to read it, this was the backstop, not an EOF.
+                Err(_) => {
+                    sub.overflowed.store(true, Ordering::Release);
+                    false
+                }
             }
         });
 
@@ -147,6 +161,7 @@ impl Fanout {
     pub(super) fn register(&mut self, fanout: &Arc<Mutex<Fanout>>) -> Subscription {
         let (tx, rx) = mpsc::channel(MAX_QUEUE_CHUNKS);
         let budget = Arc::new(Semaphore::new(MAX_QUEUE_BYTES));
+        let overflowed = Arc::new(AtomicBool::new(false));
 
         let id = SubscriberId(self.next_subscriber_id);
         self.next_subscriber_id += 1;
@@ -154,12 +169,14 @@ impl Fanout {
             id,
             tx,
             budget: Arc::clone(&budget),
+            overflowed: Arc::clone(&overflowed),
         });
 
         Subscription {
             id,
             rx,
             budget,
+            overflowed,
             fanout: Arc::clone(fanout),
         }
     }
@@ -173,6 +190,7 @@ pub struct Subscription {
     id: SubscriberId,
     rx: mpsc::Receiver<Chunk>,
     budget: Arc<Semaphore>,
+    overflowed: Arc<AtomicBool>,
     fanout: Arc<Mutex<Fanout>>,
 }
 
@@ -183,6 +201,18 @@ impl Subscription {
         let chunk = self.rx.recv().await?;
         self.budget.add_permits(queue_cost(chunk.bytes.len()));
         Some(chunk)
+    }
+
+    /// Whether this subscription ended because it fell behind its budget,
+    /// as opposed to the session reaching EOF. Only meaningful once `recv`
+    /// has returned `None`.
+    ///
+    /// Explicit because it cannot be inferred: `Session::close_subscribers`
+    /// (EOF) and `publish` (overflow) both drop the slot, and the session's
+    /// `state` is written by a *different* thread than the one that closes
+    /// the subscribers, so reading it here races.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::Acquire)
     }
 
     /// Non-blocking drain, used only when finalizing an `exit` frame: even

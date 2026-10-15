@@ -75,6 +75,25 @@ impl Conn {
         (tag, offset, payload)
     }
 
+    /// Reads one binary frame, or `None` if the stream ended cleanly on a
+    /// frame boundary. `frame` panics there instead, which is right for the
+    /// tests that require a frame -- this one exists for the test that has
+    /// to tell "ended" from "sent an exit".
+    fn try_frame(&mut self) -> Option<(u8, u64, Vec<u8>)> {
+        let mut header = [0u8; frame::HEADER_LEN];
+        match self.reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+            Err(e) => panic!("reading a frame header: {e}"),
+        }
+        let (tag, offset, len) = frame::decode_header(&header);
+        let mut payload = vec![0u8; len];
+        self.reader
+            .read_exact(&mut payload)
+            .expect("a frame payload");
+        Some((tag, offset, payload))
+    }
+
     /// Collects output frames until `needle` has been seen, returning
     /// everything received. Panics on timeout rather than hanging.
     fn read_until(&mut self, needle: &str) -> Vec<u8> {
@@ -479,4 +498,77 @@ async fn resize_follows_the_lease() {
     assert_eq!(got["rows"], 50);
 
     setup.call("terminate", json!({ "session": &id }));
+}
+
+/// A session that exits while its controller is still typing must still be
+/// told it exited -- the stream must never just end.
+///
+/// Regression for three separate races that each closed an attached
+/// connection with no `exit` frame, all of which only showed up on a session
+/// that ends immediately:
+///
+/// 1. the EOF thread's `close_subscribers` running before the reaper had
+///    written `state`, so the stream could not tell "the session is over"
+///    from "this subscriber fell behind" and assumed the latter;
+/// 2. a failed pty write ending the input half, which ended the whole
+///    connection through the outer `select!` and cancelled the exit frame
+///    being written;
+/// 3. the input half winning that `select!` for any other reason, with the
+///    same result.
+///
+/// Repeated because each one is a race: a single round passed often enough
+/// to look green.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_that_exits_under_its_controller_still_sends_exit() {
+    let (_dir, socket) = harness();
+    let mut control = Conn::connect(&socket);
+
+    for round in 0..15 {
+        let created = control.call(
+            "create",
+            json!({
+                "spec": {
+                    "command": "/bin/sh",
+                    "args": ["-c", "stty raw -echo; echo ready; exit 5"],
+                    "cwd": std::env::temp_dir(),
+                }
+            }),
+        );
+        assert_eq!(created["ok"], true, "round {round}: create failed: {created}");
+        let id = created["session"].as_str().unwrap().to_string();
+
+        let mut viewer = Conn::connect(&socket);
+        let attached = viewer.call(
+            "attach",
+            json!({ "session": &id, "from": 0, "control": true }),
+        );
+        assert_eq!(attached["ok"], true, "round {round}: attach failed");
+
+        // Type into it. The pty is already gone or about to be, so this is
+        // the write that used to take the connection down with it.
+        viewer.send_input(b"hello\n");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match viewer.try_frame() {
+                Some((tag, _offset, payload)) => {
+                    if tag == frame::EXIT {
+                        assert_eq!(
+                            payload.len(),
+                            4,
+                            "round {round}: an exit code is an i32"
+                        );
+                        break;
+                    }
+                }
+                None => panic!(
+                    "round {round}: the stream ended without an exit frame"
+                ),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: no exit frame arrived"
+            );
+        }
+    }
 }

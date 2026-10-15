@@ -160,6 +160,18 @@ falling behind is watching a session that is still running, and an `exit`
 frame would send it off to render a dead session instead of reconnecting
 from its last offset. `exit` means the session ended, and nothing else.
 
+Which of the two happened is tracked explicitly, not inferred. A subscriber
+dropped for falling behind and a subscriber released because the session
+reached EOF both end the same way from the stream's side, and the daemon
+cannot tell them apart by looking at the session's `state`: the thread that
+releases subscribers at EOF and the thread that records the exit are
+different threads, and nothing orders them. A stream that reads `state` to
+decide would, on that race, close a connection that was owed an `exit`.
+
+For the same reason an `exit` frame, once it is being written, is never
+abandoned because something else about the connection ended — a client
+typing into a session that is exiting under it still gets told how it ended.
+
 The queue budget only protects a client that has been *registered*. One that
 stops reading during catch-up has no slot to drop yet, so its write simply
 blocks — the PTY is unaffected, because catch-up runs off the fan-out mutex,
