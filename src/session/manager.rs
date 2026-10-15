@@ -277,8 +277,15 @@ impl SessionManager {
             sync,
         });
 
-        spawn_exit_listener(Arc::clone(&session), spawned.exit_rx, self.store.clone());
-        spawn_eof_listener(Arc::clone(&session), spawned.eof_rx);
+        // A thread that cannot be spawned is a session that cannot report
+        // its own exit, so the create fails rather than handing back a
+        // half-wired session. Panicking here would take down the caller's
+        // connection without an answer — which is exactly how this was
+        // found, under thread pressure from a parallel test suite.
+        spawn_exit_listener(Arc::clone(&session), spawned.exit_rx, self.store.clone())
+            .map_err(|e| CreateError::Spawn(e.into()))?;
+        spawn_eof_listener(Arc::clone(&session), spawned.eof_rx)
+            .map_err(|e| CreateError::Spawn(e.into()))?;
 
         self.sessions.lock().push(Arc::clone(&session));
         Ok(session)
@@ -419,7 +426,7 @@ fn spawn_exit_listener(
     session: Arc<Session>,
     exit_rx: std::sync::mpsc::Receiver<pty::PtyExit>,
     store: Option<Arc<StdMutex<Store>>>,
-) {
+) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("session-exit".into())
         .spawn(move || {
@@ -465,13 +472,16 @@ fn spawn_exit_listener(
             // owns it and this thread holds a strong reference.
             let _ = session.exited_tx.send(true);
         })
-        .expect("spawning the session-exit thread");
+        .map(|_| ())
 }
 
 /// Consumes `eof_rx` on its own thread. Not a state signal — it exists so a
 /// caller can tell "the reader has genuinely caught up" from "the reader has
 /// not been scheduled yet" when finalizing a stream.
-fn spawn_eof_listener(session: Arc<Session>, eof_rx: std::sync::mpsc::Receiver<()>) {
+fn spawn_eof_listener(
+    session: Arc<Session>,
+    eof_rx: std::sync::mpsc::Receiver<()>,
+) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("session-eof".into())
         .spawn(move || {
@@ -479,7 +489,7 @@ fn spawn_eof_listener(session: Arc<Session>, eof_rx: std::sync::mpsc::Receiver<(
                 let _ = session.eof_tx.send(true);
             }
         })
-        .expect("spawning the session-eof thread");
+        .map(|_| ())
 }
 
 /// Whether `command` can actually be spawned, checked before a PTY is opened
