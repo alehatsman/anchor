@@ -179,7 +179,7 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
             }
         }
 
-        respond(&mut write_half, dispatch(&line, &state)).await?;
+        respond(&mut write_half, dispatch(&line, &state).await).await?;
     }
 }
 
@@ -232,7 +232,15 @@ fn attach_check(
 }
 
 /// Answers one control request. Never panics, never drops the connection.
-fn dispatch(line: &str, state: &State) -> Value {
+///
+/// Async because two ops are genuinely slow: `terminate` runs the bounded
+/// termination policy (up to ~7s of graceful wait plus hard kill) and
+/// `purge` deletes a session directory. Both would otherwise hold a
+/// runtime worker for their whole duration, stalling every other
+/// connection that worker is responsible for — the daemon's own version of
+/// the rule it enforces for PTY output: nothing slow runs where something
+/// fast has to wait behind it.
+async fn dispatch(line: &str, state: &State) -> Value {
     let request: Request = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
@@ -253,9 +261,9 @@ fn dispatch(line: &str, state: &State) -> Value {
         "get" => op_get(request.id, line, state),
         "label" => op_label(request.id, line, state),
         "resize" => op_resize(request.id, line, state),
-        "terminate" => op_terminate(request.id, line, state),
+        "terminate" => op_terminate(request.id, line, state).await,
         "log" => op_log(request.id, line, state),
-        "purge" => op_purge(request.id, line, state),
+        "purge" => op_purge(request.id, line, state).await,
         other => proto::error(
             request.id,
             ErrorCode::UnknownOp,
@@ -445,7 +453,7 @@ fn op_resize(id: u64, line: &str, state: &State) -> Value {
     }
 }
 
-fn op_terminate(id: u64, line: &str, state: &State) -> Value {
+async fn op_terminate(id: u64, line: &str, state: &State) -> Value {
     let req: SessionReq = match parse(id, line) {
         Ok(r) => r,
         Err(e) => return e,
@@ -453,16 +461,24 @@ fn op_terminate(id: u64, line: &str, state: &State) -> Value {
     let Some(session) = state.manager.get(&req.session) else {
         return not_live(id, &req.session, state);
     };
+
+    // Off the worker: terminate blocks for the whole graceful wait plus the
+    // hard kill. That bound is what termination means, so it belongs in the
+    // policy — not on a thread other connections are waiting on.
+    let terminating = Arc::clone(&session);
+    let result = tokio::task::spawn_blocking(move || terminating.terminate()).await;
+
     // Idempotent, including against an already-exited session.
-    match session.terminate() {
-        Ok(()) => proto::ok(
+    match result {
+        Ok(Ok(())) => proto::ok(
             id,
             json!({
                 "state": session.state().as_str(),
                 "exit_code": session.snapshot().exit_code,
             }),
         ),
-        Err(e) => proto::error(id, ErrorCode::AlreadyExited, e.to_string()),
+        Ok(Err(e)) => proto::error(id, ErrorCode::AlreadyExited, e.to_string()),
+        Err(e) => proto::error(id, ErrorCode::AlreadyExited, format!("terminate: {e}")),
     }
 }
 
@@ -533,7 +549,7 @@ fn op_log(id: u64, line: &str, state: &State) -> Value {
     }
 }
 
-fn op_purge(id: u64, line: &str, state: &State) -> Value {
+async fn op_purge(id: u64, line: &str, state: &State) -> Value {
     let req: SessionReq = match parse(id, line) {
         Ok(r) => r,
         Err(e) => return e,
@@ -543,12 +559,18 @@ fn op_purge(id: u64, line: &str, state: &State) -> Value {
     if lookup(&req.session, state).is_none() {
         return proto::error(id, ErrorCode::NotFound, "no such session");
     }
-    match state.manager.forget(&req.session) {
-        Ok(_) => proto::ok(id, json!({ "purged": true })),
-        Err(e @ CreateError::StillRunning) => {
+    // Off the worker too: forgetting a session deletes its directory, and
+    // a large log on a slow disk is not something other connections should
+    // queue behind.
+    let manager = Arc::clone(&state.manager);
+    let session = req.session.clone();
+    match tokio::task::spawn_blocking(move || manager.forget(&session)).await {
+        Ok(Ok(_)) => proto::ok(id, json!({ "purged": true })),
+        Ok(Err(e @ CreateError::StillRunning)) => {
             proto::error(id, ErrorCode::AlreadyExited, e.to_string())
         }
-        Err(e) => proto::error(id, ErrorCode::InvalidSpec, e.to_string()),
+        Ok(Err(e)) => proto::error(id, ErrorCode::InvalidSpec, e.to_string()),
+        Err(e) => proto::error(id, ErrorCode::InvalidSpec, format!("purge: {e}")),
     }
 }
 

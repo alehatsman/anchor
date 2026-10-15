@@ -74,6 +74,28 @@ impl Client {
 
 /// Spawns a shell that writes `text` and stays alive, so the session is
 /// still running when the test inspects it.
+/// Runs `script` directly. `create_echo` wraps its argument in `printf`,
+/// so a script passed there becomes text the shell prints rather than code
+/// it runs — which quietly turns a test of stubborn children into a test of
+/// nothing.
+fn create_script(client: &mut Client, script: &str) -> String {
+    let response = client.ok(
+        "create",
+        json!({
+            "spec": {
+                "command": "/bin/sh",
+                "args": ["-c", script],
+                "cwd": std::env::temp_dir(),
+            },
+        }),
+    );
+    assert_eq!(response["state"], "running");
+    response["session"]
+        .as_str()
+        .expect("a session id")
+        .to_string()
+}
+
 fn create_echo(client: &mut Client, text: &str, labels: Value) -> String {
     let response = client.ok(
         "create",
@@ -366,4 +388,63 @@ async fn purge_forgets_a_session_entirely() {
     // than silently succeeding.
     let missing = client.call("purge", json!({ "session": "01JNOPE0000000000000000000" }));
     assert_eq!(missing["error"]["code"], "not_found");
+}
+
+/// A slow terminate must not stall unrelated connections.
+///
+/// The bounded wait in the termination policy is up to ~7s, and a child
+/// that ignores SIGHUP and SIGTERM takes all of it. Enough of those at once
+/// will occupy every runtime worker unless the blocking work is moved off
+/// them — so this saturates deliberately rather than firing one and hoping
+/// the scheduler picks a different thread.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_terminate_does_not_stall_other_connections() {
+    let h = harness();
+    let mut control = Client::connect(&h.socket);
+
+    let workers = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4);
+    let stubborn = workers * 2;
+
+    let mut ids = Vec::new();
+    for _ in 0..stubborn {
+        // Ignores both graceful signals, so terminate must run its whole
+        // wait and then hard-kill.
+        let id = create_script(
+            &mut control,
+            "trap '' HUP TERM; stty raw -echo; echo stubborn; while :; do sleep 1; done",
+        );
+        ids.push(id);
+    }
+    for id in &ids {
+        wait_for_output(&mut control, id, "stubborn");
+    }
+
+    // Fire every terminate at once, each on its own connection.
+    let mut terminators = Vec::new();
+    for id in &ids {
+        let socket = h.socket.clone();
+        let id = id.clone();
+        terminators.push(std::thread::spawn(move || {
+            let mut conn = Client::connect(&socket);
+            conn.call("terminate", json!({ "session": id }));
+        }));
+    }
+
+    // While those are blocked in their graceful waits, an unrelated
+    // connection must still be answered promptly.
+    let start = Instant::now();
+    let mut bystander = Client::connect(&h.socket);
+    assert_eq!(bystander.ok("ping", json!({}))["pong"], true);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "a ping waited {elapsed:?} behind {stubborn} terminates; slow work is \
+         holding runtime workers"
+    );
+
+    for t in terminators {
+        t.join().expect("a terminate panicked");
+    }
 }
