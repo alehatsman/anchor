@@ -45,9 +45,19 @@ noticed. See
 [ROADMAP.md](ROADMAP.md), [docs/](docs/) and the open issues.
 
 ```sh
-cargo test          # 83: ported fixtures, protocol, CLI, restart recovery
+cargo test                # ported fixtures, protocol, CLI, restart recovery
 cargo run --bin anchord   # or: anchor daemon
+
+anchor service install    # register anchord with launchd/systemd, so it
+                          # outlives every client (docs/07-lifecycle.md)
+anchor service status
 ```
+
+**No client should ever spawn `anchord`.** A daemon started as a child of a
+client has the client's lifetime, which is the whole property anchor exists
+to break. `anchor service install` registers it with the user's own service
+manager instead — a launchd user agent on macOS, a systemd user unit on
+Linux, both login-scoped and needing no root.
 
 It is being extracted from [teleport](https://github.com/alehatsman/teleport),
 which already runs this subsystem in production as part of a larger product.
@@ -112,6 +122,24 @@ rarely-changed daemon hold the PTYs while everything above it ships freely.
 
 That second reason holds even if no other client is ever built.
 
+**This now works, and it is demonstrated rather than claimed.** teleport's
+`an_agent_survives_teleport_restarting_under_it` starts an agent, drops the
+teleport that spawned it, starts a new one against the same `anchord`, and
+requires the agent to still be running with its transcript intact. Its
+updater restarts under load only when the daemon advertises
+`sessions_survive_restart` on `/health`.
+
+### The boundary, stated plainly
+
+**If `anchord` dies, its PTYs die with it.** The master fd has no handoff.
+anchor makes *updates* survivable by being small and changing rarely; it does
+not make *crashes* survivable. teleport documented that fix — a broker
+process per PTY — and deliberately declined to pay for it, and anchor
+inherits the choice.
+
+A restarted `anchord` is a clean daemon whose previous sessions are `lost`.
+Nothing here should ever be read as more than that.
+
 ## Design
 
 | doc | what |
@@ -121,6 +149,8 @@ That second reason holds even if no other client is ever built.
 | [docs/03-pty.md](docs/03-pty.md) | thread model, backpressure, termination |
 | [docs/04-protocol.md](docs/04-protocol.md) | the unix socket API |
 | [docs/05-extraction.md](docs/05-extraction.md) | how this gets carved out of teleport |
+| [docs/06-teleport-seam.md](docs/06-teleport-seam.md) | where the two actually meet |
+| [docs/07-lifecycle.md](docs/07-lifecycle.md) | who starts anchord, and what restart does not save |
 | [ROADMAP.md](ROADMAP.md) | milestones, each retiring one risk |
 
 ## License
