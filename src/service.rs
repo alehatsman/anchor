@@ -51,14 +51,7 @@ fn home_dir() -> Result<PathBuf> {
 /// next login, when the service manager fails to start a binary that is no
 /// longer there.
 fn warn_if_build_output(exe: &Path) {
-    let parts: Vec<_> = exe
-        .components()
-        .map(std::path::Component::as_os_str)
-        .collect();
-    let from_build = parts
-        .windows(2)
-        .any(|w| matches!(w, [a, b] if *a == "target" && (*b == "debug" || *b == "release")));
-    if from_build {
+    if is_build_output(exe) {
         eprintln!(
             "warning: {} looks like a `cargo build` output, not a stable install location — \
              a later build or `cargo clean` removes it and the service then fails to start \
@@ -67,6 +60,22 @@ fn warn_if_build_output(exe: &Path) {
             exe.display()
         );
     }
+}
+
+/// Whether a path points inside a cargo build directory.
+///
+/// Matches `target/debug` or `target/release` at any depth rather than at a
+/// fixed one — a workspace, a `CARGO_TARGET_DIR`, and a plain crate all put
+/// it somewhere different, and a check that only fires for one layout warns
+/// nobody.
+fn is_build_output(exe: &Path) -> bool {
+    let parts: Vec<_> = exe
+        .components()
+        .map(std::path::Component::as_os_str)
+        .collect();
+    parts
+        .windows(2)
+        .any(|w| matches!(w, [a, b] if *a == "target" && (*b == "debug" || *b == "release")))
 }
 
 /// The binary to register: `anchord` next to whatever is running.
@@ -476,45 +485,39 @@ mod tests {
     }
 
     /// A build-output path is recognised wherever `target/debug` appears,
-    /// not only at a fixed depth — the warning is worthless if it only
-    /// fires for one project layout.
+    /// not only at a fixed depth — the warning is worthless if it only fires
+    /// for one project layout.
+    ///
+    /// Calls `is_build_output` rather than restating its rule: a test that
+    /// re-implements the predicate it checks passes for any predicate,
+    /// including a broken one.
     #[test]
     fn build_output_paths_are_recognised() {
-        // Exercised for its classification, which is the part that can be
-        // wrong; the printing is a side effect.
         for path in [
             "/home/u/p/target/debug/anchord",
             "/home/u/p/target/release/anchord",
             "/a/b/c/d/target/debug/anchord",
+            "/tmp/cargo-target/target/debug/anchord",
         ] {
-            let p = PathBuf::from(path);
-            let parts: Vec<_> = p
-                .components()
-                .map(std::path::Component::as_os_str)
-                .collect();
             assert!(
-                parts.windows(2).any(
-                    |w| matches!(w, [a, b] if *a == "target" && (*b == "debug" || *b == "release"))
-                ),
+                is_build_output(&PathBuf::from(path)),
                 "{path} should be seen as a build output"
             );
         }
     }
 
-    /// An installed path is not a build output just because the word
-    /// appears somewhere in it.
+    /// An installed path is not a build output just because the word appears
+    /// somewhere in it.
     #[test]
     fn installed_paths_are_not_build_outputs() {
-        for path in ["/usr/local/bin/anchord", "/home/u/.cargo/bin/anchord"] {
-            let p = PathBuf::from(path);
-            let parts: Vec<_> = p
-                .components()
-                .map(std::path::Component::as_os_str)
-                .collect();
+        for path in [
+            "/usr/local/bin/anchord",
+            "/home/u/.cargo/bin/anchord",
+            "/opt/target-practice/bin/anchord",
+            "/home/u/debug/anchord",
+        ] {
             assert!(
-                !parts.windows(2).any(
-                    |w| matches!(w, [a, b] if *a == "target" && (*b == "debug" || *b == "release"))
-                ),
+                !is_build_output(&PathBuf::from(path)),
                 "{path} is an install location, not a build output"
             );
         }

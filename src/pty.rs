@@ -173,29 +173,89 @@ pub fn login_shell_path() -> String {
         .unwrap_or_else(|| "/bin/sh".to_string())
 }
 
+/// The shell families that need a different `-c` invocation
+/// (docs/03-pty.md, anchor#10).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ShellFamily {
+    /// `sh`, `bash`, `zsh`, `ksh`, `dash`, and anything unrecognised.
+    Posix,
+    /// `fish`: takes `-l`, binds `$argv`, never word-splits on expansion.
+    Fish,
+    /// `csh`, `tcsh`: rejects `-l` beside `-c`, has no `$0`/`$@`, and
+    /// word-splits `$argv` unless it is quoted with `:q`.
+    Csh,
+}
+
+/// Classifies a shell by the file name of its path.
+///
+/// The file name, not the whole path: `/opt/homebrew/bin/fish` and
+/// `/usr/local/bin/fish` are the same shell. A version suffix is not
+/// stripped — `fish3` is not a name any distribution ships, and guessing at
+/// suffixes would misclassify a shell genuinely called something else.
+///
+/// Unrecognised means `Posix`. An unknown shell is far likelier to be
+/// POSIX-compatible than not, and if it is not, the spawn fails loudly with
+/// the shell's own usage message rather than silently running under the
+/// wrong environment.
+fn shell_family(shell: &str) -> ShellFamily {
+    let name = std::path::Path::new(shell)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match name.as_str() {
+        "fish" => ShellFamily::Fish,
+        "csh" | "tcsh" => ShellFamily::Csh,
+        _ => ShellFamily::Posix,
+    }
+}
+
 /// Builds the `(shell, argv)` pair that runs `spec.program` under a login
 /// shell, or `None` when the spec did not ask for one.
 ///
-/// The shell string is the fixed literal `exec "$0" "$@"`: no request data is
-/// ever interpolated into shell source. `sh -c script name args...` binds
-/// `name` to `$0` and `args...` to `$@` as separate argv entries, which
-/// `exec` passes through untouched.
+/// **No request data is ever interpolated into shell source.** Every form
+/// here passes a fixed script literal and hands the program and its
+/// arguments to the shell as separate argv entries; the script expands them
+/// back without splitting or globbing. That property is the reason the
+/// wrapper exists in this shape, and a new family does not get added without
+/// it.
 ///
 /// `-l`, not `-i`: a login shell sources the profile files that build the
 /// environment; an interactive one also loads prompt, completion and plugins
 /// — startup cost and stray output with no business in an agent's PTY.
+///
+/// csh and tcsh get no `-l`: they reject it beside `-c` outright, and no
+/// flag combines the two. Those users get `.cshrc` and not `.login`, which
+/// is a real shortfall against what `login_shell` promises and is documented
+/// as one. Falling back to `/bin/sh` instead would source their config not
+/// at all, while still claiming to be their login shell.
 fn login_shell_wrapper(spec: &SpawnSpec<'_>) -> Option<(String, Vec<String>)> {
     if !spec.login_shell {
         return None;
     }
-    let mut argv = vec![
-        "-l".to_string(),
-        "-c".to_string(),
-        r#"exec "$0" "$@""#.to_string(),
-        spec.program.to_string(),
-    ];
-    argv.extend_from_slice(spec.args);
-    Some((login_shell_path(), argv))
+    let shell = login_shell_path();
+    let argv = wrapper_argv(&shell, spec.program, spec.args);
+    Some((shell, argv))
+}
+
+/// The argv for a given shell, split out of `login_shell_wrapper` so it is
+/// testable without mutating `$SHELL` — an env var is process-global, and a
+/// test that writes it races every other test in the binary.
+fn wrapper_argv(shell: &str, program: &str, args: &[String]) -> Vec<String> {
+    // `$argv:q` in the csh form, never a bare `$argv`: csh word-splits and
+    // globs an unquoted expansion, which turns one argument `a b` into two
+    // and a literal `*` into the directory listing.
+    let mut argv = match shell_family(shell) {
+        ShellFamily::Posix => vec![
+            "-l".to_string(),
+            "-c".to_string(),
+            r#"exec "$0" "$@""#.to_string(),
+        ],
+        ShellFamily::Fish => vec!["-l".to_string(), "-c".to_string(), "exec $argv".to_string()],
+        ShellFamily::Csh => vec!["-c".to_string(), "exec $argv:q".to_string()],
+    };
+    argv.push(program.to_string());
+    argv.extend_from_slice(args);
+    argv
 }
 
 /// Spawns `spec` behind a fresh PTY and starts the four session threads.
@@ -803,5 +863,138 @@ mod reader_tests {
             Ok(b"never".to_vec()),
         ]);
         assert_eq!(out, b"before", "the reader read past a terminal error");
+    }
+}
+
+/// The login-shell wrapper (docs/03-pty.md, anchor#10).
+///
+/// The forms are asserted by *running* them wherever the shell is installed,
+/// not by matching the argv strings. A string assertion restates the code it
+/// is checking and so passes for any form, correct or not; only an exec
+/// proves that `a b` stayed one argument and `*` stayed a star.
+#[cfg(test)]
+mod login_shell_tests {
+    use super::*;
+
+    /// Arguments chosen to break every way a shell can mishandle them: an
+    /// embedded space (word splitting), a glob (filename expansion), a
+    /// dollar (variable expansion) and a quote (quote removal).
+    const TRICKY: [&str; 4] = ["a b", "*", "c$d", "e\"f"];
+
+    /// Runs `program` under `shell` using the wrapper's own argv, and
+    /// returns what the program saw as its arguments.
+    fn argv_as_seen_by_the_child(shell: &str) -> Option<Vec<String>> {
+        if !std::path::Path::new(shell).exists() {
+            return None;
+        }
+        let args: Vec<String> = TRICKY.iter().map(|s| (*s).to_string()).collect();
+        // `printf` with a per-argument format repeats for each operand, so
+        // the output has one bracketed line per argv entry — which is the
+        // split that matters.
+        let argv = wrapper_argv(shell, "/usr/bin/printf", &{
+            let mut v = vec!["[%s]\n".to_string()];
+            v.extend(args);
+            v
+        });
+        let out = std::process::Command::new(shell)
+            .args(&argv)
+            .output()
+            .unwrap_or_else(|e| panic!("running {shell}: {e}"));
+        assert!(
+            out.status.success(),
+            "{shell} rejected the wrapper: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| l.trim_start_matches('[').trim_end_matches(']').to_string())
+                .collect(),
+        )
+    }
+
+    /// Every shell installed here must deliver the arguments unsplit,
+    /// unglobbed and unexpanded. Shells that are absent are skipped and
+    /// named, so a green run never silently means "tested nothing".
+    #[test]
+    fn installed_shells_pass_arguments_through_untouched() {
+        let mut tested = 0;
+        for shell in [
+            "/bin/sh", "/bin/bash", "/bin/zsh", "/bin/csh", "/bin/tcsh",
+            "/usr/bin/fish", "/usr/local/bin/fish", "/opt/homebrew/bin/fish",
+        ] {
+            let Some(seen) = argv_as_seen_by_the_child(shell) else {
+                continue;
+            };
+            tested += 1;
+            assert_eq!(seen, TRICKY, "{shell} mangled its arguments");
+        }
+        assert!(tested > 0, "no shell to test against; the suite proved nothing");
+        eprintln!("login-shell wrapper exercised against {tested} shell(s)");
+    }
+
+    /// The csh family is the reason this classification exists: `-l` beside
+    /// `-c` is rejected outright, so the csh form must not carry it.
+    #[test]
+    fn the_csh_form_omits_the_login_flag() {
+        for shell in ["/bin/csh", "/bin/tcsh", "/usr/local/bin/tcsh"] {
+            assert_eq!(shell_family(shell), ShellFamily::Csh, "{shell}");
+            let argv = wrapper_argv(shell, "prog", &[]);
+            assert!(
+                !argv.contains(&"-l".to_string()),
+                "csh rejects -l beside -c: {argv:?}"
+            );
+        }
+    }
+
+    /// fish takes `-l`, so dropping it there would cost the profile the
+    /// feature exists to source.
+    #[test]
+    fn the_fish_form_keeps_the_login_flag() {
+        for shell in ["/opt/homebrew/bin/fish", "/usr/bin/fish"] {
+            assert_eq!(shell_family(shell), ShellFamily::Fish, "{shell}");
+            assert!(
+                wrapper_argv(shell, "prog", &[]).contains(&"-l".to_string()),
+                "fish supports -l and the profile is the point"
+            );
+        }
+    }
+
+    /// An unrecognised shell gets the POSIX form rather than an error: it is
+    /// far likelier to be POSIX-compatible than not, and if it is not, the
+    /// spawn fails loudly with the shell's own usage message.
+    #[test]
+    fn an_unknown_shell_gets_the_posix_form() {
+        for shell in ["/bin/sh", "/bin/bash", "/usr/bin/ksh", "/opt/weird/nushell"] {
+            assert_eq!(shell_family(shell), ShellFamily::Posix, "{shell}");
+        }
+        assert_eq!(
+            wrapper_argv("/opt/weird/nushell", "prog", &["x".into()]),
+            vec!["-l", "-c", r#"exec "$0" "$@""#, "prog", "x"]
+        );
+    }
+
+    /// Classification is by file name, so where a shell is installed does
+    /// not change how it is invoked.
+    #[test]
+    fn the_install_location_does_not_change_the_family() {
+        for shell in ["/usr/bin/fish", "/opt/homebrew/bin/fish", "fish"] {
+            assert_eq!(shell_family(shell), ShellFamily::Fish, "{shell}");
+        }
+    }
+
+    /// A spec that did not ask for a login shell gets no wrapper at all.
+    #[test]
+    fn no_wrapper_without_the_flag() {
+        let spec = SpawnSpec {
+            program: "/bin/echo",
+            args: &[],
+            cwd: std::path::Path::new("/"),
+            env: &[],
+            cols: 80,
+            rows: 24,
+            login_shell: false,
+        };
+        assert!(login_shell_wrapper(&spec).is_none());
     }
 }

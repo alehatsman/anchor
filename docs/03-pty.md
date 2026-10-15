@@ -135,12 +135,46 @@ description. Dropping the `MasterPty` closes nothing and raises no signal
 ## Spawn details that bite
 
 - **argv array, never a concatenated shell string.**
-- **`login_shell`** wraps as `$SHELL -l -c 'exec "$0" "$@"' <program> <args…>`.
-  A daemon started by launchd/systemd inherits none of the user's
-  environment — `PATH` beyond the system default, `EDITOR`, `LANG`, version
-  manager shims. Without this, `claude` is not even on `PATH`. The only
-  shell-parsed text is the fixed literal; program and args stay separate argv
-  entries. `-l` not `-i`. Ignored on Windows.
+- **`login_shell`** runs the program under `$SHELL` so it inherits the user's
+  environment. A daemon started by launchd/systemd inherits none of it —
+  `PATH` beyond the system default, `EDITOR`, `LANG`, version manager shims.
+  Without this, `claude` is not even on `PATH`. `-l`, not `-i`: a login shell
+  sources the profile that builds the environment; an interactive one also
+  loads prompt, completion and plugins, which is startup cost and stray
+  output with no business in a PTY. Ignored on Windows.
+
+  **The invariant: no request data is ever interpolated into shell source.**
+  Every form below passes a *fixed* script literal and hands the program and
+  its arguments to the shell as separate argv entries, which the script
+  expands back without splitting or globbing. A form that cannot do that does
+  not get added to this table.
+
+  The POSIX form is not universal, so `$SHELL`'s file name selects one of
+  three (anchor#10):
+
+  | `$SHELL` | invocation | sources |
+  | --- | --- | --- |
+  | anything else (default) | `-l -c 'exec "$0" "$@"' <program> <args…>` | login profile |
+  | `fish` | `-l -c 'exec $argv' <program> <args…>` | login profile |
+  | `csh`, `tcsh` | `-c 'exec $argv:q' <program> <args…>` | `.cshrc` only |
+
+  The default is the POSIX form, for `sh`/`bash`/`zsh`/`ksh`/`dash` and for
+  any shell not recognised — an unknown shell is far more likely to be
+  POSIX-compatible than not, and guessing wrong fails loudly at spawn rather
+  than silently.
+
+  fish binds remaining arguments to `$argv` and does not word-split on
+  expansion, so `exec $argv` needs no quoting. csh does word-split; `:q`
+  is what preserves one word per argument, and plain `$argv` is a bug
+  — it splits `a b` into two arguments and globs a literal `*`.
+
+  **csh and tcsh cannot have `-l` and `-c` together** — they reject `-l`
+  outright in that position, and there is no flag that combines them. Those
+  users get `.cshrc` but **not** `.login`. That is a real difference from
+  what `login_shell: true` promises, and it is accepted rather than papered
+  over: falling back to `/bin/sh` would source the user's config not at all
+  while still claiming to be their login shell, which is worse because it
+  is invisible.
 - **`TERM` default.** A daemon with no controlling terminal has no `TERM`, and
   children render monochrome because color detection treats absent `TERM` as
   dumb. Set `TERM=xterm-256color` + `COLORTERM=truecolor` **only when unset**;

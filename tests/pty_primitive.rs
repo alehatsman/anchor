@@ -10,7 +10,7 @@
 #![cfg(unix)]
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anchor::pty::{self, SpawnSpec, TerminalSession};
@@ -65,37 +65,55 @@ fn spawn_interactive_sh(cols: u16, rows: u16) -> (pty::SpawnedSession, Receiver<
     (spawned, out_rx)
 }
 
-/// Accumulates chunks from `rx` until `pred(&acc)` is true, or panics after
-/// `timeout` with whatever was collected so far.
+/// Accumulates chunks from `rx` until `pred(&acc)` is true, or panics once
+/// `rx` has gone `stall` without delivering anything.
+///
+/// **The budget is per-silence, not total** (anchor#11). These tests drive a
+/// real `/bin/sh`, and a total-elapsed deadline measures how fast this
+/// machine happens to be rather than whether the PTY layer works — under
+/// load the producer is simply still producing when the clock runs out, and
+/// the suite reports a bug that is not there. A reader that has genuinely
+/// stopped still fails within `stall`, which is the condition these tests
+/// are about.
 fn recv_until(
     rx: &Receiver<Vec<u8>>,
-    timeout: Duration,
+    stall: Duration,
     mut pred: impl FnMut(&[u8]) -> bool,
 ) -> Vec<u8> {
-    let deadline = Instant::now() + timeout;
     let mut acc = Vec::new();
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "timed out waiting for predicate; got {} bytes: {:?}",
-            acc.len(),
-            String::from_utf8_lossy(&acc)
-        );
-        match rx.recv_timeout(remaining) {
+        match rx.recv_timeout(stall) {
             Ok(chunk) => {
                 acc.extend_from_slice(&chunk);
                 if pred(&acc) {
                     return acc;
                 }
             }
-            Err(e) => panic!(
-                "output channel closed before predicate matched ({e}); got {} bytes: {:?}",
-                acc.len(),
-                String::from_utf8_lossy(&acc)
+            Err(RecvTimeoutError::Timeout) => panic!(
+                "no output for {stall:?}; the predicate never matched. {}",
+                tail(&acc)
+            ),
+            Err(RecvTimeoutError::Disconnected) => panic!(
+                "output channel closed before the predicate matched. {}",
+                tail(&acc)
             ),
         }
     }
+}
+
+/// The end of what was collected, for a failure message.
+///
+/// Bounded deliberately: these tests move megabytes, and a panic that dumps
+/// all of it buries the one line that says what went wrong under a wall of
+/// output no one scrolls back through.
+fn tail(acc: &[u8]) -> String {
+    const TAIL: usize = 256;
+    let start = acc.len().saturating_sub(TAIL);
+    format!(
+        "Got {} bytes, ending {:?}",
+        acc.len(),
+        String::from_utf8_lossy(&acc[start..])
+    )
 }
 
 fn contains(acc: &[u8], needle: &str) -> bool {
@@ -151,7 +169,10 @@ fn large_burst_read_drops_nothing() {
                                       // note on large_write_arrives_intact_and_in_order above.
     let (_spawned, out_rx) = spawn_sh(&format!("stty raw -echo; yes | head -c {N}"), 24, 80);
 
-    let got = recv_until(&out_rx, Duration::from_secs(30), |acc| acc.len() >= N);
+    // DEFAULT_TIMEOUT, not the longer budget this used to need: the wait is
+    // per-silence now, and a burst this size is many thousands of chunks. It
+    // never goes 10s without one unless the reader has actually stopped.
+    let got = recv_until(&out_rx, DEFAULT_TIMEOUT, |acc| acc.len() >= N);
     assert_eq!(got.len(), N, "must not drop or duplicate bytes");
     assert!(
         got.iter().all(|&b| b == b'y' || b == b'\n'),
