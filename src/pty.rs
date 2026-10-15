@@ -24,7 +24,7 @@
 
 use std::io::{Read, Result as IoResult, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -266,6 +266,10 @@ pub fn spawn(
     let (exit_tx, exit_rx) = mpsc::sync_channel::<PtyExit>(1);
     let (eof_tx, eof_rx) = mpsc::sync_channel::<()>(1);
     let state = Arc::new(AtomicU8::new(STATE_RUNNING));
+    // Set by the reaper the instant `wait` returns. See `reaped` in
+    // `control_thread_main`: once the child is reaped its pid belongs to
+    // the kernel again, and signalling it is signalling a stranger.
+    let reaped = Arc::new(AtomicBool::new(false));
 
     std::thread::Builder::new()
         .name("pty-reader".into())
@@ -281,7 +285,8 @@ pub fn spawn(
         .name("pty-reaper".into())
         .spawn({
             let control_tx = control_tx.clone();
-            move || reaper_thread_main(child, &control_tx)
+            let reaped = Arc::clone(&reaped);
+            move || reaper_thread_main(child, &control_tx, &reaped)
         })
         .context("spawning reaper thread")?;
 
@@ -289,7 +294,17 @@ pub fn spawn(
         .name("pty-control".into())
         .spawn({
             let state = Arc::clone(&state);
-            move || control_thread_main(pair.master, pid, killer, &control_rx, &exit_tx, &state)
+            move || {
+                control_thread_main(
+                    pair.master,
+                    pid,
+                    killer,
+                    &control_rx,
+                    &exit_tx,
+                    &state,
+                    &reaped,
+                )
+            }
         })
         .context("spawning control thread")?;
 
@@ -399,6 +414,22 @@ fn reader_thread_main(
     mut on_output: impl FnMut(&[u8]) + Send,
     eof_tx: &SyncSender<()>,
 ) {
+    // EOF is signalled from a drop guard, not from the end of the loop,
+    // so it still fires if `on_output` panics. `on_output` is a
+    // caller-supplied closure that runs on this thread: a panic in it
+    // unwinds straight past a plain send, and the session would then wait
+    // on an EOF that can never arrive -- wedged with no error anywhere,
+    // which is the worst shape a failure can take.
+    struct EofOnDrop<'a>(&'a SyncSender<()>);
+    impl Drop for EofOnDrop<'_> {
+        fn drop(&mut self) {
+            // Best-effort: if nothing is waiting on EOF anymore there is
+            // nothing to do.
+            let _ = self.0.try_send(());
+        }
+    }
+    let _eof = EofOnDrop(eof_tx);
+
     // Heap, not a 64 KiB stack array: the buffer lives for the thread's whole
     // run and there is nothing to gain from the stack.
     let mut buf = vec![0u8; READ_BUFFER_SIZE];
@@ -419,8 +450,6 @@ fn reader_thread_main(
             Err(_) => break,
         }
     }
-    // Best-effort: if nothing is waiting on EOF anymore there is nothing to do.
-    let _ = eof_tx.try_send(());
 }
 
 fn writer_thread_main(mut writer: Box<dyn Write + Send>, write_rx: &Receiver<Vec<u8>>) {
@@ -438,8 +467,14 @@ fn writer_thread_main(mut writer: Box<dyn Write + Send>, write_rx: &Receiver<Vec
 fn reaper_thread_main(
     mut child: Box<dyn Child + Send + Sync>,
     control_tx: &SyncSender<ControlEvent>,
+    reaped: &AtomicBool,
 ) {
     let result = child.wait();
+    // Published before the event is sent, and deliberately so: the channel
+    // send can be delayed by scheduling, and for that whole span the pid is
+    // already back in the kernel's pool. A `Terminate` arriving in the gap
+    // would signal whatever now owns that number.
+    reaped.store(true, Ordering::SeqCst);
     // Ignored if the control thread already finished — e.g. it gave up on a
     // hard-kill timeout. Its result stands.
     let _ = control_tx.send(ControlEvent::ChildExited(result));
@@ -452,6 +487,7 @@ fn control_thread_main(
     control_rx: &Receiver<ControlEvent>,
     exit_tx: &SyncSender<PtyExit>,
     state: &Arc<AtomicU8>,
+    reaped: &AtomicBool,
 ) {
     loop {
         let Ok(event) = control_rx.recv() else {
@@ -479,6 +515,14 @@ fn control_thread_main(
             }
 
             ControlEvent::Terminate { reply_tx } => {
+                // Step 1: do not signal a pid that is no longer ours. Once
+                // `wait` has reaped the child the number is free for the
+                // kernel to hand to anything, so a kill aimed at a session
+                // that already ended lands on an unrelated process group.
+                // The `ChildExited` event is already sent or imminent --
+                // waiting for it is both correct and the whole job here.
+                let pid = pid_to_signal(pid, reaped.load(Ordering::SeqCst));
+
                 // Step 2: graceful signal. Not dropping the master — the
                 // reader and writer hold their own dups of the same open file
                 // description, so dropping it closes nothing and raises no
@@ -516,6 +560,26 @@ fn control_thread_main(
             }
         }
     }
+}
+
+/// The pid a `Terminate` may signal, or `None` if signalling it would hit
+/// a stranger.
+///
+/// Once `wait` has reaped the child, its pid goes back to the kernel's
+/// pool and can be handed to any new process. A terminate racing that is
+/// not a lost signal -- it is a `killpg` aimed at an unrelated process
+/// group, which is a far worse outcome than doing nothing.
+///
+/// This does not close the window completely and cannot: the pid is free
+/// from the moment `wait` returns, and the flag is set immediately after.
+/// What it removes is the wide case -- a session that exited some time ago
+/// and was terminated afterwards -- leaving only the few instructions
+/// between the two.
+fn pid_to_signal(pid: Option<u32>, reaped: bool) -> Option<u32> {
+    if reaped {
+        return None;
+    }
+    pid
 }
 
 /// Step 2: SIGHUP to the session's process group, then SIGTERM to the child.
@@ -681,6 +745,50 @@ mod reader_tests {
             out,
             b"beforeafter",
             "output after an interrupted read was lost"
+        );
+    }
+
+    /// Terminating a session whose child has already been reaped must not
+    /// signal anything.
+    ///
+    /// Deliberately a test of the decision rather than of the race: the
+    /// race needs a pid to be reused between two instructions, which
+    /// cannot be arranged. What it does guard is the check being deleted
+    /// as redundant -- it looks redundant, because the `ChildExited` event
+    /// is usually already queued, and "usually" is the whole problem.
+    #[test]
+    fn a_reaped_child_is_never_signalled() {
+        assert_eq!(pid_to_signal(Some(4242), false), Some(4242));
+        assert_eq!(
+            pid_to_signal(Some(4242), true),
+            None,
+            "a reaped pid belongs to the kernel again; killpg would hit a stranger"
+        );
+        assert_eq!(pid_to_signal(None, false), None);
+    }
+
+    /// A panic in the caller's closure must still signal EOF.
+    ///
+    /// `on_output` is caller-supplied and runs on the reader thread, so a
+    /// panic in it unwinds past the end of the loop. When the EOF send
+    /// lived there, the session was left waiting on a signal that could
+    /// never arrive: wedged, with nothing logged and nothing failed --
+    /// the worst shape a failure can take, because there is no symptom to
+    /// chase.
+    #[test]
+    fn a_panicking_output_callback_still_signals_eof() {
+        let (eof_tx, eof_rx) = sync_channel(1);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reader_thread_main(
+                Box::new(Scripted(vec![Ok(b"boom".to_vec())].into_iter())),
+                |_| panic!("the caller's closure panicked"),
+                &eof_tx,
+            );
+        }));
+        assert!(panicked.is_err(), "the panic was swallowed, not unwound");
+        assert!(
+            eof_rx.try_recv().is_ok(),
+            "EOF was never signalled, so the session waits on it forever"
         );
     }
 
