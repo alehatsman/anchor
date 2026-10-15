@@ -16,11 +16,23 @@ use std::time::{Duration, Instant};
 use anchor::proto::frame;
 use serde_json::{json, Value};
 
+/// A client that stops reading is closed after this; the production default
+/// is 30s, which would make these fixtures glacial.
+///
+/// Every wait in this file is derived from it rather than written out as
+/// its own literal. Two independent numbers that have to stay in a ratio
+/// drift apart the first time someone tunes one of them, and the failure
+/// is a flake, not an error.
+const WRITE_TIMEOUT: Duration = Duration::from_millis(2000);
+
 fn harness() -> (tempfile::TempDir, PathBuf) {
-    // A client that stops reading is closed after this; the production
-    // default is 30s, which would make these fixtures glacial.
     // SAFETY: set before any other thread in this binary reads it.
-    unsafe { std::env::set_var("ANCHOR_WRITE_TIMEOUT_MS", "2000") };
+    unsafe {
+        std::env::set_var(
+            "ANCHOR_WRITE_TIMEOUT_MS",
+            WRITE_TIMEOUT.as_millis().to_string(),
+        )
+    };
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("anchor.sock");
     let paths = anchor::paths::Paths::new(dir.path().join("data"), socket.clone());
@@ -211,11 +223,11 @@ async fn a_client_that_stops_reading_never_stalls_the_session() {
     // Stay silent past the write bound. Reading even once here would let
     // the daemon's blocked write complete and reset the clock, which is
     // precisely what a real stalled client does not do.
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    tokio::time::sleep(2 * WRITE_TIMEOUT).await;
 
-    // The harness sets ANCHOR_WRITE_TIMEOUT_MS low, so this resolves in
-    // seconds rather than the 30s production default.
-    let deadline = Instant::now() + Duration::from_secs(25);
+    // Generous against a loaded machine: the bound itself is what is being
+    // tested, and overshooting it only costs time on a failure.
+    let deadline = Instant::now() + 12 * WRITE_TIMEOUT;
     loop {
         assert!(
             Instant::now() < deadline,

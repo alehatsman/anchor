@@ -11,7 +11,7 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anchor::log::LogLimits;
 use anchor::model::SpawnSpec;
@@ -145,7 +145,20 @@ async fn disconnect_between_chunks_and_reconnect_has_no_gap_or_duplicate() {
     // Disconnect *between* chunks, and let the session run on with nobody
     // attached -- the case ROADMAP.md says must survive.
     drop(first.subscription);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Wait for the condition the assertion below actually depends on --
+    // that output accumulated while nobody was attached -- rather than for
+    // a fixed span and a hope. A sleep here encodes a guess about how fast
+    // the writer is, and the guess is wrong first on a loaded machine,
+    // which is exactly when a flake is hardest to read.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while session.next_offset() <= end {
+        assert!(
+            Instant::now() < deadline,
+            "the session produced nothing while detached; it was supposed to run on"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     let second = session
         .attach(end)

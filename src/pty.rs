@@ -404,8 +404,19 @@ fn reader_thread_main(
     let mut buf = vec![0u8; READ_BUFFER_SIZE];
     loop {
         match reader.read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(n) => on_output(&buf[..n]),
+            // A signal delivered to this thread interrupts the read; it is
+            // not the end of anything. Treating it as EOF would retire the
+            // reader of a session that is still running, and the session
+            // would go silent for good -- still listed, still accepting
+            // input, never producing another byte. Retry.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // Every other error is terminal, including the `EIO` that a
+            // pty master returns once its child is gone. That one *is* the
+            // normal end of a session, which is why this arm is not an
+            // error path.
+            Err(_) => break,
         }
     }
     // Best-effort: if nothing is waiting on EOF anymore there is nothing to do.
@@ -616,5 +627,73 @@ impl Drop for OrphanGuard {
             Ok(()) => warn!(pid = ?self.pid, "killed a child whose session could not be started"),
             Err(e) => warn!(pid = ?self.pid, error = %e, "killing a half-spawned child failed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    use std::io::ErrorKind;
+    use std::sync::mpsc::sync_channel;
+
+    /// Returns each scripted result once, in order, then EOF.
+    struct Scripted(std::vec::IntoIter<IoResult<Vec<u8>>>);
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+            match self.0.next() {
+                None => Ok(0),
+                Some(Err(e)) => Err(e),
+                Some(Ok(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+            }
+        }
+    }
+
+    fn run(script: Vec<IoResult<Vec<u8>>>) -> Vec<u8> {
+        let (eof_tx, _eof_rx) = sync_channel(1);
+        let mut seen = Vec::new();
+        reader_thread_main(
+            Box::new(Scripted(script.into_iter())),
+            |bytes| seen.extend_from_slice(bytes),
+            &eof_tx,
+        );
+        seen
+    }
+
+    /// An interrupted read is not EOF.
+    ///
+    /// This used to `break` on any error at all. A signal delivered to the
+    /// reader thread would retire it while the session was still running,
+    /// and that session would go silent permanently -- still listed, still
+    /// accepting input, never emitting another byte. Nothing would report
+    /// it, because from every other angle the session is healthy.
+    #[test]
+    fn an_interrupted_read_is_retried_not_treated_as_the_end() {
+        let out = run(vec![
+            Ok(b"before".to_vec()),
+            Err(std::io::Error::from(ErrorKind::Interrupted)),
+            Ok(b"after".to_vec()),
+        ]);
+        assert_eq!(
+            out,
+            b"beforeafter",
+            "output after an interrupted read was lost"
+        );
+    }
+
+    /// The other half of the same decision: a real error still ends the
+    /// reader. A pty master returns `EIO` once its child is gone, and that
+    /// is the ordinary end of a session -- retrying it would spin forever.
+    #[test]
+    fn a_real_error_still_ends_the_reader() {
+        let out = run(vec![
+            Ok(b"before".to_vec()),
+            Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            Ok(b"never".to_vec()),
+        ]);
+        assert_eq!(out, b"before", "the reader read past a terminal error");
     }
 }

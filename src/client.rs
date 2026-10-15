@@ -12,6 +12,41 @@ use serde_json::{json, Value};
 
 use crate::proto::frame;
 
+/// The largest frame the daemon can legitimately send.
+///
+/// Live output is one pty chunk (64 KiB), but a catch-up frame carries a
+/// whole replay round, which is `LIVE_GAP_BYTES`. Deriving it from that
+/// constant rather than picking a round number means the cap moves with
+/// the thing it is a cap on, instead of silently becoming wrong when the
+/// gap is retuned.
+const MAX_FRAME_BYTES: u64 = crate::session::LIVE_GAP_BYTES;
+
+/// Reads one binary frame from `src`.
+///
+/// Shared by both readers on purpose: this existed twice, and the copy the
+/// `attach` path actually uses was the one that would have been missed.
+fn read_frame_from(src: &mut impl Read) -> Result<(u8, u64, Vec<u8>)> {
+    let mut header = [0u8; frame::HEADER_LEN];
+    src.read_exact(&mut header)
+        .context("reading a frame header")?;
+    let (tag, offset, len) = frame::decode_header(&header);
+    // The daemon is trusted, but the number is not: a desynchronised
+    // stream makes payload bytes look like a header, and a `u32` read out
+    // of ordinary terminal output is a 4 GiB allocation and an abort --
+    // a far worse way to learn the stream is out of step than an error
+    // saying exactly that.
+    if len as u64 > MAX_FRAME_BYTES {
+        bail!(
+            "the daemon sent a {len}-byte frame, past the {MAX_FRAME_BYTES}-byte maximum; \
+             the stream is out of step"
+        );
+    }
+    let mut payload = vec![0u8; len];
+    src.read_exact(&mut payload)
+        .context("reading a frame payload")?;
+    Ok((tag, offset, payload))
+}
+
 /// One connection to `anchord`.
 pub struct Client {
     reader: BufReader<UnixStream>,
@@ -78,16 +113,7 @@ impl Client {
 
     /// Reads one binary frame. Only valid after a successful `attach`.
     pub fn read_frame(&mut self) -> Result<(u8, u64, Vec<u8>)> {
-        let mut header = [0u8; frame::HEADER_LEN];
-        self.reader
-            .read_exact(&mut header)
-            .context("reading a frame header")?;
-        let (tag, offset, len) = frame::decode_header(&header);
-        let mut payload = vec![0u8; len];
-        self.reader
-            .read_exact(&mut payload)
-            .context("reading a frame payload")?;
-        Ok((tag, offset, payload))
+        read_frame_from(&mut self.reader)
     }
 
     /// Writes an input frame. Only valid after a successful `attach` that
@@ -158,16 +184,7 @@ impl FrameStream {
 
     /// Reads one binary frame.
     pub fn read_frame(&mut self) -> Result<(u8, u64, Vec<u8>)> {
-        let mut header = [0u8; frame::HEADER_LEN];
-        self.inner
-            .read_exact(&mut header)
-            .context("reading a frame header")?;
-        let (tag, offset, len) = frame::decode_header(&header);
-        let mut payload = vec![0u8; len];
-        self.inner
-            .read_exact(&mut payload)
-            .context("reading a frame payload")?;
-        Ok((tag, offset, payload))
+        read_frame_from(&mut self.inner)
     }
 
     /// A handle that ends this stream's blocking read from another thread.
@@ -242,6 +259,91 @@ mod tests {
         assert_eq!(
             bytes, payload,
             "a frame buffered with the response was lost"
+        );
+    }
+
+    /// A frame header claiming more than the daemon can produce is an
+    /// error, not an allocation.
+    ///
+    /// `len` is a `u32` read off the wire, so the worst case is a 4 GiB
+    /// request. The daemon is trusted, but this number is not reached by
+    /// trusting it -- a stream that has slipped out of step turns ordinary
+    /// terminal output into a header, and the client aborts on an
+    /// allocation instead of saying what went wrong. Both readers are
+    /// checked: this lived in two copies, and the one `attach` actually
+    /// uses was the easier to miss.
+    #[test]
+    fn a_frame_larger_than_the_daemon_can_send_is_refused() {
+        for split in [false, true] {
+            let (mine, theirs) = UnixStream::pair().expect("socket pair");
+            mine.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut client = Client::from_connected(mine);
+
+            let mut wire = Vec::new();
+            if split {
+                wire.extend_from_slice(b"{\"id\":1,\"ok\":true}\n");
+            }
+            // A header alone: the point is that nothing is allocated for
+            // the payload it promises, so the payload is never sent.
+            let mut header = frame::encode(frame::OUTPUT, 0, &[]);
+            let at = header.len() - 4;
+            header[at..].copy_from_slice(&u32::MAX.to_be_bytes());
+            wire.extend_from_slice(&header);
+            (&theirs).write_all(&wire).expect("write");
+            (&theirs).flush().expect("flush");
+
+            let err = if split {
+                client
+                    .call_raw("attach", serde_json::json!({}))
+                    .expect("attach");
+                let (mut frames, _writer) = client.into_attached().expect("split");
+                frames.read_frame().unwrap_err()
+            } else {
+                client.read_frame().unwrap_err()
+            };
+            assert!(
+                err.to_string().contains("out of step"),
+                "expected a desync complaint, got: {err}"
+            );
+        }
+    }
+
+    /// The other side of the cap: a frame at exactly the maximum is legal.
+    ///
+    /// A catch-up frame carries a whole replay round, so the largest
+    /// legitimate frame is much bigger than a live one. A cap set to the
+    /// live chunk size would look correct in every test that only attaches
+    /// to a quiet session, and break the moment a client reconnected far
+    /// enough behind to need a full round -- which is the case the offsets
+    /// exist for.
+    #[test]
+    fn a_frame_at_exactly_the_maximum_is_not_refused() {
+        let (mine, theirs) = UnixStream::pair().expect("socket pair");
+        mine.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut client = Client::from_connected(mine);
+
+        // Deliberately `LIVE_GAP_BYTES` and not `MAX_FRAME_BYTES`: a test
+        // written against the constant it is checking passes for any value
+        // of it, including a wrong one. This asserts against the thing the
+        // cap is a cap *on* -- the largest round the daemon will ever send
+        // -- so setting the cap below it fails here.
+        let largest = crate::session::LIVE_GAP_BYTES;
+        let mut header = frame::encode(frame::OUTPUT, 0, &[]);
+        let at = header.len() - 4;
+        header[at..].copy_from_slice(&(largest as u32).to_be_bytes());
+        (&theirs).write_all(&header).expect("write");
+        drop(theirs); // no payload follows: the read ends, it is not refused
+
+        let err = client.read_frame().unwrap_err().to_string();
+        assert!(
+            !err.contains("out of step"),
+            "the maximum legal frame was refused as a desync: {err}"
+        );
+        assert!(
+            err.contains("frame payload"),
+            "expected the truncated payload to be what failed, got: {err}"
         );
     }
 }
