@@ -11,8 +11,8 @@ use serde_json::Value;
 fn serve(dir: &tempfile::TempDir) -> std::path::PathBuf {
     let socket = dir.path().join("anchor.sock");
     let listener = anchor::server::bind(&socket).unwrap();
-    std::thread::spawn(move || {
-        let _ = anchor::server::serve(listener);
+    tokio::spawn(async move {
+        let _ = anchor::server::serve(listener).await;
     });
     socket
 }
@@ -41,8 +41,8 @@ impl Client {
     }
 }
 
-#[test]
-fn ping_round_trips() {
+#[tokio::test(flavor = "multi_thread")]
+async fn ping_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let socket = serve(&dir);
     let mut client = Client::connect(&socket);
@@ -53,8 +53,8 @@ fn ping_round_trips() {
     assert_eq!(reply["pong"], true);
 }
 
-#[test]
-fn the_connection_stays_open_across_requests() {
+#[tokio::test(flavor = "multi_thread")]
+async fn the_connection_stays_open_across_requests() {
     let dir = tempfile::tempdir().unwrap();
     let socket = serve(&dir);
     let mut client = Client::connect(&socket);
@@ -65,8 +65,8 @@ fn the_connection_stays_open_across_requests() {
     }
 }
 
-#[test]
-fn an_unknown_op_is_an_error_not_a_disconnect() {
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_op_is_an_error_not_a_disconnect() {
     let dir = tempfile::tempdir().unwrap();
     let socket = serve(&dir);
     let mut client = Client::connect(&socket);
@@ -80,8 +80,8 @@ fn an_unknown_op_is_an_error_not_a_disconnect() {
     assert_eq!(client.send_raw(r#"{"id":8,"op":"ping"}"#)["ok"], true);
 }
 
-#[test]
-fn a_malformed_line_keeps_its_id_when_it_has_one() {
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_line_keeps_its_id_when_it_has_one() {
     let dir = tempfile::tempdir().unwrap();
     let socket = serve(&dir);
     let mut client = Client::connect(&socket);
@@ -97,8 +97,8 @@ fn a_malformed_line_keeps_its_id_when_it_has_one() {
     assert_eq!(client.send_raw(r#"{"id":10,"op":"ping"}"#)["ok"], true);
 }
 
-#[test]
-fn many_clients_are_served_concurrently() {
+#[tokio::test(flavor = "multi_thread")]
+async fn many_clients_are_served_concurrently() {
     let dir = tempfile::tempdir().unwrap();
     let socket = serve(&dir);
 
@@ -118,8 +118,8 @@ fn many_clients_are_served_concurrently() {
     }
 }
 
-#[test]
-fn the_socket_is_private_to_this_user() {
+#[tokio::test(flavor = "multi_thread")]
+async fn the_socket_is_private_to_this_user() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let socket = serve(&dir);
@@ -127,16 +127,16 @@ fn the_socket_is_private_to_this_user() {
     assert_eq!(mode & 0o777, 0o600);
 }
 
-#[test]
-fn binding_refuses_to_displace_a_live_daemon() {
+#[tokio::test(flavor = "multi_thread")]
+async fn binding_refuses_to_displace_a_live_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let socket = serve(&dir);
     let err = anchor::server::bind(&socket).unwrap_err().to_string();
     assert!(err.contains("already running"), "unexpected error: {err}");
 }
 
-#[test]
-fn a_stale_socket_file_is_replaced() {
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_socket_file_is_replaced() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("anchor.sock");
 
@@ -147,8 +147,8 @@ fn a_stale_socket_file_is_replaced() {
     assert!(UnixStream::connect(&socket).is_err());
 
     let listener = anchor::server::bind(&socket).unwrap();
-    std::thread::spawn(move || {
-        let _ = anchor::server::serve(listener);
+    tokio::spawn(async move {
+        let _ = anchor::server::serve(listener).await;
     });
     let mut client = Client::connect(&socket);
     assert_eq!(client.send_raw(r#"{"id":1,"op":"ping"}"#)["ok"], true);

@@ -1,30 +1,35 @@
 //! The unix socket server.
 //!
-//! One thread per connection, newline-delimited JSON in and out. The socket
-//! is 0600: filesystem permissions are the security boundary, so there is no
+//! Newline-delimited JSON in and out, one task per connection. The socket is
+//! 0600: filesystem permissions are the security boundary, so there is no
 //! auth and no TCP.
+//!
+//! [`bind`] is deliberately synchronous and returns a `std` listener, so a
+//! caller can claim the socket — and fail loudly if another daemon already
+//! holds it — before any runtime exists. [`serve`] adopts it.
 
-use std::io::{BufRead, BufReader, Read as _, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
 
 use crate::proto::{self, ErrorCode, Request};
 
 /// Longest control line accepted. Beyond this the request is refused with
 /// `too_large` rather than buffered.
-const MAX_LINE_BYTES: usize = 1024 * 1024;
+const MAX_LINE_BYTES: u64 = 1024 * 1024;
 
-/// Bind the socket, refusing to displace a daemon that is already running.
+/// Binds the socket, refusing to displace a daemon that is already running.
 ///
-/// A socket file left behind by a dead daemon is stale: nothing accepts on it,
-/// so it is removed and rebound.
-pub fn bind(socket_path: &Path) -> Result<UnixListener> {
+/// A socket file left behind by a dead daemon is stale: nothing accepts on
+/// it, so it is removed and rebound.
+pub fn bind(socket_path: &Path) -> Result<StdUnixListener> {
     if socket_path.exists() {
-        if UnixStream::connect(socket_path).is_ok() {
+        if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
             bail!("anchord is already running on {}", socket_path.display());
         }
         tracing::warn!(socket = %socket_path.display(), "removing stale socket");
@@ -32,20 +37,28 @@ pub fn bind(socket_path: &Path) -> Result<UnixListener> {
             .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
     }
 
-    let listener = UnixListener::bind(socket_path)
+    let listener = StdUnixListener::bind(socket_path)
         .with_context(|| format!("binding {}", socket_path.display()))?;
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("setting 0600 on {}", socket_path.display()))?;
     Ok(listener)
 }
 
-/// Accept connections until the listener fails. One thread per client.
-pub fn serve(listener: UnixListener) -> Result<()> {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream) {
+/// Accepts connections until the listener fails. One task per client.
+///
+/// Takes the `std` listener from [`bind`] and adopts it onto the runtime this
+/// is polled on.
+pub async fn serve(listener: StdUnixListener) -> Result<()> {
+    listener
+        .set_nonblocking(true)
+        .context("setting the listener non-blocking")?;
+    let listener = UnixListener::from_std(listener).context("adopting the listener")?;
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(stream).await {
                         tracing::warn!(error = %e, "connection ended with an error");
                     }
                 });
@@ -53,44 +66,50 @@ pub fn serve(listener: UnixListener) -> Result<()> {
             Err(e) => tracing::warn!(error = %e, "accept failed"),
         }
     }
-    Ok(())
 }
 
-fn handle_connection(stream: UnixStream) -> Result<()> {
-    let mut out = stream.try_clone().context("cloning stream for writes")?;
-    let mut reader = BufReader::new(stream);
+async fn handle_connection(stream: UnixStream) -> Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
     let mut line = String::new();
 
     loop {
         line.clear();
-        let read = read_line_bounded(&mut reader, &mut line)?;
-        match read {
-            Read::Eof => return Ok(()),
-            Read::TooLarge => {
-                respond(
-                    &mut out,
-                    proto::error(0, ErrorCode::TooLarge, "request line too large"),
-                )?;
-                // The rest of that line is unread garbage; the client has to
-                // reconnect rather than desynchronise the framing.
-                return Ok(());
-            }
-            Read::Line => {}
-        }
+        // Bounded, so one client cannot make the daemon buffer without
+        // limit. `take` counts bytes, not lines, and is reset per request.
+        let read = (&mut reader)
+            .take(MAX_LINE_BYTES + 1)
+            .read_line(&mut line)
+            .await
+            .context("reading request")?;
 
+        if read == 0 {
+            return Ok(()); // EOF
+        }
+        if read as u64 > MAX_LINE_BYTES {
+            respond(
+                &mut write_half,
+                proto::error(0, ErrorCode::TooLarge, "request line too large"),
+            )
+            .await?;
+            // The rest of that line is unread; the client reconnects rather
+            // than desynchronising the framing.
+            return Ok(());
+        }
         if line.trim().is_empty() {
             continue;
         }
-        respond(&mut out, dispatch(&line))?;
+
+        respond(&mut write_half, dispatch(&line)).await?;
     }
 }
 
-/// Answer one control request. Never panics, never drops the connection.
+/// Answers one control request. Never panics, never drops the connection.
 fn dispatch(line: &str) -> Value {
     let request: Request = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
-            // Salvage the id if the line was an object with one, so the
+            // Salvage the id if the line was an object carrying one, so the
             // client can still correlate the failure.
             let id = serde_json::from_str::<Value>(line)
                 .ok()
@@ -110,43 +129,10 @@ fn dispatch(line: &str) -> Value {
     }
 }
 
-fn respond(out: &mut UnixStream, value: Value) -> Result<()> {
+async fn respond(out: &mut (impl AsyncWriteExt + Unpin), value: Value) -> Result<()> {
     let mut buf = serde_json::to_vec(&value)?;
     buf.push(b'\n');
-    out.write_all(&buf).context("writing response")?;
-    out.flush().context("flushing response")?;
+    out.write_all(&buf).await.context("writing response")?;
+    out.flush().await.context("flushing response")?;
     Ok(())
-}
-
-enum Read {
-    Line,
-    Eof,
-    TooLarge,
-}
-
-/// `BufRead::read_line` with a hard ceiling, so one client cannot make the
-/// daemon buffer without bound.
-fn read_line_bounded(reader: &mut impl BufRead, out: &mut String) -> Result<Read> {
-    let mut buf = Vec::new();
-    let n = reader
-        .by_ref()
-        .take(MAX_LINE_BYTES as u64 + 1)
-        .read_until(b'\n', &mut buf)
-        .context("reading request")?;
-    if n == 0 {
-        return Ok(Read::Eof);
-    }
-    if buf.len() > MAX_LINE_BYTES {
-        return Ok(Read::TooLarge);
-    }
-    match String::from_utf8(buf) {
-        Ok(s) => {
-            out.push_str(&s);
-            Ok(Read::Line)
-        }
-        Err(_) => {
-            out.push_str("<invalid utf-8>");
-            Ok(Read::Line)
-        }
-    }
 }

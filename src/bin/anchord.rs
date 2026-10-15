@@ -13,7 +13,8 @@ use tracing_subscriber::EnvFilter;
 use anchor::paths::Paths;
 use anchor::store::Store;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     init_tracing();
 
     let paths = Paths::resolve()?;
@@ -47,7 +48,7 @@ fn main() -> Result<()> {
 
     let listener = anchor::server::bind(paths.socket_path())?;
     tracing::info!(socket = %paths.socket_path().display(), "listening");
-    anchor::server::serve(listener)
+    anchor::server::serve(listener).await
 }
 
 /// Tracing from the first commit. `ANCHOR_LOG` overrides `RUST_LOG`.
