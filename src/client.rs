@@ -100,18 +100,148 @@ impl Client {
         Ok(())
     }
 
-    /// Wraps an already-connected socket — the reader thread's half of an
-    /// attached connection.
-    pub fn from_stream(stream: UnixStream) -> Result<Self> {
-        Ok(Self {
-            reader: BufReader::new(stream.try_clone().context("cloning the socket")?),
+    /// Wraps an already-connected socket.
+    pub fn from_connected(stream: UnixStream) -> Self {
+        let reader = BufReader::new(stream.try_clone().expect("cloning a connected socket"));
+        Self {
+            reader,
             writer: stream,
             next_id: 0,
-        })
+        }
     }
 
-    /// A second handle on the same socket, for a reader thread.
-    pub fn try_clone_stream(&self) -> Result<UnixStream> {
-        self.writer.try_clone().context("cloning the socket")
+    /// Splits an attached connection into its reading and writing halves.
+    ///
+    /// The frame stream carries whatever this client's reader has already
+    /// buffered past the attach response. A `BufReader` fills in chunks, so
+    /// the first binary frames routinely arrive in the same read as the
+    /// JSON line — building a fresh reader on the raw socket silently drops
+    /// them, and the stream resumes mid-frame.
+    pub fn into_attached(self) -> Result<(FrameStream, UnixStream)> {
+        let buffered = self.reader.buffer().to_vec();
+        let reading = self.reader.into_inner();
+        Ok((FrameStream::new(buffered, reading), self.writer))
+    }
+}
+
+/// The read half of an attached connection.
+///
+/// Owns any bytes the control reader had already buffered, so no frame is
+/// lost at the handover from request/response to streaming.
+pub struct FrameStream {
+    inner: Box<dyn BufRead + Send>,
+    /// Kept so the stream can be shut down from another thread, which is
+    /// what unblocks a read that would otherwise wait forever on an idle
+    /// session.
+    socket: UnixStream,
+}
+
+impl std::fmt::Debug for FrameStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FrameStream")
+    }
+}
+
+impl FrameStream {
+    fn new(buffered: Vec<u8>, socket: UnixStream) -> Self {
+        let replay = std::io::Cursor::new(buffered);
+        let reader = BufReader::new(
+            socket
+                .try_clone()
+                .unwrap_or_else(|_| socket.try_clone().expect("cloning the socket")),
+        );
+        Self {
+            inner: Box::new(replay.chain(reader)),
+            socket,
+        }
+    }
+
+    /// Reads one binary frame.
+    pub fn read_frame(&mut self) -> Result<(u8, u64, Vec<u8>)> {
+        let mut header = [0u8; frame::HEADER_LEN];
+        self.inner
+            .read_exact(&mut header)
+            .context("reading a frame header")?;
+        let (tag, offset, len) = frame::decode_header(&header);
+        let mut payload = vec![0u8; len];
+        self.inner
+            .read_exact(&mut payload)
+            .context("reading a frame payload")?;
+        Ok((tag, offset, payload))
+    }
+
+    /// A handle that ends this stream's blocking read from another thread.
+    pub fn interrupt_handle(&self) -> Result<Interrupt> {
+        Ok(Interrupt {
+            socket: self.socket.try_clone().context("cloning the socket")?,
+        })
+    }
+}
+
+/// Ends a [`FrameStream`]'s read, so a detaching client is not left waiting
+/// on a session that happens to be quiet.
+#[derive(Debug)]
+pub struct Interrupt {
+    socket: UnixStream,
+}
+
+impl Interrupt {
+    /// Shuts the socket down in both directions. The blocked read returns
+    /// immediately rather than waiting for output that may never come.
+    pub fn stop(&self) {
+        let _ = self.socket.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// The handover must not lose bytes that arrived with the response.
+    ///
+    /// A `BufReader` fills in chunks, so a daemon that writes the attach
+    /// response and the first frames in quick succession can land both in
+    /// one read. Rebuilding a reader on the raw socket silently discards
+    /// whatever was already buffered, and the stream resumes mid-frame.
+    ///
+    /// Written against a socket pair rather than a live daemon on purpose:
+    /// coalescing is a scheduling accident, so an end-to-end test passes
+    /// whether or not the bug is present. Here it is guaranteed — one
+    /// `write` of both parts.
+    #[test]
+    fn the_attach_handover_keeps_bytes_that_arrived_with_the_response() {
+        let (mine, theirs) = UnixStream::pair().expect("socket pair");
+        // Bounded, so losing the frame fails the assertion instead of
+        // blocking forever on bytes that were discarded.
+        mine.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut client = Client::from_connected(mine);
+
+        // One write: a response line immediately followed by a frame.
+        let payload = b"hello";
+        let mut wire = Vec::new();
+        wire.extend_from_slice(b"{\"id\":1,\"ok\":true}\n");
+        wire.extend_from_slice(&frame::encode(frame::OUTPUT, 0, payload));
+        (&theirs).write_all(&wire).expect("write");
+        (&theirs).flush().expect("flush");
+
+        let response = client
+            .call_raw("attach", serde_json::json!({}))
+            .expect("attach");
+        assert_eq!(response["ok"], serde_json::json!(true));
+
+        // The frame arrived in the same read as the line above, so it is
+        // sitting in the reader's buffer right now.
+        let (mut frames, _writer) = client.into_attached().expect("split");
+        let (tag, offset, bytes) = frames
+            .read_frame()
+            .expect("a frame buffered with the response was lost at the handover");
+        assert_eq!(tag, frame::OUTPUT);
+        assert_eq!(offset, 0);
+        assert_eq!(
+            bytes, payload,
+            "a frame buffered with the response was lost"
+        );
     }
 }

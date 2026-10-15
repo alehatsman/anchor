@@ -317,12 +317,20 @@ fn attach(
     // Raw mode restores itself on every exit path, including an error.
     let _raw = RawMode::enter()?;
 
+    // Split rather than re-wrap: the control reader may already hold the
+    // first binary frames, and a fresh reader on the socket would drop them
+    // and resume mid-frame.
+    let (frames, mut writer) = client.into_attached()?;
+    // Taken before the stream moves to its thread: after `~.` this is what
+    // ends its blocking read, which otherwise waits for output a quiet
+    // session may never produce.
+    let interrupt = frames.interrupt_handle()?;
+
     // The reader half runs on its own thread: stdin and the socket both
     // block, and neither may wait for the other.
-    let socket_reader = client.try_clone_stream()?;
     let output = std::thread::Builder::new()
         .name("anchor-output".into())
-        .spawn(move || pump_output(socket_reader))
+        .spawn(move || pump_output(frames))
         .context("spawning the output thread")?;
 
     if has_control {
@@ -335,7 +343,7 @@ fn attach(
                 Ok(n) => n,
             };
             let (forward, detach) = scanner.feed(&buf[..read]);
-            if !forward.is_empty() && client.write_input(&forward).is_err() {
+            if !forward.is_empty() && write_input(&mut writer, &forward).is_err() {
                 break;
             }
             if detach {
@@ -348,18 +356,30 @@ fn attach(
         return Ok(());
     }
 
-    // Dropping the socket ends the output thread's read.
-    drop(client);
+    // Shut the socket down explicitly. Dropping the writer leaves the
+    // reader's own cloned fd open, so a detach from a quiet session would
+    // block here until the session happened to produce output — which for
+    // an idle shell is never.
+    interrupt.stop();
+    drop(writer);
     let _ = output.join();
     Ok(())
 }
 
+/// Writes one input frame to the PTY.
+fn write_input(writer: &mut std::os::unix::net::UnixStream, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    writer
+        .write_all(&frame::encode(frame::INPUT, 0, bytes))
+        .context("sending input")?;
+    writer.flush().context("flushing input")
+}
+
 /// Writes output frames to stdout, unparsed, until the stream ends.
-fn pump_output(socket: std::os::unix::net::UnixStream) -> Result<()> {
-    let mut client = Client::from_stream(socket)?;
+fn pump_output(mut frames: anchor::client::FrameStream) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     loop {
-        let (tag, _offset, payload) = match client.read_frame() {
+        let (tag, _offset, payload) = match frames.read_frame() {
             Ok(frame) => frame,
             // The daemon went away or we detached; either way, done.
             Err(_) => return Ok(()),
