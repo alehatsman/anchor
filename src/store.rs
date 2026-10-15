@@ -11,6 +11,7 @@ use rusqlite::{Connection, OptionalExtension, Row};
 use crate::model::{lost_reason, Session, SessionId, SpawnSpec, State};
 use crate::paths::Paths;
 
+#[derive(Debug)]
 pub struct Store {
     conn: Connection,
 }
@@ -119,6 +120,28 @@ impl Store {
             })?
             .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
         Ok(labels)
+    }
+
+    /// Records a session's terminal state: the one write a live session
+    /// makes on its way out. Always `exited` — `lost` only ever comes from
+    /// restart recovery, on a row with no live session behind it.
+    pub fn mark_exited(&self, session: &Session) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions
+                SET state = ?2, exit_code = ?3, lost_reason = ?4, exited_at = ?5,
+                    output_bytes = ?6, log_capped_at = ?7
+              WHERE id = ?1",
+            rusqlite::params![
+                session.id,
+                State::Exited.as_str(),
+                session.exit_code,
+                session.lost_reason,
+                session.exited_at,
+                session.output_bytes as i64,
+                session.log_capped_at.map(|v| v as i64),
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn set_output_bytes(&self, id: &str, bytes: u64, capped_at: Option<u64>) -> Result<()> {
