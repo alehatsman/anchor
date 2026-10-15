@@ -14,6 +14,12 @@ struct Harness {
     socket: std::path::PathBuf,
 }
 
+impl Harness {
+    fn session_dir(&self, id: &str) -> std::path::PathBuf {
+        self._dir.path().join("data/sessions").join(id)
+    }
+}
+
 fn harness() -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("anchor.sock");
@@ -318,8 +324,12 @@ async fn errors_are_specific_and_never_drop_the_connection() {
     let missing_field = client.call("resize", json!({ "session": "x" }));
     assert_eq!(missing_field["error"]["code"], "invalid_spec");
 
+    // A huge `max` is clamped, so what comes back is the session error --
+    // not a complaint about the size. See
+    // `an_oversized_log_range_is_clamped_not_refused`: this used to answer
+    // `too_large` and that broke paging through a long log.
     let huge = client.call("log", json!({ "session": "x", "max": 999_999_999u64 }));
-    assert_eq!(huge["error"]["code"], "too_large");
+    assert_eq!(huge["error"]["code"], "not_found");
 
     // Still usable after all of that.
     assert_eq!(client.ok("ping", json!({}))["pong"], true);
@@ -447,4 +457,118 @@ async fn a_slow_terminate_does_not_stall_other_connections() {
     for t in terminators {
         t.join().expect("a terminate panicked");
     }
+}
+
+
+/// A failure that is the daemon's own must not be reported as a bad
+/// request.
+///
+/// `invalid_spec` is a statement about what the client sent: it means do
+/// not retry, the same bytes will fail the same way. Answering it when the
+/// log file could not be read sends whoever is debugging to stare at a
+/// request that was fine, and tells a client not to retry something that
+/// might well succeed a moment later. `internal` is the only code that
+/// says "not your fault".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_side_failure_is_internal_not_invalid_spec() {
+    let setup = harness();
+    let mut client = Client::connect(&setup.socket);
+    let id = create_echo(&mut client, "ready", json!({}));
+    wait_for_output(&mut client, &id, "ready");
+
+    // Make the log unreadable underneath a session that is otherwise
+    // perfectly healthy, so the request is unimpeachable and only the
+    // daemon's own storage is broken.
+    let log = setup.session_dir(&id).join("output.vt");
+    let mut perms = std::fs::metadata(&log).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+    std::fs::set_permissions(&log, perms).unwrap();
+
+    let reply = client.call("log", json!({ "session": &id, "from": 0, "max": 4096 }));
+    assert_eq!(reply["ok"], false, "the unreadable log was served: {reply}");
+    assert_eq!(
+        reply["error"]["code"], "internal",
+        "a storage failure was blamed on the request: {reply}"
+    );
+
+    // And the connection survives it, like every other error.
+    assert_eq!(client.call("ping", json!({}))["ok"], true);
+
+    let mut perms = std::fs::metadata(&log).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o600);
+    std::fs::set_permissions(&log, perms).unwrap();
+    client.call("terminate", json!({ "session": &id }));
+}
+
+/// The codes that *are* about the request keep saying so. Changing where
+/// `internal` applies must not quietly reclassify the ordinary refusals a
+/// client branches on.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_request_level_codes_are_unchanged() {
+    let setup = harness();
+    let mut client = Client::connect(&setup.socket);
+
+    let missing = client.call("get", json!({ "session": "01NOPE" }));
+    assert_eq!(missing["error"]["code"], "not_found");
+
+    let bad_size = client.call(
+        "create",
+        json!({ "spec": { "command": "/bin/sh", "args": [], "cwd": "/tmp",
+                          "cols": 0, "rows": 0 } }),
+    );
+    assert_eq!(bad_size["error"]["code"], "invalid_spec");
+
+    let bad_cmd = client.call(
+        "create",
+        json!({ "spec": { "command": "/nope/not/a/command", "args": [], "cwd": "/tmp" } }),
+    );
+    assert_eq!(bad_cmd["error"]["code"], "invalid_spec");
+
+    let bad_label = client.call(
+        "label",
+        json!({ "session": "01NOPE", "set": { "": "empty key" } }),
+    );
+    assert!(
+        ["invalid_label", "not_found"].contains(&bad_label["error"]["code"].as_str().unwrap()),
+        "unexpected: {bad_label}"
+    );
+}
+
+
+/// Asking for more than one response can carry is paging, not an error.
+///
+/// docs/04-protocol.md has always said a `log` response is "capped at
+/// 4 MiB whatever `max` asks for". Refusing the request instead made that
+/// false where it counts: a client walking a long log asks for the range
+/// it wants and pages through what comes back, so refusing the *first*
+/// call means the loop never runs and a log past 4 MiB cannot be read by
+/// range at all. Found from the client side by teleport, whose catch-up
+/// loop this silently disabled.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_log_range_is_clamped_not_refused() {
+    let setup = harness();
+    let mut client = Client::connect(&setup.socket);
+    let id = create_echo(&mut client, "ready", json!({}));
+    let seen = wait_for_output(&mut client, &id, "ready");
+
+    let reply = client.call(
+        "log",
+        json!({ "session": &id, "from": 0, "max": 64 * 1024 * 1024u64 }),
+    );
+    assert_eq!(
+        reply["ok"], true,
+        "a range wider than one response was refused: {reply}"
+    );
+    let bytes = reply["bytes"].as_array().expect("a byte array");
+    assert!(
+        !bytes.is_empty() && bytes.len() <= 4 * 1024 * 1024,
+        "expected a clamped range, got {} bytes",
+        bytes.len()
+    );
+    assert!(
+        bytes.len() >= seen.len(),
+        "the clamp lost output that was already there"
+    );
+
+    client.call("terminate", json!({ "session": &id }));
 }

@@ -367,22 +367,7 @@ fn op_create(id: u64, line: &str, state: &State) -> Value {
                 "output_offset": 0,
             }),
         ),
-        Err(e) => {
-            let code = match &e {
-                CreateError::InvalidLabel(_) => ErrorCode::InvalidLabel,
-                CreateError::InvalidCwd(_)
-                | CreateError::ExecutableNotFound(_)
-                | CreateError::InvalidSize { .. } => ErrorCode::InvalidSpec,
-                CreateError::NotFound => ErrorCode::NotFound,
-                CreateError::StillRunning => ErrorCode::AlreadyExited,
-                // A cap refusal and a failed spawn are both "it did not
-                // start"; the message says which.
-                CreateError::TooManySessions { .. }
-                | CreateError::Log(_)
-                | CreateError::Spawn(_) => ErrorCode::SpawnFailed,
-            };
-            proto::error(id, code, e.to_string())
-        }
+        Err(e) => proto::error(id, code_for(&e), e.to_string()),
     }
 }
 
@@ -407,7 +392,32 @@ fn op_list(id: u64, line: &str, state: &State) -> Value {
                 .collect();
             proto::ok(id, json!({ "sessions": sessions }))
         }
-        Err(e) => proto::error(id, ErrorCode::InvalidSpec, e.to_string()),
+        // The store failing to read is not a bad filter.
+        Err(e) => proto::error(id, ErrorCode::Internal, e.to_string()),
+    }
+}
+
+/// The code for a `CreateError`, in one place.
+///
+/// Shared with the label path deliberately. It used to have its own
+/// catch-all that answered `invalid_spec` for everything it did not name,
+/// so the same failure got one code from `create` and a wrong one from
+/// `label`. Matching exhaustively here means a new variant is a compile
+/// error rather than a silent reclassification.
+fn code_for(e: &CreateError) -> ErrorCode {
+    match e {
+        CreateError::InvalidLabel(_) => ErrorCode::InvalidLabel,
+        CreateError::InvalidCwd(_)
+        | CreateError::ExecutableNotFound(_)
+        | CreateError::InvalidSize { .. } => ErrorCode::InvalidSpec,
+        CreateError::NotFound => ErrorCode::NotFound,
+        CreateError::StillRunning => ErrorCode::AlreadyExited,
+        // A cap refusal and a failed spawn are both "it did not start";
+        // the message says which.
+        CreateError::TooManySessions { .. } | CreateError::Spawn(_) => ErrorCode::SpawnFailed,
+        // Opening the log is the daemon's own storage failing, not
+        // anything about the request.
+        CreateError::Log(_) => ErrorCode::Internal,
     }
 }
 
@@ -449,10 +459,7 @@ fn op_label(id: u64, line: &str, state: &State) -> Value {
         // No live PTY behind it. The row may still exist, and a client's own
         // state outlives the process it described.
         Err(CreateError::NotFound) => label_stored(id, &req, state),
-        Err(e @ CreateError::InvalidLabel(_)) => {
-            proto::error(id, ErrorCode::InvalidLabel, e.to_string())
-        }
-        Err(e) => proto::error(id, ErrorCode::InvalidSpec, e.to_string()),
+        Err(e) => proto::error(id, code_for(&e), e.to_string()),
     }
 }
 
@@ -471,7 +478,9 @@ fn label_stored(id: u64, req: &LabelReq, state: &State) -> Value {
     }
     match store.replace_labels(&req.session, &labels) {
         Ok(()) => proto::ok(id, json!({ "labels": labels })),
-        Err(e) => proto::error(id, ErrorCode::InvalidSpec, e.to_string()),
+        // The labels were already validated above; a failure here is the
+        // store's.
+        Err(e) => proto::error(id, ErrorCode::Internal, e.to_string()),
     }
 }
 
@@ -543,7 +552,10 @@ async fn op_terminate(id: u64, line: &str, state: &State) -> Value {
             }),
         ),
         Ok(Err(e)) => proto::error(id, ErrorCode::AlreadyExited, e.to_string()),
-        Err(e) => proto::error(id, ErrorCode::AlreadyExited, format!("terminate: {e}")),
+        // The blocking task itself failed or panicked. The session's state
+        // is unknown, and `already_exited` would be a claim that it is
+        // gone -- the one thing this cannot know.
+        Err(e) => proto::error(id, ErrorCode::Internal, format!("terminate: {e}")),
     }
 }
 
@@ -570,13 +582,15 @@ fn op_log(id: u64, line: &str, state: &State) -> Value {
         Ok(r) => r,
         Err(e) => return e,
     };
-    if req.max > LOG_MAX_BYTES {
-        return proto::error(
-            id,
-            ErrorCode::TooLarge,
-            format!("max must be at most {LOG_MAX_BYTES} bytes"),
-        );
-    }
+    // Clamped, not refused. docs/04-protocol.md has always said one
+    // response is "capped at 4 MiB whatever `max` asks for", and refusing
+    // instead made that sentence false in the way that matters: a client
+    // walking a long log asks for the range it wants and pages through
+    // what it gets back. Refusing the first call means the loop never runs
+    // at all, so a log longer than 4 MiB could not be read by range --
+    // only by attaching. Asking for more than can be served is not an
+    // error, it is the normal shape of paging.
+    let max = req.max.min(LOG_MAX_BYTES);
 
     // Reads the file, not the live session: a log outlives its PTY, so an
     // exited or lost session still replays.
@@ -590,9 +604,20 @@ fn op_log(id: u64, line: &str, state: &State) -> Value {
         .join(crate::log::LOG_FILE_NAME);
     let mut reader = match crate::log::LogReader::open(&path) {
         Ok(reader) => reader,
-        Err(e) => return proto::error(id, ErrorCode::NotFound, format!("opening the log: {e}")),
+        // Only a missing file is `not_found`. A log that exists and cannot
+        // be opened -- permissions, a bad disk -- is the daemon's problem,
+        // and answering `not_found` for it claims the session's output is
+        // gone when it is sitting right there.
+        Err(e) => {
+            let code = if e.kind() == std::io::ErrorKind::NotFound {
+                ErrorCode::NotFound
+            } else {
+                ErrorCode::Internal
+            };
+            return proto::error(id, code, format!("opening the log: {e}"));
+        }
     };
-    match reader.read_range(req.from, req.from.saturating_add(req.max)) {
+    match reader.read_range(req.from, req.from.saturating_add(max)) {
         Ok(bytes) => {
             let len = bytes.len() as u64;
             proto::ok(
@@ -610,7 +635,8 @@ fn op_log(id: u64, line: &str, state: &State) -> Value {
                 }),
             )
         }
-        Err(e) => proto::error(id, ErrorCode::InvalidSpec, format!("reading the log: {e}")),
+        // The range was checked; this is the log file itself failing.
+        Err(e) => proto::error(id, ErrorCode::Internal, format!("reading the log: {e}")),
     }
 }
 
@@ -634,8 +660,8 @@ async fn op_purge(id: u64, line: &str, state: &State) -> Value {
         Ok(Err(e @ CreateError::StillRunning)) => {
             proto::error(id, ErrorCode::AlreadyExited, e.to_string())
         }
-        Ok(Err(e)) => proto::error(id, ErrorCode::InvalidSpec, e.to_string()),
-        Err(e) => proto::error(id, ErrorCode::InvalidSpec, format!("purge: {e}")),
+        Ok(Err(e)) => proto::error(id, code_for(&e), e.to_string()),
+        Err(e) => proto::error(id, ErrorCode::Internal, format!("purge: {e}")),
     }
 }
 

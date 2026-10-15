@@ -82,6 +82,10 @@ pub enum ErrorCode {
     UnknownOp,
     /// A line that is not a valid request object at all.
     BadRequest,
+    /// The daemon failed, not the request. See docs/04-protocol.md: this
+    /// is the one code that does not tell the client something about what
+    /// it sent, and the one where retrying makes sense.
+    Internal,
 }
 
 impl ErrorCode {
@@ -94,6 +98,7 @@ impl ErrorCode {
             ErrorCode::AlreadyExited => "already_exited",
             ErrorCode::LeaseHeld => "lease_held",
             ErrorCode::TooLarge => "too_large",
+            ErrorCode::Internal => "internal",
             ErrorCode::UnknownOp => "unknown_op",
             ErrorCode::BadRequest => "bad_request",
         }

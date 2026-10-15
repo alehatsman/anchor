@@ -59,8 +59,28 @@ at a chunk boundary — and a lossy conversion would corrupt the stream. One
 `log` response is capped at 4 MiB whatever `max` asks for; streaming is what
 `attach` is for.
 
+**Capped means clamped, not refused.** A larger `max` is served as 4 MiB,
+and the client pages on from where the bytes ran out. Refusing it would
+break the loop that reads a long log by range — the first call fails, so
+no call ever succeeds, and a log past 4 MiB becomes readable only by
+attaching. Asking for more than one response can carry is the normal shape
+of paging, not a malformed request.
+
 Error codes: `not_found`, `invalid_spec`, `invalid_label`, `spawn_failed`,
-`already_exited`, `lease_held`, `too_large`, `unknown_op`, `bad_request`.
+`already_exited`, `lease_held`, `too_large`, `unknown_op`, `bad_request`,
+`internal`.
+
+**`internal` is the daemon's fault, and that distinction is the point of
+having it.** Every other code says something about the request: it names a
+session that does not exist, it asks for a size out of range, it arrives
+while someone else holds the lease. A client reading one of those knows not
+to retry, because sending the same bytes again will fail the same way.
+`internal` means the request was fine and the daemon could not serve it —
+the database would not read, the log file would not open — so retrying is
+reasonable and reporting it to the user as a malformed request is not.
+
+Reporting a disk failure as `invalid_spec` is worse than reporting nothing
+at all: it sends whoever is debugging it to look at the request.
 
 An unknown `op` returns an error; it never drops the connection.
 
