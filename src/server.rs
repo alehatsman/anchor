@@ -139,7 +139,16 @@ pub async fn serve(listener: StdUnixListener, state: State) -> Result<()> {
                     }
                 });
             }
-            Err(e) => tracing::warn!(error = %e, "accept failed"),
+            // Pause before trying again. An accept error is usually
+            // transient, but the ones that are not -- `EMFILE` above all,
+            // where the process is out of descriptors -- fail instantly
+            // and repeat forever. Looping straight back pins a core and
+            // writes a log line per iteration, so the daemon's response to
+            // running out of fds was to burn the CPU and fill the disk.
+            Err(e) => {
+                tracing::warn!(error = %e, "accept failed");
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+            }
         }
     }
 }
@@ -605,6 +614,11 @@ struct LogReq {
 fn default_log_max() -> u64 {
     64 * 1024
 }
+
+/// How long to wait after a failed `accept` before trying again. Long
+/// enough that a permanent failure cannot spin, short enough that a
+/// transient one costs nothing noticeable.
+const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// How long `terminate` waits for the exit it already caused to be
 /// recorded. Not a wait for the child -- that has been reaped by this

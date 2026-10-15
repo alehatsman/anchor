@@ -641,3 +641,54 @@ async fn an_input_frame_larger_than_a_chunk_ends_the_connection() {
 
     setup.call("terminate", json!({ "session": &id }));
 }
+
+/// A resize frame is clamped like a resize op.
+///
+/// The control op range-checks and refuses; the frame path does not go
+/// through it at all. The pty clamps the ioctl as a backstop, but
+/// `runtime` and the store were written from the *request* -- so an
+/// attached client could leave a row claiming a width the pty had
+/// refused, and a restart would restore the session to a size it never
+/// had.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resize_frame_is_clamped_like_the_control_op() {
+    let (_dir, socket) = harness();
+    let mut setup = Conn::connect(&socket);
+    let id = create_shell(&mut setup);
+
+    let mut controller = Conn::connect(&socket);
+    controller.call(
+        "attach",
+        json!({ "session": &id, "from": 0, "control": true }),
+    );
+    assert_eq!(controller.frame().2, vec![1]);
+    controller.read_until("ready");
+
+    // Far past the 1..=1000 the control op enforces.
+    controller
+        .writer
+        .write_all(&frame::encode(
+            frame::RESIZE,
+            0,
+            &frame::encode_size(60000, 60000),
+        ))
+        .unwrap();
+    controller.writer.flush().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = setup.call("get", json!({ "session": &id }))["session"].clone();
+        if got["cols"] == 1000 && got["rows"] == 1000 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stored size never settled at the clamp; it is {}x{}",
+            got["cols"],
+            got["rows"]
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    setup.call("terminate", json!({ "session": &id }));
+}

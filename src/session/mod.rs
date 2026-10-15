@@ -224,6 +224,16 @@ impl Session {
     /// so the last size asked for always wins — dropping it would leave the
     /// terminal at the wrong width after a drag ends.
     pub fn resize(self: &Arc<Self>, cols: u16, rows: u16) -> Result<()> {
+        // Clamped at the door, so what is recorded is what the terminal
+        // actually has. The pty clamps too, as a backstop -- but it clamps
+        // only the ioctl, while `runtime` and the store were written from
+        // the unclamped request. A resize frame on an attached connection
+        // skips the control op's range check entirely, so an attached
+        // client could leave the row claiming a width the pty refused, and
+        // a restart would restore a session to a size it never had.
+        let cols = cols.clamp(*manager::SIZE_RANGE.start(), *manager::SIZE_RANGE.end());
+        let rows = rows.clamp(*manager::SIZE_RANGE.start(), *manager::SIZE_RANGE.end());
+
         let schedule_in = {
             let mut resize = self.resize.lock();
             let elapsed = resize.last_applied.elapsed();

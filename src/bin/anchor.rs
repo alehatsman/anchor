@@ -255,8 +255,14 @@ fn create(
         // about to attach to.
         None => tty::window_size().unwrap_or((80, 24)),
     };
+    // Resolved here, against *this* process's directory, before it goes
+    // on the wire. The daemon's working directory is wherever it was
+    // started -- `/` under launchd -- so a relative `--cwd` sent as typed
+    // lands somewhere the user never named, and the session starts in a
+    // directory nobody chose. The spec carries an absolute path or none.
     let cwd = match cwd {
-        Some(cwd) => cwd,
+        Some(cwd) => std::path::absolute(&cwd)
+            .with_context(|| format!("resolving --cwd {}", cwd.display()))?,
         None => std::env::current_dir().context("resolving the current directory")?,
     };
 

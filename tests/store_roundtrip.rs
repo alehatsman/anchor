@@ -162,3 +162,57 @@ fn a_missing_log_file_caps_at_zero_without_losing_the_offset() {
     assert_eq!(after.output_bytes, 42);
     assert_eq!(after.log_capped_at, Some(0));
 }
+
+/// The recorded offset can only go forward.
+///
+/// `set_output_bytes` is written from the reader thread on a throttle, so
+/// one can be overtaken by the final count `mark_exited` writes. The
+/// offset is a promise to every client holding one: rewinding it, even
+/// briefly, tells a client that bytes it has already read do not exist.
+#[test]
+fn a_stale_output_count_can_never_rewind_the_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&paths(&dir)).unwrap();
+    let session = sample_session();
+    store.insert(&session).unwrap();
+
+    store.set_output_bytes(&session.id, 5_000, None).unwrap();
+    // A throttled write from before that one, arriving late.
+    store.set_output_bytes(&session.id, 1_200, None).unwrap();
+
+    let row = store.get(&session.id).unwrap().unwrap();
+    assert_eq!(
+        row.output_bytes, 5_000,
+        "a late write rewound the offset below what clients already hold"
+    );
+
+    // Forward still works, or the guard would have frozen the count.
+    store.set_output_bytes(&session.id, 9_000, None).unwrap();
+    assert_eq!(store.get(&session.id).unwrap().unwrap().output_bytes, 9_000);
+}
+
+/// A session that has ended does not acquire a new geometry.
+///
+/// Size is persisted off the thread that applied it, so a resize in
+/// flight can land after the session exited. A dead session with a fresh
+/// width is a row describing something that never happened.
+#[test]
+fn a_resize_in_flight_does_not_land_on_an_exited_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&paths(&dir)).unwrap();
+    let mut session = sample_session();
+    store.insert(&session).unwrap();
+
+    store.set_size(&session.id, 120, 40).unwrap();
+    session.state = anchor::model::State::Exited;
+    session.exit_code = Some(0);
+    store.mark_exited(&session).unwrap();
+
+    store.set_size(&session.id, 999, 999).unwrap();
+    let row = store.get(&session.id).unwrap().unwrap();
+    assert_eq!(
+        (row.cols, row.rows),
+        (120, 40),
+        "an exited session was resized after the fact"
+    );
+}

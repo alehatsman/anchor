@@ -471,3 +471,49 @@ fn open_pty() -> (i32, i32) {
     assert_eq!(rc, 0, "openpty failed");
     (master, slave)
 }
+
+/// A relative `--cwd` is resolved against the client's directory, not the
+/// daemon's.
+///
+/// The spec goes over the wire and the daemon spawns from it, so a
+/// relative path sent as typed is resolved wherever anchord happens to be
+/// running -- `/` under launchd. The session then starts in a directory
+/// nobody named, and nothing reports it: the row says `.`, which looks
+/// right from either end.
+#[test]
+fn a_relative_cwd_is_resolved_before_it_is_sent() {
+    let daemon = Daemon::start("relative-cwd");
+    let mut client = daemon.client();
+
+    let status = Command::new(bin("anchor"))
+        .args([
+            "--socket",
+            daemon.socket().to_str().unwrap(),
+            "create",
+            "--cwd",
+            ".",
+            "--",
+            "/bin/sh",
+            "-c",
+            "exit 0",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("running anchor create");
+    assert!(status.success(), "create failed: {status:?}");
+
+    let listed = client.call("list", json!({})).expect("list");
+    let cwd = listed["sessions"][0]["cwd"]
+        .as_str()
+        .expect("a cwd on the row");
+    assert!(
+        std::path::Path::new(cwd).is_absolute(),
+        "the daemon was handed a relative cwd to resolve: {cwd:?}"
+    );
+    assert_eq!(
+        cwd,
+        std::env::current_dir().unwrap().to_str().unwrap(),
+        "`.` did not resolve to the client's own directory"
+    );
+}

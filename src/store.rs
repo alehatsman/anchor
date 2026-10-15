@@ -236,9 +236,12 @@ impl Store {
     /// after a restart, implying it ran and vanished, which it never did.
     pub fn mark_spawn_failed(&self, id: &str, exited_at: i64) -> Result<()> {
         self.conn.execute(
+            // Guarded on a live row: if something already recorded how this
+            // session ended, that is the truth and `spawn_failed` would
+            // overwrite it with a worse one.
             "UPDATE sessions
                 SET state = ?2, lost_reason = ?3, exited_at = ?4
-              WHERE id = ?1",
+              WHERE id = ?1 AND state NOT IN ('exited', 'lost')",
             rusqlite::params![
                 id,
                 State::Exited.as_str(),
@@ -250,17 +253,30 @@ impl Store {
     }
 
     /// Records the size actually applied to a session's PTY.
+    ///
+    /// Guarded on a live row. Size is persisted off the thread that applied
+    /// it, so a resize in flight can land after the session has exited, and
+    /// a dead session acquiring a new geometry is a row that describes
+    /// something that never happened.
     pub fn set_size(&self, id: &str, cols: u16, rows: u16) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET cols = ?2, rows = ?3 WHERE id = ?1",
+            "UPDATE sessions SET cols = ?2, rows = ?3
+              WHERE id = ?1 AND state NOT IN ('exited', 'lost')",
             rusqlite::params![id, cols, rows],
         )?;
         Ok(())
     }
 
+    /// Guarded so the count can only go forward.
+    ///
+    /// These are written from the reader thread on a throttle, so one can
+    /// be overtaken by the final count `mark_exited` writes. The offset is
+    /// a promise to every client holding one: rewinding it, even for an
+    /// instant, says bytes they have already read do not exist.
     pub fn set_output_bytes(&self, id: &str, bytes: u64, capped_at: Option<u64>) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET output_bytes = ?2, log_capped_at = ?3 WHERE id = ?1",
+            "UPDATE sessions SET output_bytes = ?2, log_capped_at = ?3
+              WHERE id = ?1 AND output_bytes <= ?2",
             rusqlite::params![id, bytes as i64, capped_at.map(|v| v as i64)],
         )?;
         Ok(())

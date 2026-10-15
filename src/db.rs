@@ -93,7 +93,13 @@ fn migrate(conn: &Connection) -> Result<()> {
         {
             Ok(()) => conn.execute_batch("COMMIT;")?,
             Err(e) => {
-                conn.execute_batch("ROLLBACK;")?;
+                // The rollback's own failure is logged, never returned:
+                // `?` here would replace the error that explains what went
+                // wrong with one about the cleanup afterwards, and the
+                // cause of a failed migration is the thing worth keeping.
+                if let Err(rollback) = conn.execute_batch("ROLLBACK;") {
+                    tracing::error!(version, error = %rollback, "rolling back a failed migration");
+                }
                 return Err(anyhow::Error::from(e))
                     .with_context(|| format!("applying migration v{version}"));
             }
