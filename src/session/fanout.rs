@@ -1,5 +1,5 @@
 //! The `{output log, subscribers}` pair and the live-subscriber handle over
-//! it -- docs/03-pty.md#reader-loop's "steps 2-4 happen under one
+//! it -- docs/03-pty.md#reader-loop-ordering--not-negotiable's "steps 2-4 happen under one
 //! short mutex that also guards subscriber registration". See the parent
 //! module doc (`session/mod.rs`) for the design this implements; `replay.rs`
 //! is the other half of the story (catch-up reads off this same mutex).
@@ -77,7 +77,7 @@ pub(super) struct SubscriberSlot {
 }
 
 /// The `{output log, subscribers}` pair, guarded by one short-held mutex
-/// (docs/03-pty.md#reader-loop: "steps 2-4 happen under one short
+/// (docs/03-pty.md#reader-loop-ordering--not-negotiable: "steps 2-4 happen under one short
 /// mutex that also guards subscriber registration"). The log carries
 /// `next_offset`, so appending to the file and advancing the offset cannot
 /// drift apart, and neither can drift from subscriber registration.
@@ -322,7 +322,7 @@ mod tests {
 
     /// The ordering rule, checked from the outside: by the time a chunk is
     /// visible to a subscriber, its bytes are already readable at the offset
-    /// it was tagged with (docs/03-pty.md#reader-loop). Needs private
+    /// it was tagged with (docs/03-pty.md#reader-loop-ordering--not-negotiable). Needs private
     /// `Fanout`, so it lives here.
     #[tokio::test]
     async fn a_published_offset_is_already_on_disk() {

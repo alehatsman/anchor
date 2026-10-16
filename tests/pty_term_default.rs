@@ -1,6 +1,6 @@
 //! Regression test for the TERM/COLORTERM default `pty::spawn` fills in when
 //! the daemon's own environment has no TERM to inherit
-//! (docs/03-pty.md#spawn). A background service (launchd/systemd) has
+//! (docs/03-pty.md#spawn-details-that-bite). A background service (launchd/systemd) has
 //! no controlling terminal and so no TERM at all -- without a default, the
 //! child is treated as a "dumb" terminal by color-detection libraries and
 //! silently renders in monochrome. Same PTY bytes to every client, so every

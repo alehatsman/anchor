@@ -30,7 +30,7 @@ fn temp_dir() -> PathBuf {
 }
 
 /// A throwaway `<data_dir>/sessions` root. Each session writes its
-/// `output.vt` under here (docs/02-model.md#layout); these tests only
+/// `output.vt` under here (docs/02-model.md#storage); these tests only
 /// care that the log exists somewhere private to them.
 fn sessions_root(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -74,7 +74,7 @@ async fn zero_subscribers_session_survives() {
     session.terminate().expect("terminate with no subscriber");
 }
 
-/// S3 one layer up (docs/03-pty.md#the-terminalsession-trait): a
+/// S3 one layer up (docs/03-pty.md#termination): a
 /// `Session` must not serialize `write`/`resize`/`terminate` behind one lock.
 /// A child that never reads its pty eventually blocks the pty writer thread;
 /// `terminate()` must still return within its bounded policy (~7s) instead of
@@ -181,7 +181,7 @@ async fn terminate_leaves_the_session_listed_until_purged() {
     // `terminate()` returning only guarantees the state left `running`; the
     // final `-> exited` transition is made by the exit listener thread
     // reacting to the same `wait()` result, asynchronously
-    // (docs/03-pty.md#state-machine), so give it a moment.
+    // (docs/03-pty.md#termination), so give it a moment.
     let deadline = Instant::now() + DEFAULT_TIMEOUT;
     loop {
         if session.state() == anchor::model::State::Exited {

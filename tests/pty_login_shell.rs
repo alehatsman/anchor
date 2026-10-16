@@ -1,18 +1,19 @@
 //! Regression test for `SpawnSpec::login_shell` -- the flag that runs a
-//! preset's command through the user's login shell instead of exec'ing it
-//! directly (docs/03-pty.md#spawn). anchord's premise is running as
-//! a background service, and launchd/systemd hand it none of the environment
-//! a login shell builds: `PATH` beyond the system default, `EDITOR`, `LANG`,
-//! language-manager shims. The `shell` preset never felt this (`$SHELL -l`
-//! rebuilds its own environment on the way in); `claude`/`codex` exec a
-//! named binary with no shell in between and got only what the service
-//! manager handed the daemon.
+//! session's command through the user's login shell instead of exec'ing it
+//! directly (docs/03-pty.md#spawn-details-that-bite). anchord's premise is
+//! running as a background service, and launchd/systemd hand it none of the
+//! environment a login shell builds: `PATH` beyond the system default,
+//! `EDITOR`, `LANG`, language-manager shims. A session that spawns `$SHELL`
+//! itself never feels this (`$SHELL -l` rebuilds its own environment on the
+//! way in); one that execs a named binary like `claude` or `codex` with no
+//! shell in between gets only what the service manager handed the daemon.
 //!
-//! Two things are asserted, and the second is the one that matters for
-//! docs/06-security.md: the wrapper passes the program and its arguments as
-//! *separate argv entries* bound to `$0`/`"$@"`, never as a concatenated
-//! shell string. An argument containing a space must not split, and one
-//! containing a glob must not expand.
+//! Two things are asserted, and the second is the one that matters for the
+//! invariant in docs/03-pty.md#spawn-details-that-bite -- no request data is
+//! ever interpolated into shell source: the wrapper passes the program and
+//! its arguments as *separate argv entries* bound to `$0`/`"$@"`, never as
+//! a concatenated shell string. An argument containing a space must not
+//! split, and one containing a glob must not expand.
 //!
 //! All cases live in one #[test] fn, run strictly sequentially, because they
 //! mutate the process-wide `SHELL` var -- cargo runs the #[test] fns *within*

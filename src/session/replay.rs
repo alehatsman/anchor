@@ -74,7 +74,7 @@ pub struct Replay {
     /// Where replay actually starts -- `ready.replay_from`. The requested
     /// offset, except for a client attaching past a cap: there it is
     /// `next_offset` and nothing is replayed
-    /// (docs/02-model.md#size-cap).
+    /// (docs/02-model.md#the-size-cap).
     pub replay_from: u64,
     /// The boundary captured when the client attached -- `ready.next_offset`.
     /// **Not** necessarily the offset the subscriber is finally registered
@@ -250,7 +250,7 @@ impl Replay {
             // Nothing left, or everything left is behind a cap. Either way the
             // stream resumes at the boundary rather than at a file position
             // that no longer means what the client thinks
-            // (docs/02-model.md#size-cap).
+            // (docs/02-model.md#the-size-cap).
             replay_from = next_offset;
         } else if end - replay_from > LIVE_GAP_BYTES {
             // Stalled: this client cannot be caught up. Serve it the freshest

@@ -1,10 +1,11 @@
 //! `log.rs` on its own: append accounting, the size cap, clamped range
 //! reads, and restart recovery.
 //!
-//! The subset of docs/10-testing.md#2-sessionoffset-unit-tests that needs no
-//! PTY -- deliberately not `cfg(unix)`-gated, so the offset model is checked
-//! on every platform in the CI matrix even while the fixtures that spawn
-//! `/bin/sh` (`session_replay.rs`) are Unix-only.
+//! The part of the offset model that needs no PTY -- deliberately not
+//! `cfg(unix)`-gated, so it stays checkable on any platform anchord is ever
+//! built for, while the fixtures that spawn `/bin/sh` (`session_replay.rs`)
+//! are Unix-only. There is no CI matrix today; this is a property of the
+//! file, not a claim that something runs it elsewhere.
 
 use std::path::PathBuf;
 
@@ -32,7 +33,7 @@ fn limits(max_bytes: u64, warn_bytes: u64) -> LogLimits {
 }
 
 /// `file_length == min(next_offset, log_capped_at)`, the identity that is the
-/// entire replay index (docs/02-model.md#output-log). Asserted after
+/// entire replay index (docs/02-model.md#storage). Asserted after
 /// every operation, not just at the end.
 fn assert_invariant(log: &OutputLog, dir: &std::path::Path) {
     let on_disk = std::fs::metadata(dir.join(LOG_FILE_NAME))
@@ -98,7 +99,7 @@ fn append_offsets_and_range_reads_agree() {
 
 /// The cap: the file stops growing at `log_max_bytes`, `log_capped_at` is set
 /// to exactly that offset, and `next_offset` keeps advancing so live
-/// streaming can continue (docs/02-model.md#size-cap).
+/// streaming can continue (docs/02-model.md#the-size-cap).
 #[test]
 fn hitting_the_cap_stops_the_file_but_not_the_offset() {
     let dir = scratch("cap");
@@ -159,7 +160,7 @@ fn hitting_the_cap_stops_the_file_but_not_the_offset() {
 /// The M3 gate's restart clause. A capped log's file stopped growing while
 /// the column kept counting; taking the file length unconditionally on
 /// recovery would rewind `next_offset` below offsets live clients already
-/// hold (docs/02-model.md#restart-recovery).
+/// hold (docs/02-model.md#startup-sequence).
 #[test]
 fn reopening_a_capped_log_does_not_rewind_next_offset() {
     let dir = scratch("no-rewind");

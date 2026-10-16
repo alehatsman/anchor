@@ -1,11 +1,13 @@
-//! PTY integration fixtures -- docs/10-testing.md#1-pty-integration-fixtures-daemontestspty_rs.
+//! PTY integration fixtures. The rules they defend live in docs/03-pty.md;
+//! the rules about *how* to write them live in docs/08-testing.md.
 //!
-//! Unix-focused: this is what could actually be run and verified in this
-//! environment. Windows needs the same fixtures re-run on real hardware
-//! (docs/10-testing.md#platform-matrix); the two exit-code fixtures are
-//! expected to fail there until
-//! [W1](../../docs/15-open-questions.md#w1--conpty-children-are-never-observed-as-exited-on-windows)
-//! resolves -- not attempted here, tracked instead.
+//! Unix-only, and that is a scope decision rather than a gap in coverage:
+//! anchord is Unix-only as of 2026-10-16 (docs/09-windows.md). Should that
+//! reopen, these fixtures are the ones that get a Windows twin -- teleport's
+//! `pty_primitive_windows.rs` already ran against real Windows 11, and its
+//! `#W1` (a gracefully-exiting ConPTY child never observed as exited) was
+//! resolved on 2026-09-05 in teleport#9, so no exit-code fixture here is
+//! blocked on anything upstream.
 
 #![cfg(unix)]
 
@@ -133,10 +135,10 @@ fn large_write_arrives_intact_and_in_order() {
     // cooked-mode termios treats as control characters (0x04 = EOF, 0x03 =
     // SIGINT, ...), not literal data -- that's line-discipline policy, not
     // pty.rs's job to work around (see the module doc and
-    // docs/03-pty.md#spawn). Raw mode also drops ONLCR, so no
+    // docs/03-pty.md#spawn-details-that-bite). Raw mode also drops ONLCR, so no
     // \n -> \r\n surprises on the way back either. Same lesson the spike
     // already learned the hard way for S3
-    // (docs/15-open-questions.md#s3--a-blocking-write-wedges-terminate).
+    // (teleport docs/15-open-questions.md#s3).
     let (spawned, out_rx) = spawn_sh("stty raw -echo; printf READY; cat", 24, 80);
 
     // `stty` runs, then the sentinel, then `cat` execs -- all sequential in
@@ -185,7 +187,7 @@ fn resize_is_observed_by_the_child() {
     let (spawned, out_rx) = spawn_interactive_sh(24, 80);
     spawned.session.resize(120, 40).unwrap();
     // resize() hands off to the control thread and returns immediately
-    // (docs/03-pty.md#resize: "short and non-blocking") -- it carries
+    // (docs/03-pty.md#resize-and-the-control-lease: "short and non-blocking") -- it carries
     // no ack, so give it a moment to land before asking the child to query
     // its size, rather than racing the control thread against the writer
     // thread on two independent channels.
@@ -229,7 +231,7 @@ fn nonzero_exit_is_recorded_accurately() {
 // keep the pty's master open past the direct child's exit?" -- with two
 // different, *correct* answers, because Linux and macOS genuinely differ here.
 // Split by `target_os` for that reason, not because macOS is flaky. This
-// resolves [S5](../../docs/15-open-questions.md#s5--a-detached-grandchild-cannot-hold-a-pty-past-its-parent-on-macos),
+// resolves S5 (teleport docs/15-open-questions.md#s5),
 // which was previously a `#[cfg(target_os = "linux")]` gate with an unverified
 // hypothesis attached.
 //
@@ -282,7 +284,7 @@ fn eof_and_exit_are_independent_signals() {
     // (ignoring SIGHUP) keeps the pty's slave side open for a few seconds
     // after. wait() must not be blocked on that, and EOF must not arrive
     // early just because the child already exited
-    // (docs/15-open-questions.md#s2--eof-is-not-exit, S2's verified recipe).
+    // (teleport docs/15-open-questions.md#s2, S2's verified recipe).
     //
     // SIGHUP ignored *before* the fork races the parent's `exit 0` (S2's own
     // finding) is what the grandchild actually needs: fork inherits signal
@@ -411,7 +413,7 @@ fn eof_follows_the_session_leaders_exit_even_with_a_live_grandchild() {
     assert_eq!(
         rc, 0,
         "the grandchild must still be alive after EOF -- macOS revoked its pty \
-         descriptor, it did not kill the process (docs/15-open-questions.md#s5)"
+         descriptor, it did not kill the process (teleport docs/15-open-questions.md#s5)"
     );
 }
 
@@ -427,7 +429,7 @@ fn terminate_reaches_exited_within_the_bounded_policy() {
     let terminate_latency = t0.elapsed();
 
     // SIGTERM should kill a plain `sleep` near-instantly -- well under the
-    // full 5s+2s bounded policy (docs/03-pty.md#concrete-policy).
+    // full 5s+2s bounded policy (docs/03-pty.md#termination).
     assert!(
         terminate_latency < Duration::from_secs(2),
         "terminate() took {terminate_latency:?}, expected a fast SIGTERM kill"
@@ -444,7 +446,7 @@ fn terminate_reaches_exited_within_the_bounded_policy() {
 }
 
 /// Issue #49: a child that ignores both graceful signals must still die by
-/// step 4's hard kill (docs/03-pty.md#concrete-policy), not ride out
+/// step 4's hard kill (docs/03-pty.md#termination), not ride out
 /// `KILL_WAIT` and leak as a live process behind an `exited` row.
 #[test]
 fn terminate_hard_kills_a_child_that_ignores_hup_and_term() {

@@ -1,6 +1,6 @@
 //! Append-only output log -- `<data_dir>/sessions/<id>/output.vt`.
 //!
-//! See docs/02-model.md#output-log for the durability rules and
+//! See docs/02-model.md#storage for the durability rules and
 //! ROADMAP.md for the milestone this
 //! implements. Raw PTY bytes, appended, never rewritten: no framing, no
 //! headers, no escaping. The file's length *is* the replay index.
@@ -43,19 +43,19 @@ use anyhow::{Context, Result};
 use tracing::warn;
 
 /// Filename every session's log is opened under, inside its own session
-/// directory (docs/02-model.md#layout).
+/// directory (docs/02-model.md#storage).
 pub const LOG_FILE_NAME: &str = "output.vt";
 
-/// Defaults from docs/02-model.md#size-cap. `config.toml` does not
+/// Defaults from docs/02-model.md#the-size-cap. `config.toml` does not
 /// exist yet; when it does, it overrides these rather than replacing them.
 pub const DEFAULT_LOG_WARN_BYTES: u64 = 256 * 1024 * 1024;
 /// See [`DEFAULT_LOG_WARN_BYTES`].
 pub const DEFAULT_LOG_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 /// Never `fsync` per chunk -- that couples PTY drain rate to disk latency
-/// (docs/02-model.md#output-log). Sync on this interval instead.
+/// (docs/02-model.md#storage). Sync on this interval instead.
 pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Size/sync thresholds for one session's log (docs/02-model.md#size-cap).
+/// Size/sync thresholds for one session's log (docs/02-model.md#the-size-cap).
 #[derive(Debug, Clone, Copy)]
 pub struct LogLimits {
     /// Emit [`LogEvent::Warned`] once the log crosses this size.
@@ -78,7 +78,7 @@ impl Default for LogLimits {
 }
 
 /// What SQLite remembered about this log before the daemon restarted. The
-/// seam for docs/02-model.md#restart-recovery; `persistence.rs` (M7)
+/// seam for docs/02-model.md#startup-sequence; `persistence.rs` (M7)
 /// fills it in, and until then every open is a fresh one.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StoredState {
@@ -136,7 +136,7 @@ pub struct OutputLog {
     file: Arc<File>,
     limits: LogLimits,
     /// Authoritative output offset. Never rewinds -- not on a cap, not across
-    /// a restart (docs/02-model.md#restart-recovery).
+    /// a restart (docs/02-model.md#startup-sequence).
     next_offset: u64,
     /// Bytes actually on disk. Equal to `min(next_offset, log_capped_at)`
     /// except after an I/O error, where it is the honest, smaller truth.
@@ -236,7 +236,7 @@ impl OutputLog {
 
         // Persist first, advance second -- a subscriber must never see an
         // offset for bytes that are not yet readable
-        // (docs/03-pty.md#reader-loop).
+        // (docs/03-pty.md#reader-loop-ordering--not-negotiable).
         self.next_offset = start + bytes.len() as u64;
 
         Appended { start, events }
@@ -287,7 +287,7 @@ impl OutputLog {
     /// keeps the hole *visible*: without it a client would be handed a
     /// replay range that silently stops short of `next_offset` and live
     /// chunks resuming past a gap it was never told about
-    /// (docs/02-model.md#size-cap).
+    /// (docs/02-model.md#the-size-cap).
     fn fail(&mut self, events: &mut Vec<LogEvent>, error: &io::Error) {
         if self.io_failed {
             return;
@@ -303,7 +303,7 @@ impl OutputLog {
 
 /// A second reference to a log's open file, used only to `fsync` it. Exists
 /// so the flush never happens on the PTY reader thread or under the fan-out
-/// mutex (docs/02-model.md#output-log).
+/// mutex (docs/02-model.md#storage).
 #[derive(Debug, Clone)]
 pub struct SyncHandle {
     file: Arc<File>,
@@ -324,7 +324,7 @@ impl SyncHandle {
 
 /// One thread for the whole daemon that flushes every registered log on
 /// `sync_interval` -- the "`fsync` on a 2-second timer while running" half of
-/// docs/02-model.md#output-log.
+/// docs/02-model.md#storage.
 ///
 /// One thread, not one per session: the work is a handful of `fsync`s and the
 /// per-session thread budget is already spent on the four `pty.rs` needs.

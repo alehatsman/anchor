@@ -327,7 +327,7 @@ async fn attaching_past_next_offset_is_offset_ahead() {
 /// Past a cap the bytes are gone. Replay stops at `log_capped_at`, a client
 /// asking for what is beyond it gets nothing and is told where the stream
 /// resumes, and live output keeps flowing throughout
-/// (docs/02-model.md#size-cap).
+/// (docs/02-model.md#the-size-cap).
 #[tokio::test]
 async fn replay_across_a_cap_stops_at_the_cap_and_live_output_continues() {
     const CAP: u64 = 64 * 1024;
