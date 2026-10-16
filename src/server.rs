@@ -36,11 +36,39 @@ impl State {
         Self { manager, store }
     }
 
+    /// The store, locked.
+    ///
+    /// **Never hold this guard across anything that touches a `Session`.**
+    /// `SessionManager::label` takes a session's labels and then the store;
+    /// a caller that takes them the other way round closes a cycle and
+    /// deadlocks the whole daemon, which is #19: `op_list` held this guard
+    /// for the arm of a `match` whose body called `Session::snapshot`.
+    ///
+    /// Reads that only need rows should go through [`stored_rows`] or
+    /// [`stored_row`], which hand back owned data and cannot leak the guard
+    /// into the caller's scope.
+    ///
+    /// [`stored_rows`]: Self::stored_rows
+    /// [`stored_row`]: Self::stored_row
     fn store(&self) -> std::sync::MutexGuard<'_, Store> {
         match self.store.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    /// Stored rows matching `filter`, with the store lock released before
+    /// this returns.
+    fn stored_rows(
+        &self,
+        filter: &BTreeMap<String, String>,
+    ) -> anyhow::Result<Vec<crate::model::Session>> {
+        self.store().list_filtered(filter)
+    }
+
+    /// One stored row, with the store lock released before this returns.
+    fn stored_row(&self, id: &str) -> anyhow::Result<Option<crate::model::Session>> {
+        self.store().get(id)
     }
 }
 
@@ -414,7 +442,13 @@ fn op_list(id: u64, line: &str, state: &State) -> Value {
     };
     // The store is the full history: live sessions plus the rows a restart
     // turned into `lost`. Live state is folded over it below.
-    match state.store().list_filtered(&req.filter) {
+    //
+    // Through `stored_rows`, not `state.store()`: the fold calls
+    // `Session::snapshot`, and a store guard still live at that point is
+    // the store -> session.labels order that deadlocks against
+    // `SessionManager::label` (#19). A `match` scrutinee would have held it
+    // for the whole arm.
+    match state.stored_rows(&req.filter) {
         Ok(sessions) => {
             let sessions: Vec<Value> = sessions
                 .iter()
@@ -724,7 +758,7 @@ fn lookup(id: &str, state: &State) -> Option<crate::model::Session> {
     if let Some(session) = state.manager.get(id) {
         return Some(session.snapshot());
     }
-    state.store().get(id).ok().flatten()
+    state.stored_row(id).ok().flatten()
 }
 
 /// Folds live state over a stored row, so a list never reports a running
@@ -738,7 +772,7 @@ fn merge_live(row: &crate::model::Session, state: &State) -> crate::model::Sessi
 
 /// A control op that needs a live PTY, against a session that has none.
 fn not_live(id: u64, session: &str, state: &State) -> Value {
-    match state.store().get(session) {
+    match state.stored_row(session) {
         Ok(Some(_)) => proto::error(id, ErrorCode::AlreadyExited, "session is not running"),
         _ => proto::error(id, ErrorCode::NotFound, "no such session"),
     }
