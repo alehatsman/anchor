@@ -5,6 +5,19 @@ Unix socket, `$XDG_RUNTIME_DIR/anchor.sock`, fallback
 auth. Filesystem permissions (0600) are the security boundary — see
 [01-scope.md](01-scope.md): remote access is a client's job.
 
+**A variable that is set but empty does not count as set.** Both lookups
+treat `""` as absent and fall through (`non_empty_env`, `src/paths.rs:91`).
+A client that skips this resolves `$XDG_RUNTIME_DIR/anchor.sock` to the
+*relative* path `anchor.sock` when the variable is empty, then reports
+anchord unreachable while naming no cause — the daemon is fine and the
+client is knocking on a path in its own working directory. Empty-not-absent
+is the common shape in practice: a service manager clearing a variable it
+does not set, or a scratch environment built by hand.
+
+Clients resolve this themselves rather than asking anchord, because the
+resolution is how you *find* anchord. Any client that gets it wrong is
+wrong before there is anyone to ask.
+
 Two framings on one socket:
 
 - **control** — newline-delimited JSON, request/response, correlated by `id`
