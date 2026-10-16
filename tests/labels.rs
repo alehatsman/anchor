@@ -336,6 +336,104 @@ mod live {
 
         session.terminate().expect("terminate");
     }
+
+    /// Two clients sharing one anchord are told to stay out of each other's
+    /// way by namespacing their keys (docs/02-model.md) -- teleport writes
+    /// `teleport.*`, another client writes its own prefix. That only works if
+    /// a per-key op is per-key in effect.
+    ///
+    /// It was not: `label` read the map under one lock and wrote it under
+    /// another, so concurrent writers each overwrote the other's edit and the
+    /// loser lost *every* key it held, not just the one in flight (#12).
+    ///
+    /// Asserting on the store as well as on memory is the point, not belt and
+    /// braces: holding a lock across only the in-memory edit serializes the
+    /// writers and still lets them reach the store in the opposite order,
+    /// leaving the persisted map one key short. That variant passes a
+    /// memory-only assertion and fails this one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_writers_on_distinct_keys_keep_every_key() {
+        const WRITERS: usize = 24;
+        // Rounds, because the store half of this is probabilistic and one
+        // round is not a test. Measured against the memory-only variant
+        // described above: 1 round caught it 2 times in 8, 12 rounds 4 in 6,
+        // 60 rounds 8 in 8. The original two-lock form fails on the first
+        // round every time -- only the store ordering needs the repetition.
+        // A fresh session per round keeps the rounds independent.
+        //
+        // This is a volume budget, not a timeout (docs/08-testing.md): it
+        // buys detection probability, so shrinking it trades that away
+        // without failing anything.
+        const ROUNDS: usize = 60;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(&dir);
+        let store = Arc::new(Mutex::new(Store::open(&paths).unwrap()));
+        let manager =
+            Arc::new(SessionManager::new(paths.sessions_dir()).with_store(Arc::clone(&store)));
+
+        for round in 0..ROUNDS {
+            let session = manager
+                .create(&spec(), labels_of(&[("base", "kept")]))
+                .expect("create");
+            let id = session.id.clone();
+
+            // Released together, so the reads overlap rather than queue behind
+            // each other -- the interleaving is the premise of the test.
+            let start = Arc::new(std::sync::Barrier::new(WRITERS));
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|i| {
+                    let manager = Arc::clone(&manager);
+                    let start = Arc::clone(&start);
+                    let id = id.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        manager
+                            .label(&id, labels_of(&[(&format!("k{i}"), "v")]), &[])
+                            .expect("label");
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("writer thread");
+            }
+
+            let live = manager
+                .get(&id)
+                .expect("session is still live")
+                .labels
+                .lock()
+                .clone();
+            let persisted = lock_store(&store).get(&id).unwrap().unwrap().labels;
+
+            for i in 0..WRITERS {
+                let key = format!("k{i}");
+                assert_eq!(
+                    live.get(&key).map(String::as_str),
+                    Some("v"),
+                    "round {round}: {key} was lost in memory: a writer's whole \
+                 map replaced it"
+                );
+                assert_eq!(
+                    persisted.get(&key).map(String::as_str),
+                    Some("v"),
+                    "round {round}: {key} was lost in the store: writers reached \
+                 it out of order"
+                );
+            }
+            assert_eq!(live.get("base").map(String::as_str), Some("kept"));
+            assert_eq!(persisted.get("base").map(String::as_str), Some("kept"));
+
+            session.terminate().expect("terminate");
+        }
+    }
+
+    fn lock_store(store: &Mutex<Store>) -> std::sync::MutexGuard<'_, Store> {
+        match store.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 }
 
 /// A create whose child never starts must not leave a row claiming to be

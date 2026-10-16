@@ -48,6 +48,12 @@ Rules:
 - anchor never interprets a label. Reserved prefix: none. Namespacing is the
   caller's problem and convention (`wm.*`, `teleport.*`) is enough.
 - labels are mutable after create — a client's own state may change.
+- a label write is per-key: `set` and `remove` name keys, never a whole map.
+  Two clients editing *different* keys on the same session cannot lose each
+  other's work, in memory or on disk. This is what makes the namespacing
+  convention above load-bearing rather than decorative — without it, sharing
+  one daemon would need an external lock, which is the side-table again under
+  a different name. It was not true until #12.
 
 ### Lifecycle
 

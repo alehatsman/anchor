@@ -380,10 +380,11 @@ impl Session {
         self.fanout.lock().subscribers.clear();
     }
 
-    /// Replaces this session's labels wholesale.
-    pub fn set_labels(&self, labels: std::collections::BTreeMap<String, String>) {
-        *self.labels.lock() = labels;
-    }
+    // No `set_labels`. A whole-map setter is what made #12 possible: it
+    // takes the lock only for the write, so the read it depends on happened
+    // under a different one and two writers could each overwrite the other's
+    // keys. Edit `labels` under a single guard held across read and write --
+    // see `SessionManager::label`, the only writer.
 
     /// A point-in-time row for the store and the wire.
     ///

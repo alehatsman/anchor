@@ -305,20 +305,46 @@ impl SessionManager {
     ) -> Result<BTreeMap<String, String>, CreateError> {
         let session = self.get(id).ok_or(CreateError::NotFound)?;
 
-        let mut labels = session.labels.lock().clone();
+        // One critical section across read, edit, write and persist (#12).
+        //
+        // This op is per-key on the wire -- `set` and `remove` name keys, not
+        // a whole map -- but the only way to apply it is to rewrite the map.
+        // Reading under one lock and writing under another made two clients
+        // touching *disjoint* keys clobber each other: both read the old map,
+        // both wrote their own edit of it, and the loser lost every key it
+        // had, not just the one it was writing. Namespacing by key prefix,
+        // which is how clients are told to share a daemon
+        // (docs/02-model.md), did not help and could not.
+        //
+        // The store write stays inside the guard so the two cannot be
+        // ordered differently: serialized in memory and racing to the store
+        // leaves the store holding whichever map arrived last, and a restart
+        // then resurrects the lost key's absence.
+        //
+        // Nesting labels -> store is safe here, and deliberately one-way: no
+        // path takes the store lock and then a session's labels lock
+        // (`snapshot` clones labels and releases before touching the store;
+        // `label_stored` never touches a live session). Audited at the time
+        // of writing -- a new store-then-labels path would make this a cycle.
+        let mut guard = session.labels.lock();
+
+        let mut labels = guard.clone();
         for key in remove {
             labels.remove(key);
         }
         labels.extend(set);
+        // Before any mutation: `?` here must leave the session's labels
+        // exactly as they were, which is why the edit is built on a clone.
         model::labels::validate(&labels)?;
 
-        session.set_labels(labels.clone());
+        *guard = labels.clone();
         if let Some(store) = &self.store {
             let mut store = lock(store);
             if let Err(e) = store.replace_labels(id, &labels) {
                 warn!(session = %id, error = %e, "persisting labels failed");
             }
         }
+        drop(guard);
         Ok(labels)
     }
 
