@@ -1,8 +1,20 @@
 # 09 — Windows
 
-Status: **spec only. No code.** Nothing here is implemented, and §7 lists two
-decisions that are the owner's, not this document's. The spec does not hold
-until those are answered.
+Status: **deferred, 2026-10-16.** Windows is not being built. The owner
+answered §7's Q2: not now.
+
+Nothing here is implemented and nothing is scheduled. This document is kept
+because the costing is the expensive part and it is done — not because the
+work is queued. **anchord is Unix-only, deliberately, as of this date.**
+
+§7's Q1 (does anchor acquire an access-control model?) is therefore
+unanswered rather than decided. It would have to be answered before any of
+this starts.
+
+What would reopen it: a client that needs sessions on Windows and cannot
+use a Unix host. teleport is the obvious candidate — its `use_anchor` path
+cannot ship on Windows while this is deferred, which is a consequence worth
+knowing before anyone deletes its in-process PTY layer (§8).
 
 ## Goal
 
@@ -267,3 +279,33 @@ Windows without this work.
 
 This document does not recommend one. It exists so the question is asked with
 the costs visible rather than discovered during a port.
+
+## 8. Consequence for teleport
+
+Deferring this is not neutral downstream, and the dependency runs the other
+way from how it looks.
+
+teleport's in-process PTY layer is its **only** Windows session path while
+anchord is Unix-only. teleport#107 — `daemon/src/lib.rs` declaring
+`pub mod anchor_client;` ungated while that module imports
+`tokio::net::UnixStream` — was going to be resolved by "this compiles on
+Windows because anchor has an arm there". With Windows deferred, that
+resolution is unavailable, and the honest options narrow to two:
+
+- **teleport keeps its in-process layer as the Windows path**, gated, and
+  the deletion becomes a Unix-only deletion rather than a removal.
+- **teleport states that teleportd is Unix-only too**, and the deletion
+  proceeds as specified.
+
+Both are teleport's call, not anchor's. What anchor owes them is the fact,
+not the choice: anchord will not host a session on Windows, and no date is
+attached to that changing.
+
+One practical consequence. teleport's deletion spec holds
+`ConptyDsrProbe` and `pty_primitive_windows.rs` as transfers rather than
+deletions, released only once the behaviour is under test in anchor (§5,
+step 3). That gate is now indefinite. If teleport deletes its in-process
+layer and anchor never ports the probe, that code should be preserved
+deliberately — it is the only proven ConPTY exit-handshake work in either
+repo, and §1's negative knowledge is not recoverable by reading the code
+that remains.
