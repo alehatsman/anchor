@@ -78,7 +78,7 @@ unchanged and it ships normally throughout.
 
 ---
 
-## M5 — Flip the default, prove the payoff — in progress
+## M5 — Flip the default, prove the payoff — exit criteria met, 2026-10-16
 
 > Done: an agent survives teleport restarting under it (demonstrated by
 > `an_agent_survives_teleport_restarting_under_it`), anchord restarts without
@@ -87,9 +87,18 @@ unchanged and it ships normally throughout.
 > install` gives anchord a lifecycle of its own, and an unreachable anchord
 > is reported rather than read as an empty session list.
 >
-> Open: flipping teleport's `use_anchor` default, and deleting teleport's
-> in-process PTY layer — which stays gated on a release having actually run
-> on the anchor path.
+> **Both exit criteria were demonstrated against a live daemon** at teleport
+> `4912d9c`, 2026-10-16: a session created by the old teleportd survived the
+> upgrade with its transcript intact, and `anchord` was rebuilt and bounced
+> under a running teleportd that never noticed. `use_anchor=true` is deployed
+> on `work_mac`. See teleport `docs/20-retiring-the-in-process-pty.md`.
+>
+> Open, and neither is anchor's code: flipping teleport's *compiled*
+> `use_anchor` default (still `false` at `daemon/src/config.rs:140`), and
+> deleting teleport's in-process PTY layer. The delete acquired two new
+> gates once it stopped being reversible — a Windows transport arm for
+> anchor (#16, deferred) and anchord present on the three hosts that do not
+> have it yet.
 
 Scope: default teleport to anchor; packaging so `anchord` is a separate
 launchd/systemd unit with its own lifecycle.
@@ -102,7 +111,10 @@ teleport's in-process PTY layer.
 
 ## Later, unscheduled
 
-- Windows (blocked on teleport `#W1`)
+- Windows — **deferred, 2026-10-16**, by decision rather than by blocker.
+  teleport's `#W1` was resolved on 2026-09-05; the cost is specced in
+  [docs/09-windows.md](docs/09-windows.md) and the consequence for
+  teleport is tracked in #16.
 - non-PTY sessions (only with a real consumer — see scope doc)
 - crash survival via per-PTY broker processes (explicitly deferred)
 

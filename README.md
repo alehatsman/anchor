@@ -22,11 +22,12 @@ noticed. That is the entire pitch.
 
 ## Status
 
-**M3 — the socket protocol and the CLI.** `anchord` owns real PTY sessions: four threads
-each, an append-only output log addressable by byte offset, many bounded
-subscribers with backpressure, a control lease, and termination that reaps a
-child ignoring SIGHUP and SIGTERM. Ported from teleport along with its test
-suite, which is the point — those fixtures are the behavioural spec.
+**M5 — the payoff, demonstrated. M0–M4 are done.** `anchord` owns real PTY
+sessions: four threads each, an append-only output log addressable by byte
+offset, many bounded subscribers with backpressure, a control lease, and
+termination that reaps a child ignoring SIGHUP and SIGTERM. Ported from
+teleport along with its test suite, which is the point — those fixtures are
+the behavioural spec.
 
 Labels are queryable: filter sessions by exact match on any key, which is
 the capability that moved this boundary out of teleport in the first place.
