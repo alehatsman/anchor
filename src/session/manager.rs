@@ -321,11 +321,16 @@ impl SessionManager {
         // leaves the store holding whichever map arrived last, and a restart
         // then resurrects the lost key's absence.
         //
-        // Nesting labels -> store is safe here, and deliberately one-way: no
-        // path takes the store lock and then a session's labels lock
-        // (`snapshot` clones labels and releases before touching the store;
-        // `label_stored` never touches a live session). Audited at the time
-        // of writing -- a new store-then-labels path would make this a cycle.
+        // Nesting labels -> store is one-way by rule, and the rule is the
+        // other side's to keep: **nothing may hold the store lock while it
+        // touches a `Session`**. This comment used to claim the cycle could
+        // not exist because `snapshot` clones labels and releases before the
+        // store is touched. That was true of `snapshot` and false of its
+        // caller: `op_list` held the store guard across the whole `match`
+        // arm that called it, which is store -> labels, and the daemon
+        // deadlocked (#19). An audit of the callee cannot see the nesting a
+        // caller creates, so the invariant now lives on `server::State`'s
+        // accessors, where a read that only needs rows cannot keep the guard.
         let mut guard = session.labels.lock();
 
         let mut labels = guard.clone();
