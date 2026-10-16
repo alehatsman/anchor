@@ -172,7 +172,10 @@ fn a_running_session_does_not_delay_shutdown() {
             }),
         )
         .expect("create");
-    let id = created["session"].as_str().expect("a session id").to_string();
+    let id = created["session"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
 
     let log = dir.0.join("anchor/sessions").join(&id).join("output.vt");
     let deadline = Instant::now() + Duration::from_secs(10);

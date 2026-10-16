@@ -58,13 +58,7 @@ fn restore_saved() {
     if fd >= 0 {
         // SAFETY: `fd` was published after `original` was written, so the
         // value behind the cell is initialised and never mutated again.
-        unsafe {
-            libc::tcsetattr(
-                fd,
-                libc::TCSANOW,
-                (*SAVED.original.get()).as_ptr(),
-            )
-        };
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, (*SAVED.original.get()).as_ptr()) };
     }
 }
 
@@ -337,7 +331,9 @@ mod raw_mode_tests {
         let before = attrs(slave);
         assert_ne!(before.c_lflag & libc::ECHO, 0, "a fresh pty echoes");
 
-        let guard = RawMode::enter_on(slave).expect("enter").expect("a terminal");
+        let guard = RawMode::enter_on(slave)
+            .expect("enter")
+            .expect("a terminal");
         assert_eq!(
             attrs(slave).c_lflag & libc::ECHO,
             0,
@@ -368,7 +364,9 @@ mod raw_mode_tests {
     fn a_dropped_guard_leaves_nothing_for_a_later_signal_to_restore() {
         let _serialised = TEST_LOCK.lock();
         let (master, slave) = open_pty();
-        let guard = RawMode::enter_on(slave).expect("enter").expect("a terminal");
+        let guard = RawMode::enter_on(slave)
+            .expect("enter")
+            .expect("a terminal");
         assert!(RESTORE_FD.load(std::sync::atomic::Ordering::Acquire) >= 0);
         drop(guard);
         assert_eq!(
@@ -394,7 +392,9 @@ mod raw_mode_tests {
     fn the_handlers_cover_the_signals_that_skip_drop() {
         let _serialised = TEST_LOCK.lock();
         let (master, slave) = open_pty();
-        let guard = RawMode::enter_on(slave).expect("enter").expect("a terminal");
+        let guard = RawMode::enter_on(slave)
+            .expect("enter")
+            .expect("a terminal");
 
         for signum in RESTORE_SIGNALS {
             // SAFETY: querying the current disposition without changing it.

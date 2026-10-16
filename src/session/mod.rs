@@ -371,7 +371,6 @@ impl Session {
         self.size_changes.subscribe()
     }
 
-
     /// Releases every subscriber, ending their streams.
     ///
     /// Called once the PTY master reports EOF: no further output can exist,

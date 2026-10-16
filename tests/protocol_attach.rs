@@ -552,7 +552,10 @@ async fn a_session_that_exits_under_its_controller_still_sends_exit() {
                 }
             }),
         );
-        assert_eq!(created["ok"], true, "round {round}: create failed: {created}");
+        assert_eq!(
+            created["ok"], true,
+            "round {round}: create failed: {created}"
+        );
         let id = created["session"].as_str().unwrap().to_string();
 
         let mut viewer = Conn::connect(&socket);
@@ -571,17 +574,11 @@ async fn a_session_that_exits_under_its_controller_still_sends_exit() {
             match viewer.try_frame() {
                 Some((tag, _offset, payload)) => {
                     if tag == frame::EXIT {
-                        assert_eq!(
-                            payload.len(),
-                            4,
-                            "round {round}: an exit code is an i32"
-                        );
+                        assert_eq!(payload.len(), 4, "round {round}: an exit code is an i32");
                         break;
                     }
                 }
-                None => panic!(
-                    "round {round}: the stream ended without an exit frame"
-                ),
+                None => panic!("round {round}: the stream ended without an exit frame"),
             }
             assert!(
                 Instant::now() < deadline,
@@ -652,7 +649,10 @@ async fn an_input_frame_larger_than_a_chunk_ends_the_connection() {
         "attach",
         json!({ "session": &id, "from": 0, "control": true }),
     );
-    assert_eq!(reply["control"], true, "the lease was not released: {reply}");
+    assert_eq!(
+        reply["control"], true,
+        "the lease was not released: {reply}"
+    );
     assert_eq!(next.frame().2, vec![1]);
     next.send_input(b"alive\n");
     next.read_until("alive");
@@ -732,7 +732,10 @@ async fn a_resize_is_announced_to_everyone_attached() {
     );
     // The reply carries the size, so a client starts from the truth rather
     // than waiting for a change that may never come.
-    assert_eq!(reply["cols"], 80, "attach reply is missing the size: {reply}");
+    assert_eq!(
+        reply["cols"], 80,
+        "attach reply is missing the size: {reply}"
+    );
     assert_eq!(reply["rows"], 24);
     assert_eq!(controller.frame().2, vec![1]);
     controller.read_until("ready");

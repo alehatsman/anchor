@@ -89,7 +89,11 @@ fn anchord_path() -> Result<PathBuf> {
     let exe = exe.canonicalize().unwrap_or(exe);
     // `anchor` and `anchord` ship side by side; when `anchor` is what ran,
     // its sibling is the daemon. When `anchord` itself ran, this is a no-op.
-    let candidate = exe.with_file_name(if cfg!(windows) { "anchord.exe" } else { "anchord" });
+    let candidate = exe.with_file_name(if cfg!(windows) {
+        "anchord.exe"
+    } else {
+        "anchord"
+    });
     if candidate.exists() {
         return Ok(candidate);
     }

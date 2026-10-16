@@ -115,7 +115,9 @@ fn run_attach(
                 if n == 0 {
                     break;
                 }
-                seen.lock().expect("stdout buffer").extend_from_slice(&buf[..n]);
+                seen.lock()
+                    .expect("stdout buffer")
+                    .extend_from_slice(&buf[..n]);
             }
         })
     };
@@ -323,7 +325,10 @@ fn attach_returns_when_the_session_exits() {
             }),
         )
         .expect("create");
-    let id = created["session"].as_str().expect("a session id").to_string();
+    let id = created["session"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
 
     let mut child = Command::new(bin("anchor"))
         .arg("--socket")
@@ -389,7 +394,10 @@ fn a_signalled_attach_leaves_the_terminal_usable() {
             }),
         )
         .expect("create");
-    let id = created["session"].as_str().expect("a session id").to_string();
+    let id = created["session"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
 
     let (master, slave) = open_pty();
     let echoes = |label: &str| -> bool {

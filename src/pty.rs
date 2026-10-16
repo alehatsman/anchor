@@ -831,8 +831,7 @@ mod reader_tests {
             Ok(b"after".to_vec()),
         ]);
         assert_eq!(
-            out,
-            b"beforeafter",
+            out, b"beforeafter",
             "output after an interrupted read was lost"
         );
     }
@@ -949,8 +948,14 @@ mod login_shell_tests {
     fn installed_shells_pass_arguments_through_untouched() {
         let mut tested = 0;
         for shell in [
-            "/bin/sh", "/bin/bash", "/bin/zsh", "/bin/csh", "/bin/tcsh",
-            "/usr/bin/fish", "/usr/local/bin/fish", "/opt/homebrew/bin/fish",
+            "/bin/sh",
+            "/bin/bash",
+            "/bin/zsh",
+            "/bin/csh",
+            "/bin/tcsh",
+            "/usr/bin/fish",
+            "/usr/local/bin/fish",
+            "/opt/homebrew/bin/fish",
         ] {
             let Some(seen) = argv_as_seen_by_the_child(shell) else {
                 continue;
@@ -958,7 +963,10 @@ mod login_shell_tests {
             tested += 1;
             assert_eq!(seen, TRICKY, "{shell} mangled its arguments");
         }
-        assert!(tested > 0, "no shell to test against; the suite proved nothing");
+        assert!(
+            tested > 0,
+            "no shell to test against; the suite proved nothing"
+        );
         eprintln!("login-shell wrapper exercised against {tested} shell(s)");
     }
 

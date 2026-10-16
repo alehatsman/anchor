@@ -198,11 +198,7 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
             Err(_) => {
                 respond(
                     &mut write_half,
-                    proto::error(
-                        0,
-                        ErrorCode::BadRequest,
-                        "request line is not valid UTF-8",
-                    ),
+                    proto::error(0, ErrorCode::BadRequest, "request line is not valid UTF-8"),
                 )
                 .await?;
                 continue;

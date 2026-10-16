@@ -459,7 +459,6 @@ async fn a_slow_terminate_does_not_stall_other_connections() {
     }
 }
 
-
 /// A failure that is the daemon's own must not be reported as a bad
 /// request.
 ///
@@ -533,7 +532,6 @@ async fn the_request_level_codes_are_unchanged() {
         "unexpected: {bad_label}"
     );
 }
-
 
 /// Asking for more than one response can carry is paging, not an error.
 ///

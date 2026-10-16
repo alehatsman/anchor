@@ -331,6 +331,9 @@ async fn a_socket_path_too_long_to_bind_is_named_as_too_long() {
 async fn a_short_socket_path_still_binds() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("s.sock");
-    assert!(socket.as_os_str().len() <= 103, "the fixture itself is too long");
+    assert!(
+        socket.as_os_str().len() <= 103,
+        "the fixture itself is too long"
+    );
     anchor::server::bind(&socket).expect("a short path must bind");
 }
