@@ -151,6 +151,7 @@ Nothing here should ever be read as more than that.
 | [docs/05-extraction.md](docs/05-extraction.md) | how this gets carved out of teleport |
 | [docs/06-teleport-seam.md](docs/06-teleport-seam.md) | where the two actually meet |
 | [docs/07-lifecycle.md](docs/07-lifecycle.md) | who starts anchord, and what restart does not save |
+| [docs/08-testing.md](docs/08-testing.md) | why a green suite is not evidence, and what to check instead |
 | [ROADMAP.md](ROADMAP.md) | milestones, each retiring one risk |
 
 ## License
