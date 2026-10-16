@@ -203,8 +203,28 @@ description. Dropping the `MasterPty` closes nothing and raises no signal
 
 ## Platform
 
-Unix first. Windows is a known-harder target and teleport has an unresolved
-blocker there (`#W1`: a gracefully-exiting ConPTY child was never observed as
-exited). **v1 is Unix-only.** Keep every `#[cfg(windows)]` inside the PTY
-module so the port stays possible; a platform conditional anywhere else is a
-bug.
+Unix first. **v1 is Unix-only** — but no longer because Windows is blocked.
+
+This section used to cite teleport's `#W1` (a gracefully-exiting ConPTY child
+never observed as exited) as an unresolved blocker. It was resolved on
+2026-09-05 (teleport#9) and this text went stale for six weeks, reading as a
+live obstacle and very nearly costing a scope decision on that basis.
+
+The cause was conhost's ConPTY startup handshake, not reaping: it writes a
+cursor-position query (`ESC[6n`) and blocks waiting for a reply, so an
+already-exited child never gets torn down. teleport's `ConptyDsrProbe`
+answers that one query and then stops — a probe that kept answering would
+corrupt any application that legitimately asks where the cursor is.
+
+Windows is therefore a port, not a research problem. Two pieces of work, one
+of them a real scope question:
+
+- bring the probe and its test across (transport-independent; nothing to do
+  with how clients reach anchord)
+- decide the access-control story. `server.rs` makes filesystem permissions
+  *the* security boundary — 0600, no auth, no TCP — and a named pipe has no
+  equivalent. anchor would be choosing to have an access-control model for
+  the first time, which is a scope decision and not a port.
+
+Keep every `#[cfg(windows)]` inside the PTY module so the port stays
+possible; a platform conditional anywhere else is a bug.
