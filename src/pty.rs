@@ -233,6 +233,18 @@ fn login_shell_wrapper(spec: &SpawnSpec<'_>) -> Option<(String, Vec<String>)> {
         return None;
     }
     let shell = login_shell_path();
+    if shell_family(&shell) == ShellFamily::Csh {
+        // Say it where someone hits it, not only in the spec. Without this
+        // the shortfall surfaces as `command not found` for a program that
+        // is on PATH in the user's real login shell -- a true error that
+        // names the wrong layer, and the one thing `login_shell` exists to
+        // prevent.
+        tracing::warn!(
+            shell = %shell,
+            "login_shell under csh/tcsh sources .cshrc but not .login: those \
+             shells reject -l beside -c. A PATH set in .login will be missing."
+        );
+    }
     let argv = wrapper_argv(&shell, spec.program, spec.args);
     Some((shell, argv))
 }

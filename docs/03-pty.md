@@ -186,6 +186,11 @@ description. Dropping the `MasterPty` closes nothing and raises no signal
   over: falling back to `/bin/sh` would source the user's config not at all
   while still claiming to be their login shell, which is worse because it
   is invisible.
+
+  A spawn under csh **logs a warning naming the shortfall**. Without it the
+  failure reaches the user as `command not found` for a program that is on
+  `PATH` in their real login shell — a true error pointing at the wrong
+  layer, which is the one thing `login_shell` exists to prevent.
 - **`TERM` default.** A daemon with no controlling terminal has no `TERM`, and
   children render monochrome because color detection treats absent `TERM` as
   dumb. Set `TERM=xterm-256color` + `COLORTERM=truecolor` **only when unset**;
