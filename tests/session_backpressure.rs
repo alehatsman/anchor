@@ -9,6 +9,7 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -75,13 +76,34 @@ async fn zero_subscribers_session_survives() {
 
 /// S3 one layer up (docs/03-pty.md#the-terminalsession-trait): a
 /// `Session` must not serialize `write`/`resize`/`terminate` behind one lock.
-/// A child that never reads its pty eventually blocks a writer thread that
-/// keeps calling `write()`; `terminate()` must still return within its
-/// bounded policy (~7s) instead of queueing behind that stuck writer.
+/// A child that never reads its pty eventually blocks the pty writer thread;
+/// `terminate()` must still return within its bounded policy (~7s) instead of
+/// queueing behind that stuck writer.
+///
+/// **Reaching that premise is the whole difficulty (anchor#9).** The first
+/// version of this test pushed 4 KiB chunks of `x` with no newline, and a tty
+/// in canonical mode *discards* on line overflow rather than queueing: the
+/// writer never blocked, 436 MB went into a child that read nothing, and
+/// `terminate()` raced nothing for as long as the test existed. Chunks of
+/// complete lines land in the canonical queue instead, which is ~1 KiB, so it
+/// fills immediately and the next write to the master blocks for real.
+///
+/// The stall is then *waited for*, never slept past, and "stalled" means
+/// **wedged, not merely slow**. `Session::write` fails once the 32-slot write
+/// channel has been full for `WRITE_ENQUEUE_TIMEOUT`, and a tty that discards
+/// is slow enough to produce that on its own — the blob form above fails
+/// writes too, while the pty writer thread keeps making progress. Only an
+/// unbroken streak of rejections says the writer thread is stuck inside one
+/// `write()` and will never take another chunk. A single success resets the
+/// streak, so the premise cannot be faked by a busy machine.
+///
+/// If the streak never arrives the test fails loudly instead of passing
+/// vacuously, which is the whole point of the issue.
 #[tokio::test]
 async fn terminate_is_not_wedged_by_a_stuck_write() {
     let manager = SessionManager::new(sessions_root("stuck-write"));
     let cwd = temp_dir();
+    // Execs `sleep`, which never reads its stdin, so nothing drains the tty.
     let args = vec!["-c".to_string(), "sleep 30".to_string()];
     let session = manager
         .create(&spec(&args, 80, 24, &cwd), BTreeMap::new())
@@ -89,16 +111,41 @@ async fn terminate_is_not_wedged_by_a_stuck_write() {
 
     // Runs on its own thread, not this test's async task, so a write that
     // blocks doesn't block the assertion below from ever running.
+    let stalled = Arc::new(AtomicBool::new(false));
     let writer_session = Arc::clone(&session);
+    let writer_stalled = Arc::clone(&stalled);
     std::thread::spawn(move || {
-        let chunk = vec![b'x'; 4096];
-        while writer_session.write(&chunk).is_ok() {}
+        // Complete lines, not a 4 KiB blob: see the note above.
+        let chunk: Vec<u8> = std::iter::repeat_n(b"xxxxxxxxxxxxxxx\n", 64)
+            .flatten()
+            .copied()
+            .collect();
+        // Eight consecutive rejections is >=2s with not one chunk accepted:
+        // a discarding tty interleaves successes and never gets here.
+        const WEDGED_STREAK: u32 = 8;
+        let mut consecutive = 0;
+        loop {
+            if writer_session.write(&chunk).is_ok() {
+                consecutive = 0;
+                continue;
+            }
+            consecutive += 1;
+            if consecutive == WEDGED_STREAK {
+                writer_stalled.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
     });
 
-    // Give the writer thread time to actually fill the write channel and the
-    // pty's own kernel buffer -- otherwise terminate() could win the race by
-    // running before any write is stuck, proving nothing.
-    std::thread::sleep(Duration::from_millis(500));
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    while !stalled.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "writes never stayed rejected for {DEFAULT_TIMEOUT:?}, so the pty \
+             writer thread never wedged and this test would prove nothing"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     let t0 = Instant::now();
     session.terminate().expect("terminate should not error");

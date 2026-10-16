@@ -74,7 +74,18 @@ without a second number to get wrong.
 
 A disconnected subscriber reconnects and replays from its last offset. This
 converts a slow consumer into an ordinary reconnection. **Test it
-deliberately.**
+deliberately** — and check the test reaches its own premise.
+
+**A tty discards rather than blocks when the written data is not whole
+lines.** In canonical mode an over-long line with no terminator is thrown
+away at the line-length limit, so a child that never reads its pty absorbs
+unbounded input and the writer never blocks. anchor#9: a test built on that
+shape pushed 436 MB into a `sleep 30` and proved nothing for its whole life.
+Complete lines queue instead; the canonical queue is ~1 KiB, fills at once,
+and the next write to the master blocks for real. A write rejected by the
+session layer is also not proof on its own — the channel fills from slowness
+too. Only an unbroken streak of rejections means the writer thread is
+wedged.
 
 ### Catch up before registering, not after
 
