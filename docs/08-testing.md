@@ -146,3 +146,35 @@ These same four suites are the four heaviest in teleport's suite as well,
 arrived at independently. The pressure points belong to testing a PTY
 multiplexer, not to either codebase — which is the reason this file exists
 rather than living in one commit message.
+
+## A comment is a claim with a date on it
+
+Two of anchor's Windows deferrals cited teleport blockers that had been
+fixed six weeks earlier — `#W1` in `src/pty.rs` and in `docs/03-pty.md`,
+both reading as live obstacles long after `teleport#9` closed them. The
+cost was not cosmetic: that citation was the strongest argument against a
+scope decision, right up until someone checked the date.
+
+Stale citations fail differently from stale code. Code that goes wrong
+breaks a build or reds a test; a comment that goes wrong keeps compiling
+and keeps persuading. Nothing in the toolchain checks whether
+"unresolved", "unverified" or "not yet ported" is still true, so the claim
+survives exactly as long as nobody looks.
+
+Three habits, all cheap:
+
+- **Date the claim, not just the note.** "Unverified on real Windows
+  (2026-09-04)" invites a check. "Unverified on real Windows" invites
+  belief.
+- **Treat a cross-repo citation as the repeater's.** It stops being the
+  other repo's problem the moment it is restated here as fact. Both of
+  today's stale notes were accurate when written, in a repo that had since
+  fixed them and not told anyone.
+- **Prefer a reference that resolves to nothing over one that resolves to
+  the wrong thing.** `S4` looked like GitHub issue #4; issue #4 exists, is
+  closed, and is in the same subsystem on an adjacent date. A dangling
+  reference makes a reader keep looking. A plausible one makes them stop.
+
+The general form is the same failure this file is about. A test that cannot
+fail by not running, and a comment that cannot fail by being out of date,
+are both claims nothing checks — and both read as evidence.
