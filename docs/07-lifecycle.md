@@ -67,6 +67,34 @@ to run while sessions were live. With anchord supervised separately, the
 client restarts and reconnects by offset
 ([04-protocol.md](04-protocol.md)) and the sessions never notice.
 
+## Stopping
+
+Both service managers stop a service by sending **SIGTERM** and escalating to
+SIGKILL if it does not go. anchord therefore has to treat SIGTERM as an
+instruction, not an accident: it stops accepting, lets the runtime unwind,
+and **exits 0**. SIGINT is handled identically, because a daemon run in the
+foreground during development is stopped with Ctrl-C.
+
+What that buys is one thing, and it is worth being exact about it: unwinding
+drops the `LogSyncer`, whose `Drop` does a final `fsync` pass over every
+live log. Dying of the signal skips that and leaves the tail of each log
+unsynced until the kernel writes it back. Neither case loses data to a
+process death — the page cache outlives the process — but only the clean
+path survives the machine losing power a moment later.
+
+What it deliberately does **not** do:
+
+- **It does not unlink the socket.** The next daemon already probes a socket
+  file it finds and replaces it when nothing answers
+  ([04-protocol.md](04-protocol.md)); unlinking on the way out adds a second
+  path to the same outcome and a way to remove a file that is no longer ours.
+- **It does not mark sessions `lost`.** Startup does that, has to do it
+  anyway for the crash case, and is the only place that decides what a live
+  row means (see the bind-before-recovery note in `daemon.rs`).
+- **It does not terminate sessions gracefully.** PTYs die with the daemon —
+  the master fd closes, and the kernel hangs up each child. That boundary is
+  the section above, and a shutdown path is not where it gets renegotiated.
+
 ## Edge cases the implementation must handle
 
 - **Install is idempotent.** Running it twice is not an error and does not

@@ -66,7 +66,66 @@ pub async fn run(paths: &Paths) -> Result<()> {
         Arc::new(SessionManager::new(paths.sessions_dir()).with_store(Arc::clone(&store)));
 
     tracing::info!(socket = %paths.socket_path().display(), "listening");
-    crate::server::serve(listener, State::new(manager, store)).await
+    let serving = crate::server::serve(listener, State::new(manager, store));
+
+    // A service manager stops a service with SIGTERM, so it is an
+    // instruction rather than an accident (docs/07-lifecycle.md#stopping).
+    // Returning instead of dying of the signal is what lets the runtime
+    // unwind, and unwinding is what drops the `LogSyncer` and gives every
+    // live log its final fsync.
+    tokio::select! {
+        result = serving => result,
+        signal = stop_signal() => {
+            tracing::info!(signal, "stopping");
+            Ok(())
+        }
+    }
+}
+
+/// Resolves on the first SIGTERM or SIGINT, naming the one that arrived.
+///
+/// SIGINT too: a daemon run in the foreground is stopped with Ctrl-C, and a
+/// developer deserves the same final fsync launchd gets.
+#[cfg(unix)]
+async fn stop_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    // A failure to install a handler is not a reason to refuse to serve: the
+    // daemon simply keeps the default disposition for that signal, which is
+    // exactly where it was before this existed.
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "no SIGTERM handler; shutdown will not be clean");
+            std::future::pending().await
+        }
+    };
+    let mut int = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "no SIGINT handler");
+            // SIGTERM still works, and it is the one the service manager
+            // sends, so this is a degraded shutdown rather than none.
+            term.recv().await;
+            return "SIGTERM";
+        }
+    };
+
+    tokio::select! {
+        _ = term.recv() => "SIGTERM",
+        _ = int.recv() => "SIGINT",
+    }
+}
+
+#[cfg(not(unix))]
+async fn stop_signal() -> &'static str {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => "CTRL-C",
+        Err(e) => {
+            tracing::warn!(error = %e, "no ctrl-c handler; shutdown will not be clean");
+            std::future::pending().await
+        }
+    }
 }
 
 /// Tracing from the first commit. `ANCHOR_LOG` overrides `RUST_LOG`.
