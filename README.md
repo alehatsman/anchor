@@ -152,6 +152,7 @@ Nothing here should ever be read as more than that.
 | [docs/06-teleport-seam.md](docs/06-teleport-seam.md) | where the two actually meet |
 | [docs/07-lifecycle.md](docs/07-lifecycle.md) | who starts anchord, and what restart does not save |
 | [docs/08-testing.md](docs/08-testing.md) | why a green suite is not evidence, and what to check instead |
+| [docs/09-windows.md](docs/09-windows.md) | what a Windows port would cost, and the decision it waits on |
 | [ROADMAP.md](ROADMAP.md) | milestones, each retiring one risk |
 
 ## License
