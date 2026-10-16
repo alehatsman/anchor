@@ -285,17 +285,40 @@ the costs visible rather than discovered during a port.
 Deferring this is not neutral downstream, and the dependency runs the other
 way from how it looks.
 
-teleport's in-process PTY layer is its **only** Windows session path while
-anchord is Unix-only. teleport#107 — `daemon/src/lib.rs` declaring
-`pub mod anchor_client;` ungated while that module imports
-`tokio::net::UnixStream` — was going to be resolved by "this compiles on
-Windows because anchor has an arm there". With Windows deferred, that
-resolution is unavailable, and the honest options narrow to two:
+teleport's in-process PTY layer is its only **possible** Windows session
+path while anchord is Unix-only. Possible, not working: `teleportd` does not
+currently compile on Windows at all.
 
-- **teleport keeps its in-process layer as the Windows path**, gated, and
-  the deletion becomes a Unix-only deletion rather than a removal.
+Checked rather than assumed, 2026-10-16. teleport's CI builds
+`windows-latest` (`.github/workflows/ci.yml:39`) and the `daemon
+(windows-latest)` job is red with `error[E0432]: unresolved import
+tokio::net::UnixStream` at `daemon/src/anchor_client.rs:29`. That is
+teleport#107, and it is a build break rather than a missing feature.
+
+The sequence matters: teleport's Windows PTY work is **proven** — W1 and S4
+were both verified on real Windows 11 build 26200, and
+`pty_primitive_windows.rs` ran there. The anchor client is what broke the
+build, by declaring four ungated `anchor_*` modules in
+`daemon/src/lib.rs:7-10`. anchor's integration took teleport's Windows build
+down, and this deferral leaves it down.
+
+**This also reverses the argument against the obvious fix.** `#[cfg(unix)]`
+on the anchor modules was rejected as self-defeating, correctly, *while the
+deletion was going ahead* — gating them is only right if the in-process layer
+stays as the Windows path, and the deletion would have removed it. With
+Windows deferred here, the in-process layer stays. The gate is now simply the
+fix, and it needs nothing from anchor.
+
+So the options are narrower than they look:
+
+- **teleport keeps its in-process layer as the Windows path**, cfg-gates the
+  anchor modules, and the deletion becomes a Unix-only deletion rather than a
+  removal. This restores a build that used to work and depends on nothing
+  here.
 - **teleport states that teleportd is Unix-only too**, and the deletion
-  proceeds as specified.
+  proceeds as specified — in which case the Windows CI job should be dropped
+  rather than left red, since a permanently failing job is a gate nobody can
+  read.
 
 Both are teleport's call, not anchor's. What anchor owes them is the fact,
 not the choice: anchord will not host a session on Windows, and no date is
