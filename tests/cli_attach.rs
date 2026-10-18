@@ -525,3 +525,132 @@ fn a_relative_cwd_is_resolved_before_it_is_sent() {
         "`.` did not resolve to the client's own directory"
     );
 }
+
+/// Sets a pty's size, the way a terminal emulator does when its window
+/// moves.
+fn set_window_size(fd: i32, cols: u16, rows: u16) {
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCSWINSZ with a winsize this test owns, on a pty it opened.
+    assert_eq!(
+        unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &size) },
+        0,
+        "setting the window size"
+    );
+}
+
+/// Polls `get` until the session reports `(cols, rows)`. Returns what it
+/// last saw, so the caller's assertion is the one that reports the
+/// failure.
+fn await_size(client: &mut Client, id: &str, want: (u16, u16), timeout: Duration) -> (u16, u16) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let got = client.call("get", json!({ "session": id })).expect("get");
+        let session = &got["session"];
+        let seen = (
+            session["cols"].as_u64().expect("cols") as u16,
+            session["rows"].as_u64().expect("rows") as u16,
+        );
+        if seen == want || Instant::now() >= deadline {
+            return seen;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Resizing the window after attaching reaches the PTY.
+///
+/// `anchor attach` used to size the session exactly once, before the
+/// replay, and then install nothing: resize the terminal afterwards and
+/// the child kept rendering at the size it had when you attached --
+/// wrapped lines, a status bar in the wrong row, a full-screen TUI drawing
+/// outside the visible area, and no way back but detaching and attaching
+/// again (anchor#15).
+///
+/// Driven through a real pty for the same reason as the raw-mode test:
+/// over pipes `window_size` returns `None` and the whole path is skipped.
+/// The `SIGWINCH` is sent by hand because this pty has no controlling
+/// session for the kernel to deliver one to -- which is the one thing a
+/// real terminal does differently, and not the thing under test.
+#[test]
+fn a_resize_after_attaching_reaches_the_session() {
+    let daemon = Daemon::start("sigwinch");
+    let mut client = daemon.client();
+    let created = client
+        .call(
+            "create",
+            json!({
+                "spec": {
+                    "command": "/bin/sh",
+                    "args": ["-c", "stty raw -echo; echo banner; cat"],
+                    "cwd": "/tmp",
+                    // Deliberately neither of the sizes below, so the
+                    // attach-time resize is visible too.
+                    "cols": 60,
+                    "rows": 20,
+                },
+            }),
+        )
+        .expect("create");
+    let id = created["session"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
+
+    let (master, slave) = open_pty();
+    // openpty leaves the size at 0x0, which `window_size` reports as "not
+    // a size" -- so without this the client would send nothing and the
+    // test would be measuring the wrong silence.
+    set_window_size(master, 80, 24);
+
+    // SAFETY: `slave` is a live fd; each `Stdio` takes its own dup.
+    let (stdin, stdout) = unsafe {
+        use std::os::fd::FromRawFd;
+        (
+            Stdio::from(std::os::fd::OwnedFd::from_raw_fd(libc::dup(slave))),
+            Stdio::from(std::os::fd::OwnedFd::from_raw_fd(libc::dup(slave))),
+        )
+    };
+    let mut attach = Command::new(bin("anchor"))
+        .args(["--socket", daemon.socket().to_str().unwrap(), "attach", &id])
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning anchor attach");
+
+    // The attach-time resize is also the signal that the client is up and
+    // holds the lease: without it, the SIGWINCH below would race the
+    // attach and fail for the wrong reason.
+    assert_eq!(
+        await_size(&mut client, &id, (80, 24), Duration::from_secs(10)),
+        (80, 24),
+        "attach never sized the session to its terminal"
+    );
+
+    set_window_size(master, 120, 50);
+    // SAFETY: signalling a child this test spawned.
+    assert_eq!(
+        unsafe { libc::kill(attach.id() as i32, libc::SIGWINCH) },
+        0,
+        "signalling the attach"
+    );
+
+    assert_eq!(
+        await_size(&mut client, &id, (120, 50), Duration::from_secs(10)),
+        (120, 50),
+        "the window moved and the session never heard about it"
+    );
+
+    let _ = attach.kill();
+    let _ = attach.wait();
+    // SAFETY: fds this test opened.
+    unsafe {
+        libc::close(master);
+        libc::close(slave);
+    }
+}

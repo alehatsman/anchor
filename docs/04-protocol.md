@@ -229,7 +229,10 @@ connection that can prove nothing about a lease held on another.
 
 - **While someone holds the lease**, the holder resizes with a `resize`
   frame (`0x05`) on its own attached connection, where the lease is already
-  known. The control op is refused with `lease_held`.
+  known. The control op is refused with `lease_held`. `anchor attach` sends
+  one of these for every `SIGWINCH` it sees, which is what keeps the PTY
+  the size of the window rather than the size the window was at attach
+  time.
 - **While the lease is free**, the control op is accepted. That is the
   case where a client sizes a session to its terminal *before* attaching,
   and with no holder there is nobody to protect.

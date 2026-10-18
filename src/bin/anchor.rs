@@ -339,7 +339,12 @@ fn attach(
 ) -> Result<()> {
     // Match the session to this terminal before any output arrives, so the
     // replay is painted at the width it will keep.
+    //
+    // Watching starts before the size is read, so a resize racing the
+    // attach is remembered rather than lost: the stdin loop below sends
+    // whatever the handler recorded.
     if want_control {
+        tty::watch_resizes();
         if let Some((cols, rows)) = tty::window_size() {
             let mut control = Client::connect(socket)?;
             let _ = control.call(
@@ -403,6 +408,17 @@ fn attach(
             // for input, which arrives as readability.
             if ended.load(Ordering::Acquire) {
                 break;
+            }
+            // The window moved. One frame per observed change, carrying
+            // the size the terminal has now — the daemon coalesces the
+            // rest, and a drag that produced a hundred signals while this
+            // was blocked in `poll` is one frame here.
+            if tty::take_resize() {
+                if let Some((cols, rows)) = tty::window_size() {
+                    if write_resize(&mut writer, cols, rows).is_err() {
+                        break;
+                    }
+                }
             }
             match stdin_readable(STDIN_POLL) {
                 Readable::Yes => {}
@@ -494,6 +510,24 @@ fn write_input(writer: &mut std::os::unix::net::UnixStream, bytes: &[u8]) -> Res
         .write_all(&frame::encode(frame::INPUT, 0, bytes))
         .context("sending input")?;
     writer.flush().context("flushing input")
+}
+
+/// Writes one resize frame.
+///
+/// A frame on the attached connection rather than the `resize` control op:
+/// the lease is per-connection, and this is the connection that holds it
+/// (`docs/04-protocol.md`). The op would arrive on a different one and be
+/// refused with `lease_held` — by us, against ourselves.
+fn write_resize(writer: &mut std::os::unix::net::UnixStream, cols: u16, rows: u16) -> Result<()> {
+    use std::io::Write;
+    writer
+        .write_all(&frame::encode(
+            frame::RESIZE,
+            0,
+            &frame::encode_size(cols, rows),
+        ))
+        .context("sending a resize")?;
+    writer.flush().context("flushing a resize")
 }
 
 /// Writes output frames to stdout, unparsed, until the stream ends.

@@ -161,6 +161,47 @@ impl Drop for RawMode {
     }
 }
 
+/// Set by the `SIGWINCH` handler; cleared by whoever acts on it.
+///
+/// A flag rather than a self-pipe because the attach loop already polls
+/// stdin on a short timeout, so it has a place to ask. `signal()` installs
+/// a BSD-style handler — restarting, on the platforms anchor runs on — so
+/// the poll is not reliably interrupted and the flag is what carries the
+/// news across. The cost is that a resize lands within one poll timeout
+/// rather than instantly, which is below what a redraw is visible at.
+static RESIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records that the terminal changed size. Async-signal-safe: one atomic
+/// store, no allocation and no locks.
+extern "C" fn note_resize(_signum: libc::c_int) {
+    RESIZED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Starts watching for terminal size changes, for [`take_resize`].
+///
+/// Install this **before** reading the size for the first time, not after:
+/// a resize between the read and the handler would otherwise be the one
+/// change nothing ever hears about, and the session would stay the wrong
+/// size until the user resized again.
+pub fn watch_resizes() {
+    // SAFETY: installing a handler that only stores to an atomic.
+    unsafe {
+        libc::signal(
+            libc::SIGWINCH,
+            note_resize as *const () as libc::sighandler_t,
+        )
+    };
+}
+
+/// Takes the pending size change, if there is one, and clears it.
+///
+/// Coalescing is the point: a drag across the screen is hundreds of
+/// signals and one size that matters — the one the terminal has when the
+/// caller asks.
+pub fn take_resize() -> bool {
+    RESIZED.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
 /// The terminal's current size, for the initial resize and for SIGWINCH.
 /// `None` when stdout is not a terminal.
 pub fn window_size() -> Option<(u16, u16)> {
