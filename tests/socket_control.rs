@@ -1,5 +1,9 @@
 //! M0 exit criterion: the daemon binds, a client connects, control framing
 //! answers. `ping` is the only op in M0; everything else is a clean error.
+//!
+//! Unix-only: it drives a real unix socket and a real `/bin/sh`. On
+//! Windows the transport is a named pipe (docs/09-windows.md §3).
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -294,10 +298,11 @@ async fn an_oversized_line_is_answered_then_the_connection_is_closed() {
     let padding = "x".repeat(2 * 1024 * 1024);
     let line = format!(r#"{{"id":7,"op":"ping","pad":"{padding}"}}"#) + "\n";
 
-    // The write is expected to fail partway: the daemon answers and closes
-    // at the cap, long before the client has finished sending. A client
-    // must drain the reply anyway rather than reading `EPIPE` as "the
-    // daemon died" -- which is the mistake the answer exists to prevent.
+    // The write may fail partway: the daemon answers at the cap and drains
+    // only so much before it closes, so a long enough line still meets
+    // `EPIPE`. A client must read the reply anyway rather than taking the
+    // failed write as "the daemon died" -- the mistake the answer exists to
+    // prevent.
     let _ = client.writer.write_all(line.as_bytes());
     let _ = client.writer.flush();
 

@@ -3,7 +3,9 @@
 Unix socket, `$XDG_RUNTIME_DIR/anchor.sock`, fallback
 `$XDG_DATA_HOME/anchor/anchor.sock`. Loopback equivalent; no TCP, no TLS, no
 auth. Filesystem permissions (0600) are the security boundary — see
-[01-scope.md](01-scope.md): remote access is a client's job.
+[01-scope.md](01-scope.md): remote access is a client's job. On Windows, a
+named pipe whose DACL is the same boundary: see
+[below](#windows-a-named-pipe).
 
 **A variable that is set but empty does not count as set.** Both lookups
 treat `""` as absent and fall through (`non_empty_env`, `src/paths.rs`).
@@ -18,7 +20,60 @@ Clients resolve this themselves rather than asking anchord, because the
 resolution is how you *find* anchord. Any client that gets it wrong is
 wrong before there is anyone to ask.
 
-Two framings on one socket:
+## Windows: a named pipe
+
+On Windows the transport is a named pipe, not a socket. **The wire protocol
+is identical**: the same newline-delimited JSON, the same switch to binary
+frames after `attach`, byte for byte. Only how a client finds anchord and
+decides to trust it differs, and that is the whole of this section. Why each
+rule exists is [09-windows.md](09-windows.md) §3–§4.
+
+**The name.** `\\.\pipe\anchor-<SID>`, where `<SID>` is the string form
+(`S-1-5-21-…`) of the user SID in the client's own process token
+(`TokenUser`, as `ConvertSidToStringSidW` writes it). Per user, because the
+pipe namespace is machine-global. No environment variable changes it; the
+CLI's `--socket` takes a full pipe path (`\\.\pipe\…`) instead, and refuses
+anything else.
+
+**Connecting.** Open the name with `CreateFileW`, `GENERIC_READ |
+GENERIC_WRITE`, `OPEN_EXISTING`, and `SECURITY_SQOS_PRESENT |
+SECURITY_IDENTIFICATION` in the flags — so a server cannot impersonate the
+client at more than identification level. tokio's `ClientOptions` sets
+exactly these by default; do not override `security_qos_flags`.
+
+- `ERROR_FILE_NOT_FOUND`: no anchord is running for this user.
+- `ERROR_PIPE_BUSY`: every instance is mid-handoff. Retry briefly; anchord
+  always has a listening instance between connections.
+- `ERROR_ACCESS_DENIED`: the pipe exists and is not yours to open. anchord
+  grants nobody but its owner, so this is someone else's pipe at your name.
+  Treat it as an error, not as "not running".
+
+**Verifying, before the first byte is sent.** Read the pipe's owner from the
+handle you opened (`GetSecurityInfo(handle, SE_KERNEL_OBJECT,
+OWNER_SECURITY_INFORMATION, …)`) and require it to be **equal to your own
+user SID** (`EqualSid`). anchord sets the owner explicitly when it creates
+the pipe, and only a process running as you — or one holding a privilege
+that already owns the machine — can create a pipe owned by you. A mismatch
+means another user created the name first: close the handle and refuse.
+Sending a request first would hand that process whatever the request
+carries.
+
+**What anchord guarantees on its side**, so a client need not check it: the
+pipe's DACL grants your SID and nothing else (no Administrators, no SYSTEM,
+no Everyone); the first instance is created with
+`FILE_FLAG_FIRST_PIPE_INSTANCE`, so anchord **fails to start** if the name
+is already taken rather than probing and replacing it; remote clients are
+rejected (`PIPE_REJECT_REMOTE_CLIENTS`); it is byte mode; and anchord never
+impersonates a client.
+
+**Ending a blocked read.** There is no `shutdown`. A client that must end a
+read from another thread — a detach from a quiet session — cancels it
+(`CancelIoEx`, or dropping the tokio handle) rather than waiting for output
+that may never come.
+
+## Framing
+
+Two framings on one connection:
 
 - **control** — newline-delimited JSON, request/response, correlated by `id`
 - **stream** — after `attach`, the connection switches to binary frames
@@ -115,9 +170,12 @@ desynchronised mid-line: the rest of that line was never read, so anything
 following it would be parsed as the next request and every request after
 would be off by one.
 
-A client sending one will usually see its own write fail before it finishes
-— the daemon answers and closes at the cap, with megabytes still in flight.
-The reply is already on the wire. **Read it before acting on the write
+A client sending one may see its own write fail before it finishes — the
+daemon answers at the cap, ends its side, and drains at most 16 MiB or 2 s
+of what is still arriving before it closes. (The drain is there because
+closing a unix socket with unread input makes Linux reset the connection,
+which can discard the reply before the client reads it.) The reply is
+already on the wire. **Read it before acting on the write
 error**, or the one case the daemon took care to report arrives looking
 exactly like the daemon dying.
 
@@ -338,13 +396,20 @@ not recorded by then the reply goes out anyway, so a client must check
 `already_exited`.
 
 `attach` restores the terminal on the way out, including when it is
-**signalled** rather than exited — `SIGTERM` and `SIGHUP` restore the saved
-attributes and then re-raise, so the process still looks killed to whatever
-was waiting on it. A terminal left raw outlives the process that did it,
-and a client attached to a long-running session is the thing someone kills
-from another window. `SIGINT` and `SIGQUIT` are deliberately not handled:
-in raw mode ^C and ^\ are bytes for the session, not signals to the
-client.
+**signalled** rather than exited — `SIGTERM`, `SIGHUP`, `SIGINT` and
+`SIGQUIT` restore the saved attributes and then re-raise, so the process
+still looks killed to whatever was waiting on it. A terminal left raw
+outlives the process that did it, and a client attached to a long-running
+session is the thing someone kills from another window. The keyboard cannot
+raise `SIGINT` or `SIGQUIT` here — in raw mode ^C and ^\ are bytes for the
+session — but `kill -INT` from another window can (`RESTORE_SIGNALS`,
+`src/tty/unix.rs`).
+
+On Windows the same restore runs from a console control handler on close,
+logoff, shutdown and Ctrl-Break; Ctrl-C is a byte for the session, as on
+Unix. Raw mode there also switches the console to UTF-8 and VT input, and
+output to VT processing — for an observer too, since a Windows console
+interprets escape sequences only when asked (`src/tty/windows.rs`).
 
 `attach` is raw-mode passthrough: local keystrokes go to the PTY as the exact
 bytes the local terminal produced, and output goes to stdout unparsed. **No VT

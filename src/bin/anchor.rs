@@ -2,7 +2,7 @@
 //! and scripts.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
-use anchor::client::Client;
+use anchor::client::{Client, Stream};
 use anchor::paths::Paths;
 use anchor::proto::frame;
 use anchor::tty::{self, EscapeScanner, RawMode};
@@ -20,7 +20,8 @@ use anchor::tty::{self, EscapeScanner, RawMode};
 #[command(name = "anchor", about = "Talk to anchord", version)]
 struct Cli {
     /// Control socket: the one to connect to, or for `daemon` the one to
-    /// bind. `service` ignores it. Defaults to the usual resolution.
+    /// bind. `service` ignores it. Defaults to the usual resolution. On
+    /// Windows, a named pipe: `\\.\pipe\<name>`.
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
     #[command(subcommand)]
@@ -130,6 +131,9 @@ fn main() -> Result<()> {
     // has to surface as an ordinary error so the raw-mode guard unwinds
     // (src/tty.rs). `daemon` keeps it too: a client hanging up must be an
     // error on that connection, never the death of the daemon.
+    //
+    // Windows has no SIGPIPE: a write to a closed pipe is already an error.
+    #[cfg(unix)]
     if !matches!(cli.command, Command::Attach { .. } | Command::Daemon) {
         // SAFETY: restoring the default disposition, before any thread runs.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
@@ -349,7 +353,7 @@ fn create(
 }
 
 fn logs(client: &mut Client, id: &str, mut from: u64) -> Result<()> {
-    let mut stdout = std::io::stdout().lock();
+    let mut stdout = tty::output();
     loop {
         let response = session_call(
             client,
@@ -443,6 +447,11 @@ fn attach(
     // kills it. The terminal's output post-processing then turns the
     // session's `\r\n` into `\r\r\n`, and a carriage return at column 0 is
     // a no-op, so what the observer sees is unchanged.
+    //
+    // Output is a separate question, and on Windows not a free one: a
+    // console interprets escape sequences only when asked, so controller
+    // and observer alike ask. A no-op on Unix.
+    let _vt = tty::vt_output()?;
     let _raw = if has_control { RawMode::enter()? } else { None };
 
     // Split rather than re-wrap: the control reader may already hold the
@@ -482,7 +491,7 @@ fn attach(
 
     if has_control {
         let mut scanner = EscapeScanner::new();
-        let mut stdin = std::io::stdin().lock();
+        let mut keyboard = tty::Keyboard::new();
         let mut buf = [0u8; 1024];
         loop {
             // Wait for a keystroke *or* for the session to end, rather
@@ -503,14 +512,10 @@ fn attach(
                     }
                 }
             }
-            match stdin_readable(STDIN_POLL) {
-                Readable::Yes => {}
-                Readable::NotYet => continue,
-                Readable::Closed => break,
-            }
-            let read = match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
+            let read = match keyboard.read(&mut buf, STDIN_POLL) {
+                tty::Input::Bytes(n) => n,
+                tty::Input::Idle => continue,
+                tty::Input::Closed => break,
             };
             let (forward, detach) = scanner.feed(&buf[..read]);
             if !forward.is_empty() && write_input(&mut writer, &forward).is_err() {
@@ -546,58 +551,13 @@ fn attach(
     result
 }
 
-/// How long [`stdin_readable`] waits before returning so the caller can
-/// re-check whether the session ended. Short enough that a finished
-/// session closes the terminal promptly, long enough not to spin.
-const STDIN_POLL: libc::c_int = 100;
-
-/// Outcome of waiting for stdin to become readable.
-enum Readable {
-    /// There are bytes to read.
-    Yes,
-    /// The wait expired with nothing to read.
-    NotYet,
-    /// stdin is gone, or the wait failed in a way retrying will not fix.
-    Closed,
-}
-
-/// Waits up to `timeout_ms` for stdin to become readable.
-///
-/// `read` on stdin cannot be interrupted by another thread, so a blocking
-/// read would outlive the session it belongs to. Polling the descriptor
-/// leaves the read itself blocking-but-ready, which keeps the input path
-/// byte-for-byte what it was.
-fn stdin_readable(timeout_ms: libc::c_int) -> Readable {
-    let mut fds = libc::pollfd {
-        fd: libc::STDIN_FILENO,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one initialised `pollfd`, and the count matches.
-    let ready = unsafe { libc::poll(&raw mut fds, 1, timeout_ms) };
-    if ready < 0 {
-        // EINTR is a signal, not a failure: the caller re-checks and waits
-        // again rather than treating a suspend/resume as end-of-input.
-        return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            Readable::NotYet
-        } else {
-            Readable::Closed
-        };
-    }
-    if ready == 0 {
-        return Readable::NotYet;
-    }
-    // HUP without data still means read() will report EOF, so let the
-    // caller's `read` observe it rather than deciding here.
-    if fds.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-        Readable::Yes
-    } else {
-        Readable::NotYet
-    }
-}
+/// How long one wait for keystrokes lasts before the loop re-checks whether
+/// the session ended. Short enough that a finished session closes the
+/// terminal promptly, long enough not to spin.
+const STDIN_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Writes one input frame to the PTY.
-fn write_input(writer: &mut std::os::unix::net::UnixStream, bytes: &[u8]) -> Result<()> {
+fn write_input(writer: &mut Stream, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     writer
         .write_all(&frame::encode(frame::INPUT, 0, bytes))
@@ -611,7 +571,7 @@ fn write_input(writer: &mut std::os::unix::net::UnixStream, bytes: &[u8]) -> Res
 /// the lease is per-connection, and this is the connection that holds it
 /// (`docs/04-protocol.md`). The op would arrive on a different one and be
 /// refused with `lease_held` — by us, against ourselves.
-fn write_resize(writer: &mut std::os::unix::net::UnixStream, cols: u16, rows: u16) -> Result<()> {
+fn write_resize(writer: &mut Stream, cols: u16, rows: u16) -> Result<()> {
     use std::io::Write;
     writer
         .write_all(&frame::encode(
@@ -629,7 +589,7 @@ fn write_resize(writer: &mut std::os::unix::net::UnixStream, cols: u16, rows: u1
 /// detach, a daemon that died and a desynchronised stream all look the same:
 /// a failed read. The caller knows which of them it caused.
 fn pump_output(mut frames: anchor::client::FrameStream) -> Result<()> {
-    let mut stdout = std::io::stdout().lock();
+    let mut stdout = tty::output();
     loop {
         let (tag, _offset, payload) = frames
             .read_frame()

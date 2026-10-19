@@ -145,15 +145,40 @@ fn arm_stop_signal() -> impl std::future::Future<Output = &'static str> {
     }
 }
 
-#[cfg(not(unix))]
+/// The Windows counterpart: console control events rather than signals,
+/// registered *now* for the same reason as the Unix arm -- the pipe is
+/// connectable the moment it is bound.
+///
+/// Ctrl-C and Ctrl-Break for a daemon in the foreground; close, logoff and
+/// shutdown for the console or session going away under it, which gives the
+/// handler a few seconds before the system ends the process. That is the
+/// only stop Windows announces: Task Scheduler's "End" and `taskkill /F` are
+/// `TerminateProcess`, which nothing can catch, so those exits get no final
+/// fsync -- the periodic one is what bounds the loss.
+#[cfg(windows)]
 fn arm_stop_signal() -> impl std::future::Future<Output = &'static str> {
-    async {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => "CTRL-C",
-            Err(e) => {
-                tracing::warn!(error = %e, "no ctrl-c handler; shutdown will not be clean");
-                std::future::pending().await
-            }
+    use tokio::signal::windows;
+
+    // A failure to install one is not a reason to refuse to serve, as on
+    // Unix; that event simply keeps its default.
+    let mut c = windows::ctrl_c()
+        .map_err(|e| tracing::warn!(error = %e, "no ctrl-c handler; shutdown will not be clean"))
+        .ok();
+    let mut brk = windows::ctrl_break().ok();
+    let mut close = windows::ctrl_close().ok();
+    let mut logoff = windows::ctrl_logoff().ok();
+    let mut shutdown = windows::ctrl_shutdown().ok();
+
+    async move {
+        // A listener that was never installed yields `None`, which disables
+        // its branch rather than ending the wait.
+        tokio::select! {
+            Some(()) = async { c.as_mut()?.recv().await } => "CTRL-C",
+            Some(()) = async { brk.as_mut()?.recv().await } => "CTRL-BREAK",
+            Some(()) = async { close.as_mut()?.recv().await } => "CTRL-CLOSE",
+            Some(()) = async { logoff.as_mut()?.recv().await } => "CTRL-LOGOFF",
+            Some(()) = async { shutdown.as_mut()?.recv().await } => "CTRL-SHUTDOWN",
+            else => std::future::pending().await,
         }
     }
 }

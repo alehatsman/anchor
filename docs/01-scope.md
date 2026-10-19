@@ -58,7 +58,8 @@ Only the things that cannot be correct in a client:
 - not a terminal multiplexer (tmux, zellij)
 - not a remote access product (teleport, ssh)
 - not a scheduler (cron, systemd timers)
-- not multi-user — one user, one daemon, unix socket (mode 0600), no TCP
+- not multi-user — one user, one daemon, unix socket (mode 0600) or, on
+  Windows, a named pipe only its user can open; no TCP
 
 ## Open questions
 

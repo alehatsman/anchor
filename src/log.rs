@@ -440,6 +440,10 @@ fn create_dir_owner_only(dir: &Path) -> Result<()> {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("setting owner-only permissions on {}", dir.display()))?;
     }
+    // The data dir's DACL is inheritable, so this already holds; set
+    // explicitly anyway, for the same not-relying-on-the-parent reason.
+    #[cfg(windows)]
+    crate::winsec::restrict_to_current_user(dir)?;
     Ok(())
 }
 

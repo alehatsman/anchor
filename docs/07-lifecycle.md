@@ -32,8 +32,16 @@ anchor service status      what is registered; on macOS, only whether it is load
 
 - **macOS** — a launchd **user agent** in `~/Library/LaunchAgents`.
 - **Linux** — a systemd **user unit** in `~/.config/systemd/user`.
+- **Windows** — a **Task Scheduler task** named `anchord`, triggered by this
+  user's logon, running `conhost.exe --headless anchord.exe` under the
+  user's interactive token at least privilege. The XML it was registered
+  from is kept as `%LOCALAPPDATA%\anchor\anchord.task.xml`, which is what
+  `install` compares against. How each choice was arrived at, and checked,
+  is [09-windows.md](09-windows.md) §4.7.
 
-Both are **login-scoped and need no root**. A boot-scoped unit (launchd's
+All three are **login-scoped and need no root** (on Windows, no
+elevation: a logon trigger scoped to this user's SID is what a standard
+user may register; an unscoped one is `Access is denied`). A boot-scoped unit (launchd's
 `LaunchDaemons`, or systemd lingering) starts sessions for a user who is not
 logged in, needs elevation to install, and is a different product decision
 than this one. `install` therefore never enables lingering and never writes
@@ -45,7 +53,10 @@ asking to *be* supervised, and writing the one file that asks.
 
 ## Restart, and what it does not save
 
-The unit restarts anchord if it exits. That is worth having — the next
+The unit restarts anchord if it exits. On Windows "restarts" means within a
+minute: Task Scheduler's own `RestartOnFailure` was observed not to revive
+a killed anchord, so the task repeats every minute under `IgnoreNew`, which
+is a no-op while anchord runs. That is worth having — the next
 session works without anyone noticing — but be exact about what it does not
 do:
 
@@ -85,6 +96,13 @@ unsynced until the kernel writes it back. Neither case loses data to a
 process death — the page cache outlives the process — but only the clean
 path survives the machine losing power a moment later.
 
+**Windows has no SIGTERM.** anchord treats the console control events the
+same way — Ctrl-C and Ctrl-Break in the foreground, and close, logoff and
+shutdown when the console or the session goes away — and unwinds to the
+same final fsync. What Windows does not announce cannot be handled:
+`TerminateProcess` (Task Manager, `taskkill /F`, `anchor service
+uninstall`) ends the process outright, as SIGKILL does.
+
 What it deliberately does **not** do:
 
 - **It does not unlink the socket.** The next daemon already probes a socket
@@ -117,7 +135,14 @@ What it deliberately does **not** do:
   reloaded, but systemd will not restart an already-running service, so the
   old anchord keeps going until it next stops. The platforms differ here
   deliberately: converging them means restarting anchord on Linux too, which
-  would kill sessions to fix a cosmetic inconsistency.
+  would kill sessions to fix a cosmetic inconsistency. Windows behaves like
+  Linux: re-registering a task (`schtasks /Create /F`) was observed to leave
+  the running anchord serving, so a changed registration applies at its
+  next start.
+- **Uninstall stops anchord on every platform.** On Windows that has to be
+  done by hand: `schtasks /End` stops the headless conhost and leaves
+  anchord serving as an orphan (observed), so `uninstall` finds anchord as
+  the server of this user's own owner-verified pipe and terminates it.
 - **The binary path is recorded absolutely**, resolved from the running
   executable. A relative path resolves against the service manager's working
   directory, not the user's.
@@ -125,7 +150,8 @@ What it deliberately does **not** do:
   be removed by the next build, which breaks the unit with no error until
   the next login.
 - **Paths containing spaces** must survive the unit file's quoting rules.
-  Both formats have them and they are not the same rules.
+  All three formats have them and they are not the same rules; on Windows
+  the path is also re-split by conhost, so it is quoted inside the arguments.
 - **Uninstall removes only what install wrote**, and is not an error when
   nothing is installed.
 - **An unsupported platform says so**, rather than succeeding and doing

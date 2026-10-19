@@ -1,13 +1,11 @@
 //! PTY integration fixtures. The rules they defend live in docs/03-pty.md;
 //! the rules about *how* to write them live in docs/08-testing.md.
 //!
-//! Unix-only, and that is a scope decision rather than a gap in coverage:
-//! anchord is Unix-only as of 2026-10-16 (docs/09-windows.md). Should that
-//! reopen, these fixtures are the ones that get a Windows twin -- teleport's
-//! `pty_primitive_windows.rs` already ran against real Windows 11, and its
-//! `#W1` (a gracefully-exiting ConPTY child never observed as exited) was
-//! resolved on 2026-09-05 in teleport#9, so no exit-code fixture here is
-//! blocked on anything upstream.
+//! Unix-only: these drive `/bin/sh`, `stty` and process groups. The Windows
+//! twin is `tests/pty_primitive_windows.rs`, lifted from teleport along with
+//! the ConPTY code it tests (docs/09-windows.md §1). One fixture here has no
+//! twin and never will: ConPTY has no raw input mode, so a byte-exact
+//! `0..256` round trip cannot be reproduced through it.
 
 #![cfg(unix)]
 

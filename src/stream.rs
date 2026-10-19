@@ -16,9 +16,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::server::{ConnRead, ConnWrite};
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::proto::frame;
 use crate::session::{ReplayStep, Session};
@@ -88,8 +88,8 @@ fn write_timeout() -> Duration {
 /// needs a reconnect to count as the same holder layers that above anchor —
 /// see docs/06-teleport-seam.md.
 pub async fn serve_attached(
-    mut out: OwnedWriteHalf,
-    input: OwnedReadHalf,
+    mut out: ConnWrite,
+    input: ConnRead,
     // Bytes the client pipelined after its attach line, already read off the
     // socket by the control loop's buffered reader.
     buffered: Vec<u8>,
@@ -173,7 +173,7 @@ pub async fn serve_attached(
 
 /// Catch-up rounds, then the live subscription, then `exit`.
 async fn pump_output(
-    out: &mut OwnedWriteHalf,
+    out: &mut ConnWrite,
     session: &Arc<Session>,
     from: u64,
     timeout: Duration,
@@ -474,7 +474,7 @@ async fn pump_input(
 }
 
 async fn write_frame(
-    out: &mut OwnedWriteHalf,
+    out: &mut ConnWrite,
     timeout: Duration,
     tag: u8,
     offset: u64,

@@ -13,9 +13,25 @@
 //! [`bind`] is deliberately synchronous and returns a `std` listener, so a
 //! caller can claim the socket — and fail loudly if another daemon already
 //! holds it — before any runtime exists. [`serve`] adopts it.
+//!
+//! **On Windows the socket is a named pipe** (docs/09-windows.md §3), and
+//! `0600` is spelled as a DACL granting the creating user's SID and nothing
+//! else (`winsec`). Still no auth and no TCP: the OS is the boundary on both
+//! kernels. Two Unix behaviours are deliberately *not* ported. A stale
+//! socket is probed and replaced; a taken pipe name is refused, because on
+//! Windows replacing it is the same act as being squatted (§4.2). And there
+//! is no length limit to check.
+//!
+//! The seam is a type alias per platform — [`Listener`], [`ConnRead`],
+//! [`ConnWrite`] — not a trait. Every use site needs only read, write and
+//! split, and a trait would buy dynamic dispatch on the attach path for an
+//! abstraction nothing calls (§3.1). Platform code stays in this file and
+//! in `client.rs`.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -24,11 +40,33 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use tokio::net::UnixListener;
 
 use crate::proto::{self, ErrorCode, Request, SpecWire};
 use crate::session::{CreateError, SessionManager};
 use crate::store::Store;
+
+/// What [`bind`] claims and [`serve`] accepts on.
+#[cfg(unix)]
+pub type Listener = StdUnixListener;
+/// What [`bind`] claims and [`serve`] accepts on.
+#[cfg(windows)]
+pub type Listener = PipeListener;
+
+/// The read half of one client connection.
+#[cfg(unix)]
+pub type ConnRead = tokio::net::unix::OwnedReadHalf;
+/// The read half of one client connection.
+#[cfg(windows)]
+pub type ConnRead = tokio::io::ReadHalf<tokio::net::windows::named_pipe::NamedPipeServer>;
+
+/// The write half of one client connection.
+#[cfg(unix)]
+pub type ConnWrite = tokio::net::unix::OwnedWriteHalf;
+/// The write half of one client connection.
+#[cfg(windows)]
+pub type ConnWrite = tokio::io::WriteHalf<tokio::net::windows::named_pipe::NamedPipeServer>;
 
 /// Everything a connection needs to answer a request.
 #[derive(Clone)]
@@ -82,18 +120,25 @@ impl State {
 /// `too_large` rather than buffered.
 const MAX_LINE_BYTES: u64 = 1024 * 1024;
 
+/// How much of a refused line is read and thrown away after `too_large`,
+/// and for how long, so closing does not reset the reply away.
+const TOO_LARGE_DRAIN_BYTES: u64 = 16 * MAX_LINE_BYTES;
+const TOO_LARGE_DRAIN_TIME: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The usable length of `sockaddr_un.sun_path`, minus the NUL.
 ///
 /// 104 on macOS and the BSDs, 108 on Linux; the smaller is used on both
 /// because a daemon that starts here and not there is worse than one that
 /// gives the same answer everywhere.
+#[cfg(unix)]
 const MAX_SOCKET_PATH: usize = 103;
 
 /// Binds the socket, refusing to displace a daemon that is already running.
 ///
 /// A socket file left behind by a dead daemon is stale: nothing accepts on
 /// it, so it is removed and rebound.
-pub fn bind(socket_path: &Path) -> Result<StdUnixListener> {
+#[cfg(unix)]
+pub fn bind(socket_path: &Path) -> Result<Listener> {
     // Checked before anything else, because the kernel's own answer is
     // `EINVAL` with no mention of length -- which reads as "the path is
     // wrong" rather than "the path is too long", and sends you looking at
@@ -179,6 +224,161 @@ pub fn bind(socket_path: &Path) -> Result<StdUnixListener> {
     Ok(listener)
 }
 
+/// A claimed pipe name: its first instance, and the security every later
+/// instance is created with.
+///
+/// The first instance is a raw handle rather than a tokio server, because
+/// adopting a handle onto tokio needs a runtime and [`bind`] runs before
+/// one exists — the same reason the Unix arm returns a `std` listener.
+#[cfg(windows)]
+pub struct PipeListener {
+    name: std::ffi::OsString,
+    security: crate::winsec::SecurityDescriptor,
+    first: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for PipeListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipeListener")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The pipe prefix every anchor endpoint on Windows must carry. Anything
+/// else handed to `--socket` is a filesystem path, which is a mistake here.
+#[cfg(windows)]
+pub(crate) const PIPE_PREFIX: &str = r"\\.\pipe\";
+
+/// Claims the pipe name, **failing if anything already holds it**.
+///
+/// Not the Unix arm's probe-and-replace. A pipe name that exists is either
+/// a running anchord — refuse, like Unix — or a squatter: another process
+/// that created the name first to receive this user's spawn requests and
+/// session output (docs/09-windows.md §4.2). There is no third case to
+/// tidy up: a pipe vanishes with its last handle, so "stale" does not exist.
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE` makes the create itself fail on a taken
+/// name, so there is no window between checking and claiming.
+///
+/// The pipe is created with an owner-only DACL and this user as its owner
+/// (`SecurityDescriptor::owner_only_pipe`), rejects remote clients, and is
+/// byte mode — the protocol is a byte stream, newline-delimited.
+#[cfg(windows)]
+pub fn bind(pipe: &Path) -> Result<Listener> {
+    let name = pipe.as_os_str().to_os_string();
+    if !name.to_string_lossy().starts_with(PIPE_PREFIX) {
+        bail!(
+            "{} is not a named pipe: on Windows the endpoint is \\\\.\\pipe\\<name>",
+            pipe.display()
+        );
+    }
+    let user = crate::winsec::UserSid::current()?;
+    let security = crate::winsec::SecurityDescriptor::owner_only_pipe(&user)?;
+    match create_first_instance(&name, &security) {
+        Ok(first) => Ok(PipeListener {
+            name,
+            security,
+            first,
+        }),
+        Err(e) => Err(explain_taken(pipe, &e)),
+    }
+}
+
+/// `CreateNamedPipeW` for the first instance, with
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE`. Every flag here must match what
+/// `create_next_instance` asks tokio for, or Windows refuses the later ones.
+#[cfg(windows)]
+fn create_first_instance(
+    name: &std::ffi::OsStr,
+    security: &crate::winsec::SecurityDescriptor,
+) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
+    };
+    use windows_sys::Win32::System::Pipes::{
+        CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    };
+
+    let wide: Vec<u16> = name.encode_wide().chain(Some(0)).collect();
+    let attributes = security.attributes();
+    // SAFETY: a NUL-terminated name and security attributes that outlive the
+    // call; the returned handle is owned below.
+    let handle = unsafe {
+        CreateNamedPipeW(
+            wide.as_ptr(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_UNLIMITED_INSTANCES,
+            PIPE_BUFFER_BYTES,
+            PIPE_BUFFER_BYTES,
+            0,
+            &attributes,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a valid handle this function just created and nothing else owns.
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+}
+
+/// The pipe's in and out buffer sizes: tokio's own default, written down so
+/// the first instance and the rest agree.
+#[cfg(windows)]
+const PIPE_BUFFER_BYTES: u32 = 65536;
+
+/// Every instance after the first, with the same security as the first.
+#[cfg(windows)]
+fn create_next_instance(
+    name: &std::ffi::OsStr,
+    security: &crate::winsec::SecurityDescriptor,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    let mut attributes = security.attributes();
+    // SAFETY: `attributes` points at a descriptor `security` keeps alive for
+    // the duration of the call.
+    unsafe {
+        tokio::net::windows::named_pipe::ServerOptions::new()
+            .pipe_mode(tokio::net::windows::named_pipe::PipeMode::Byte)
+            .reject_remote_clients(true)
+            .in_buffer_size(PIPE_BUFFER_BYTES)
+            .out_buffer_size(PIPE_BUFFER_BYTES)
+            .create_with_security_attributes_raw(name, std::ptr::from_mut(&mut attributes).cast())
+    }
+}
+
+/// Says *who* holds a pipe name that could not be claimed, as far as this
+/// user can tell, without ever displacing it.
+///
+/// Probing is safe in a way removing never is: a connection that closes
+/// costs a real anchord nothing. The probe is the client's own check, so a
+/// pipe this user owns reads as a running daemon and anything else reads as
+/// what it is.
+#[cfg(windows)]
+fn explain_taken(pipe: &Path, error: &std::io::Error) -> anyhow::Error {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY};
+    let taken = matches!(
+        error.raw_os_error().map(|c| c as u32),
+        Some(ERROR_ACCESS_DENIED | ERROR_PIPE_BUSY)
+    );
+    if !taken {
+        return anyhow::anyhow!("creating the pipe {}: {error}", pipe.display());
+    }
+    match crate::client::Stream::connect(pipe) {
+        Ok(_) => anyhow::anyhow!("anchord is already running on {}", pipe.display()),
+        Err(probe) => anyhow::anyhow!(
+            "{} already exists and is not this user's anchord ({probe:#}). Refusing to \
+             start, and not replacing it: on Windows a pipe name someone else holds is \
+             a squatter, not a stale socket (docs/09-windows.md §4.2).",
+            pipe.display()
+        ),
+    }
+}
+
 /// Accepts connections, one task per client, and never returns once setup
 /// succeeds: a failed `accept` is logged and retried, because the ones that
 /// matter (`EMFILE`) are transient and ending the daemon over one would end
@@ -186,7 +386,8 @@ pub fn bind(socket_path: &Path) -> Result<StdUnixListener> {
 ///
 /// Takes the `std` listener from [`bind`] and adopts it onto the runtime this
 /// is polled on.
-pub async fn serve(listener: StdUnixListener, state: State) -> Result<()> {
+#[cfg(unix)]
+pub async fn serve(listener: Listener, state: State) -> Result<()> {
     listener
         .set_nonblocking(true)
         .context("setting the listener non-blocking")?;
@@ -197,7 +398,8 @@ pub async fn serve(listener: StdUnixListener, state: State) -> Result<()> {
             Ok((stream, _addr)) => {
                 let state = state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, state).await {
+                    let (read, write) = stream.into_split();
+                    if let Err(e) = handle_connection(read, write, state).await {
                         tracing::warn!(error = %e, "connection ended with an error");
                     }
                 });
@@ -216,8 +418,67 @@ pub async fn serve(listener: StdUnixListener, state: State) -> Result<()> {
     }
 }
 
-async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
+/// The Windows accept loop: one pipe instance waits for a client, and the
+/// next is created **before** the connected one is handed off.
+///
+/// That order is the security property, not a detail. A pipe name exists
+/// only while some instance of it does, so a moment with no listening
+/// instance and no live connection is a moment the name is free — for a
+/// squatter to take (§4.2). Creating the next first means the connected
+/// instance keeps the name alive across the gap. A failure to create one is
+/// retried, holding the connected client until it succeeds, rather than
+/// risking that gap.
+#[cfg(windows)]
+pub async fn serve(listener: Listener, state: State) -> Result<()> {
+    use std::os::windows::io::IntoRawHandle;
+    use tokio::net::windows::named_pipe::NamedPipeServer;
+
+    let PipeListener {
+        name,
+        security,
+        first,
+    } = listener;
+    // Moved, never duplicated: a second handle to an instance keeps it open
+    // after tokio closes its own, and the client on it would never see EOF.
+    // SAFETY: an overlapped pipe handle `bind` created and owned outright;
+    // ownership moves into tokio here.
+    let mut server = unsafe { NamedPipeServer::from_raw_handle(first.into_raw_handle()) }
+        .context("adopting the pipe")?;
+
+    loop {
+        if let Err(e) = server.connect().await {
+            // A client that connected and left before this instance noticed
+            // leaves it unusable until it is disconnected; recycle it.
+            tracing::warn!(error = %e, "accepting on the pipe failed");
+            let _ = server.disconnect();
+            tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+            continue;
+        }
+        let next = loop {
+            match create_next_instance(&name, &security) {
+                Ok(next) => break next,
+                Err(e) => {
+                    tracing::warn!(error = %e, "creating the next pipe instance failed");
+                    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                }
+            }
+        };
+        let connected = std::mem::replace(&mut server, next);
+        let state = state.clone();
+        tokio::spawn(async move {
+            let (read, write) = tokio::io::split(connected);
+            if let Err(e) = handle_connection(read, write, state).await {
+                tracing::warn!(error = %e, "connection ended with an error");
+            }
+        });
+    }
+}
+
+async fn handle_connection(
+    read_half: ConnRead,
+    mut write_half: ConnWrite,
+    state: State,
+) -> Result<()> {
     let mut reader = BufReader::new(read_half);
     // Bytes, not a `String`: a `read_line` into a `String` fails the whole
     // read on invalid UTF-8, which drops the connection with no reply.
@@ -249,6 +510,23 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
             .await?;
             // The rest of that line is unread; the client reconnects rather
             // than desynchronising the framing.
+            //
+            // Not a bare close, though. Closing a unix socket with bytes
+            // still in its receive queue makes Linux reset the connection,
+            // and a reset can discard the reply above before the client
+            // reads it -- `ECONNRESET` where `too_large` was owed, seen on
+            // GitHub's ubuntu runner (anchor#33). So: end our half, then
+            // drain what the client is still sending, bounded in bytes and
+            // time so a client that never stops cannot hold the task.
+            let _ = write_half.shutdown().await;
+            let _ = tokio::time::timeout(
+                TOO_LARGE_DRAIN_TIME,
+                tokio::io::copy(
+                    &mut (&mut reader).take(TOO_LARGE_DRAIN_BYTES),
+                    &mut tokio::io::sink(),
+                ),
+            )
+            .await;
             return Ok(());
         }
         // Answered, not dropped. The whole line was consumed, so the

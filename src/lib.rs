@@ -2,8 +2,9 @@
 //!
 //! A session is a PTY plus an append-only output log, addressed by byte
 //! offset, outliving every client that attaches to it. Clients speak a
-//! newline-delimited JSON protocol over a unix socket, switching to binary
-//! framing once attached (docs/04-protocol.md).
+//! newline-delimited JSON protocol over a unix socket -- a named pipe on
+//! Windows -- switching to binary framing once attached
+//! (docs/04-protocol.md).
 //!
 //! The daemon is meant to be started by the user's own service manager and
 //! never by a client, which is what lets a client be restarted — or shipped
@@ -25,6 +26,8 @@ pub mod session;
 pub mod store;
 pub mod stream;
 pub mod tty;
+#[cfg(windows)]
+pub mod winsec;
 
 /// Milliseconds since the unix epoch.
 ///

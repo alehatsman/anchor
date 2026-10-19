@@ -248,6 +248,101 @@ fn tilde_dot_detaches_from_an_idle_session() {
     );
 }
 
+/// A paste longer than one read reaches the session whole, with nothing
+/// typed after it.
+///
+/// The attach loop polls stdin's descriptor and then reads up to 1 KiB.
+/// It used to read through `std::io::stdin()`, which is an 8 KiB
+/// `BufReader`: one 3000-byte paste filled that buffer in a single read,
+/// the loop forwarded the first 1024 bytes, and the rest sat in userspace
+/// where `poll` on the fd cannot see it -- delivered only when the next
+/// keystroke happened to make the fd readable again. A child waiting for
+/// the whole paste waited for a key nobody was going to press.
+#[test]
+fn a_paste_longer_than_one_read_arrives_whole() {
+    const PASTE: usize = 3000;
+    let mut daemon = Daemon::start("paste");
+    let mut client = daemon.client();
+    let created = client
+        .call(
+            "create",
+            json!({
+                "spec": {
+                    "command": "/bin/sh",
+                    "args": ["-c", format!(
+                        "stty raw -echo; echo ready; head -c {PASTE} >/dev/null; echo got-all; sleep 300"
+                    )],
+                    "cwd": "/tmp",
+                },
+            }),
+        )
+        .expect("create");
+    let id = created["session"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
+
+    let mut child = Command::new(bin("anchor"))
+        .arg("--socket")
+        .arg(daemon.socket())
+        .arg("attach")
+        .arg(&id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning anchor attach");
+    let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let mut stdout = child.stdout.take().expect("stdout");
+    {
+        let seen = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                seen.lock().expect("stdout").extend_from_slice(&buf[..n]);
+            }
+        });
+    }
+    let saw = |needle: &str| {
+        let seen = seen.lock().expect("stdout");
+        seen.windows(needle.len()).any(|w| w == needle.as_bytes())
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !saw("ready") {
+        assert!(Instant::now() < deadline, "the session never became ready");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // One write, so it lands in the CLI's stdin as one chunk. No `~` in it.
+    let stdin = child.stdin.as_mut().expect("stdin");
+    stdin.write_all(&[b'p'; PASTE]).expect("pasting");
+    stdin.flush().expect("flushing the paste");
+
+    // Nothing else is typed: the whole paste has to get there on its own.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !saw("got-all") {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the child never received all {PASTE} pasted bytes: the tail of the paste \
+                 is stuck in the client, waiting for a keystroke"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"\r~.")
+        .expect("detaching");
+    let _ = child.wait();
+}
+
 #[test]
 fn an_attach_replays_history_without_losing_the_first_frames() {
     let mut daemon = Daemon::start("replay");

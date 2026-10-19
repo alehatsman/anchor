@@ -76,6 +76,50 @@ jobs:
           grep -q "^$want: test$" tests.list || { echo "::error::$want is not listed on $RUNNER_OS"; exit 1; }
       - run: cargo test
 
+  windows:
+    # Its own job rather than a third matrix entry: the Unix job's coverage
+    # step names one fixture per kernel and refuses any other runner, which
+    # is the right answer for it. docs/09-windows.md §5 is the order this
+    # job grows in, and its first obligation is to be able to go red at all.
+    #
+    # Gate 1, 2026-10-19: red before anything was ported, and red the way it
+    # should be -- `cargo clippy` failed to compile the library (39 errors:
+    # the unix-only `pty` module, `tokio::net::UnixStream`, termios,
+    # `PermissionsExt`). Reproduced by running these steps on a real Windows
+    # 11 box (build 26200). Every later gate was run there the same way
+    # before it was committed; the first run of this job on GitHub is still
+    # to come.
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install $env:RUST_VERSION --profile minimal --component clippy
+      - run: rustup default $env:RUST_VERSION
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-latest-cargo-${{ hashFiles('Cargo.lock') }}
+      - run: cargo clippy --all-targets -- -D warnings
+      # Every ConPTY fixture writes its own name here as its last statement,
+      # and the step after this one refuses to pass unless each fixture the
+      # binary lists did. RUNNER_TEMP is fresh per job, which matters: a
+      # stale ledger would vouch for fixtures that have stopped running.
+      - name: cargo test
+        run: cargo test
+        env:
+          ANCHOR_CONPTY_LEDGER: ${{ runner.temp }}\conpty.ledger
+      # docs/09-windows.md §5 step 3: an ungated assertion that the Windows
+      # fixtures executed. A count gate cannot do this -- the count is never
+      # zero -- and `cargo test` alone reports a gated-out or early-returning
+      # fixture as nothing at all, or as ok.
+      - name: the ConPTY fixtures must have run, not merely passed
+        run: cargo test --test pty_primitive_windows -- --ignored --exact every_conpty_fixture_ran_to_completion
+        env:
+          ANCHOR_CONPTY_LEDGER: ${{ runner.temp }}\conpty.ledger
+
   citations:
     # Twenty-five doc citations pointed at headings that do not exist before
     # anything read them (#17).

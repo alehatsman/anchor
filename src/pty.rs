@@ -15,14 +15,30 @@
 //! **that closure must never block**, for the same reason the reader loop
 //! must not. This file cannot enforce it; it is a contract on the caller.
 //!
-//! **Unix only, by omission rather than by blocker.** The ConPTY exit
-//! handshake that made this look hard is solved upstream, so what remains is
-//! a port plus an access-control decision -- `server.rs`'s 0600 boundary has
-//! no named-pipe equivalent. docs/09-windows.md carries both. When Windows
-//! lands, every `#[cfg(windows)]` it needs belongs in this module and
-//! nowhere else.
-
-#![cfg(unix)]
+//! **Windows: ConPTY, lifted from teleport** (docs/09-windows.md §1). Every
+//! PTY-layer `#[cfg(windows)]` lives in this module and nowhere else, so a
+//! caller never learns which platform it is on. Three pieces differ:
+//!
+//! - **the startup handshake.** conhost writes a cursor-position query
+//!   (`ESC[6n`) as the first bytes of every session and blocks its own IO
+//!   thread until something answers. Nothing in `portable-pty` does, so a
+//!   child that exits gracefully was never observed as exited (teleport
+//!   `#W1`, fixed 2026-09-05 in teleport#9). `ConptyDsrProbe` answers that
+//!   one query and then stops looking -- see its doc for why stopping is the
+//!   subtle half.
+//! - **termination.** Dropping the master *is* the graceful step on Windows
+//!   (ClosePseudoConsole), where on Unix it closes nothing. The three
+//!   helpers `pid_to_signal`, `graceful_signal_group` and `hard_kill_group`
+//!   each have a Windows implementation, so the control loop that calls
+//!   them has no platform conditional of its own.
+//! - **no login shell.** `login_shell` is ignored rather than an error, so
+//!   one preset stays portable across a user's machines.
+//!
+//! What does not transfer, and never will: ConPTY has no raw input mode.
+//! Every byte written to the master crosses conhost's VT parser whatever
+//! console mode the child sets, so a byte-exact `0..256` round trip is
+//! unreproducible by construction. `tests/pty_primitive_windows.rs` says so
+//! rather than faking it.
 
 use std::io::{Read, Result as IoResult, Write};
 use std::path::Path;
@@ -177,15 +193,29 @@ pub struct SpawnedSession {
 /// service managers and container images, and taking it literally spawns
 /// the empty program -- which fails at exec with a message about `""`
 /// rather than about a shell, long after the useful place to notice.
+#[cfg(unix)]
 pub fn login_shell_path() -> String {
-    std::env::var("SHELL")
+    non_empty_var("SHELL").unwrap_or_else(|| "/bin/sh".to_string())
+}
+
+/// Windows has no login shell. This is the user's command interpreter, which
+/// is what a caller asking for "the shell" means there; `login_shell` itself
+/// never uses it (see [`login_shell_wrapper`]). Same empty-is-unset rule as
+/// the Unix arm, for the same reason.
+#[cfg(windows)]
+pub fn login_shell_path() -> String {
+    non_empty_var("COMSPEC").unwrap_or_else(|| "cmd.exe".to_string())
+}
+
+fn non_empty_var(key: &str) -> Option<String> {
+    std::env::var(key)
         .ok()
-        .filter(|shell| !shell.trim().is_empty())
-        .unwrap_or_else(|| "/bin/sh".to_string())
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// The shell families that need a different `-c` invocation
 /// (docs/03-pty.md, anchor#10).
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ShellFamily {
     /// `sh`, `bash`, `zsh`, `ksh`, `dash`, and anything unrecognised.
@@ -208,6 +238,7 @@ enum ShellFamily {
 /// POSIX-compatible than not, and if it is not, the spawn fails loudly with
 /// the shell's own usage message rather than silently running under the
 /// wrong environment.
+#[cfg(unix)]
 fn shell_family(shell: &str) -> ShellFamily {
     let name = std::path::Path::new(shell)
         .file_name()
@@ -239,6 +270,7 @@ fn shell_family(shell: &str) -> ShellFamily {
 /// is a real shortfall against what `login_shell` promises and is documented
 /// as one. Falling back to `/bin/sh` instead would source their config not
 /// at all, while still claiming to be their login shell.
+#[cfg(unix)]
 fn login_shell_wrapper(spec: &SpawnSpec<'_>) -> Option<(String, Vec<String>)> {
     if !spec.login_shell {
         return None;
@@ -260,9 +292,19 @@ fn login_shell_wrapper(spec: &SpawnSpec<'_>) -> Option<(String, Vec<String>)> {
     Some((shell, argv))
 }
 
+/// Windows has no login-shell convention, so there is never a wrapper. The
+/// flag is ignored rather than refused, so one `presets.toml` stays portable
+/// across a user's machines -- teleport settled this, and anchor copies the
+/// decision rather than re-litigating it (docs/09-windows.md, Non-goals).
+#[cfg(windows)]
+fn login_shell_wrapper(_spec: &SpawnSpec<'_>) -> Option<(String, Vec<String>)> {
+    None
+}
+
 /// The argv for a given shell, split out of `login_shell_wrapper` so it is
 /// testable without mutating `$SHELL` — an env var is process-global, and a
 /// test that writes it races every other test in the binary.
+#[cfg(unix)]
 fn wrapper_argv(shell: &str, program: &str, args: &[String]) -> Vec<String> {
     // `$argv:q` in the csh form, never a bare `$argv`: csh word-splits and
     // globs an unquoted expansion, which turns one argument `a b` into two
@@ -287,6 +329,7 @@ fn wrapper_argv(shell: &str, program: &str, args: &[String]) -> Vec<String> {
 /// Lives beside `wrapper_argv` because it needs the same per-family
 /// knowledge; a POSIX-only probe under fish or tcsh cannot succeed, and
 /// `create` would refuse a program the wrapper would have launched.
+#[cfg(unix)]
 pub fn resolves_in_login_shell(command: &str, cwd: &Path) -> bool {
     let shell = login_shell_path();
     std::process::Command::new(&shell)
@@ -303,6 +346,7 @@ pub fn resolves_in_login_shell(command: &str, cwd: &Path) -> bool {
 /// The argv that makes `shell` exit 0 iff it can find `command`. Same rule
 /// as `wrapper_argv`: the script is a fixed literal and the name is a
 /// separate argv entry, never interpolated.
+#[cfg(unix)]
 fn probe_argv(shell: &str, command: &str) -> Vec<String> {
     let mut argv = match shell_family(shell) {
         // `--` keeps a name that looks like an option from being parsed as one.
@@ -326,6 +370,42 @@ fn probe_argv(shell: &str, command: &str) -> Vec<String> {
     };
     argv.push(command.to_string());
     argv
+}
+
+/// Whether `path` names something `spawn` can run: a regular file with an
+/// execute bit.
+#[cfg(unix)]
+pub fn is_spawnable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Whether `path` names something `spawn` can run.
+///
+/// Windows has no execute bit; it has extensions. `portable-pty`'s own
+/// `PATH` search tries the name as given and then with each `PATHEXT`
+/// extension, so `cmd` finds `cmd.exe` -- and a preflight that only tried the
+/// literal name would refuse the `cmd` that spawn would have run. This
+/// mirrors that search rather than approximating it.
+#[cfg(windows)]
+pub fn is_spawnable(path: &Path) -> bool {
+    if path.is_file() {
+        return true;
+    }
+    let extensions = non_empty_var("PATHEXT").unwrap_or_else(|| ".EXE".to_string());
+    extensions
+        .split(';')
+        .filter_map(|ext| ext.strip_prefix('.'))
+        .any(|ext| path.with_extension(ext).is_file())
+}
+
+/// There is no login shell to ask on Windows (`login_shell_wrapper` never
+/// wraps), so there is nothing it could find that `PATH` did not.
+#[cfg(windows)]
+pub fn resolves_in_login_shell(_command: &str, _cwd: &Path) -> bool {
+    false
 }
 
 /// Spawns `spec` behind a fresh PTY and starts the four session threads.
@@ -377,8 +457,19 @@ pub fn spawn(
 
     let child = pair.slave.spawn_command(cmd).context("spawn_command")?;
 
-    // The master only sees EOF once every slave-side handle is gone, and ours
-    // is one of them.
+    // Dropped on both platforms, for different reasons, so the comment is
+    // split rather than shared.
+    //
+    // Unix: the master only sees EOF once every slave-side handle is gone,
+    // and ours is one of them.
+    //
+    // Windows: there is no slave fd. `portable-pty`'s slave and master are
+    // two `Arc`s on one pseudoconsole, and ClosePseudoConsole runs when the
+    // last of them drops. Termination's graceful step *is* dropping the
+    // master (see `graceful_signal_group`), which only closes anything if
+    // this one is already gone. teleport gates this line on `unix` and gets
+    // the same effect from the slave falling out of scope when `spawn`
+    // returns; dropping it here says so instead of relying on it.
     drop(pair.slave);
 
     let pid = child.process_id();
@@ -391,6 +482,11 @@ pub fn spawn(
     let writer = pair.master.take_writer().context("take pty writer")?;
 
     let (write_tx, write_rx) = mpsc::sync_channel::<Vec<u8>>(WRITE_CHANNEL_CAPACITY);
+    // Windows only: the first bytes of the session pass through the one-shot
+    // ConPTY handshake responder before anything else sees them. Without it
+    // conhost never finishes starting and a child's exit is never observed.
+    #[cfg(windows)]
+    let reader: Box<dyn Read + Send> = Box::new(ConptyDsrProbe::new(reader, write_tx.clone()));
     let (control_tx, control_rx) = mpsc::sync_channel::<ControlEvent>(CONTROL_CHANNEL_CAPACITY);
     let (exit_tx, exit_rx) = mpsc::sync_channel::<PtyExit>(1);
     let (eof_tx, eof_rx) = mpsc::sync_channel::<()>(1);
@@ -582,6 +678,125 @@ fn reader_thread_main(
     }
 }
 
+/// Answers ConPTY's one startup cursor-position query, then gets out of the
+/// way. Lifted from teleport's `daemon/src/pty.rs`, where it fixed `#W1`.
+///
+/// conhost writes `ESC[6n` to the master as the very first bytes of a
+/// session and blocks its own input thread until a reply (`ESC[row;colR`)
+/// comes back. A terminal emulator answers that automatically; a raw
+/// `portable-pty` pair does no VT parsing and never does, so conhost never
+/// finishes starting -- and a child that has already exited is never torn
+/// down, which is why its exit was never observed. The root cause was never
+/// reaping.
+///
+/// **Stopping is the subtle half.** Only the first `PROBE_BYTE_BUDGET` bytes
+/// ever read are scanned. Once the query is found and answered, or the budget
+/// runs out without it, every later byte passes through untouched for the
+/// rest of the session. A real program can send `ESC[6n` itself and expects
+/// the *attached client's* terminal to answer; a probe that kept replying
+/// would hand it a fixed, wrong position and corrupt it. The handshake is
+/// the first thing conhost writes, before the child can have written
+/// anything, so the budget only ever covers conhost's own burst. A build
+/// that does not emit the query exhausts the budget harmlessly.
+#[cfg(windows)]
+struct ConptyDsrProbe {
+    inner: Box<dyn Read + Send>,
+    write_tx: SyncSender<Vec<u8>>,
+    /// Bytes read while scanning and not yet handed to the caller: real
+    /// output either side of the query, or everything scanned once the budget
+    /// ran out without a match.
+    pending: Vec<u8>,
+    scanned: usize,
+    done: bool,
+}
+
+#[cfg(windows)]
+impl ConptyDsrProbe {
+    const QUERY: &'static [u8] = b"\x1b[6n";
+    /// A fixed reply: `portable-pty` exposes no way to ask where the cursor
+    /// actually is. conhost needs *a* well-formed reply to unblock, and
+    /// nothing observed depends on it being accurate.
+    const REPLY: &'static [u8] = b"\x1b[1;1R";
+    /// A give-up bound for a conhost that behaves differently, not a latency
+    /// budget: the query has only ever been seen alone, as the first read.
+    const PROBE_BYTE_BUDGET: usize = 4096;
+
+    fn new(inner: Box<dyn Read + Send>, write_tx: SyncSender<Vec<u8>>) -> Self {
+        Self {
+            inner,
+            write_tx,
+            pending: Vec::new(),
+            scanned: 0,
+            done: false,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Read for ConptyDsrProbe {
+    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        loop {
+            if !self.pending.is_empty() {
+                let n = self.pending.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.pending[..n]);
+                self.pending.drain(..n);
+                return Ok(n);
+            }
+            if self.done {
+                return self.inner.read(buf);
+            }
+
+            let mut tmp = [0u8; 256];
+            let n = self.inner.read(&mut tmp)?;
+            if n == 0 {
+                return Ok(0); // EOF before any handshake: nothing to answer
+            }
+            self.pending.extend_from_slice(&tmp[..n]);
+            self.scanned += n;
+
+            if let Some(pos) = self
+                .pending
+                .windows(Self::QUERY.len())
+                .position(|w| w == Self::QUERY)
+            {
+                // A blocking send, kept from teleport: it is one message at
+                // session start, and the writer drains into conhost's input
+                // pipe, which conhost is reading -- it is waiting on exactly
+                // this. If the writer is already gone the session is too.
+                let _ = self.write_tx.send(Self::REPLY.to_vec());
+                // The query is conhost's, not the session's output.
+                self.pending.drain(pos..pos + Self::QUERY.len());
+                self.done = true;
+            } else if self.scanned >= Self::PROBE_BYTE_BUDGET {
+                self.done = true;
+            }
+        }
+    }
+}
+
+/// The exit code a session records, from the status the reaper observed.
+///
+/// Unix codes fit an `i32` already; the `-1` arm needs a `u32` above
+/// `i32::MAX`, which no Unix status produces. portable-pty reports a
+/// signalled child as exit code 1, so a session killed by
+/// SIGHUP/SIGTERM/SIGKILL is recorded as `1`, indistinguishable from `exit 1`.
+#[cfg(unix)]
+pub fn exit_code(status: &ExitStatus) -> i32 {
+    i32::try_from(status.exit_code()).unwrap_or(-1)
+}
+
+/// Windows exit codes are a full `DWORD`, and the ones above `i32::MAX` are
+/// the ones that matter: an `NTSTATUS` such as `0xC000013A`
+/// (`STATUS_CONTROL_C_EXIT`, what a child torn down with its console
+/// reports). The Unix conversion would record every one of them as `-1`,
+/// which is an exit code that is not accurate. The bits are kept instead, as
+/// the signed value `cmd` and PowerShell themselves print
+/// (`-1073741510`), so `exit_code as u32` recovers the status exactly.
+#[cfg(windows)]
+pub fn exit_code(status: &ExitStatus) -> i32 {
+    status.exit_code() as i32
+}
+
 fn writer_thread_main(mut writer: Box<dyn Write + Send>, write_rx: &Receiver<Vec<u8>>) {
     for chunk in write_rx {
         // `write_all` can block indefinitely if the child never reads. That
@@ -620,6 +835,10 @@ fn control_thread_main(
     state: &Arc<AtomicU8>,
     reaped: &AtomicBool,
 ) {
+    // An `Option` so the graceful step can take it on the platform where
+    // dropping it is the mechanism. On Unix it is never taken.
+    let mut master = Some(master);
+
     loop {
         let Ok(event) = control_rx.recv() else {
             return; // both the session and the reaper are gone
@@ -630,12 +849,14 @@ fn control_thread_main(
                 if state.load(Ordering::SeqCst) == STATE_RUNNING {
                     // Best-effort: if the PTY is already gone there is
                     // nothing to resize.
-                    let _ = master.resize(PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
+                    if let Some(master) = &master {
+                        let _ = master.resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                    }
                 }
             }
 
@@ -654,19 +875,17 @@ fn control_thread_main(
                 // waiting for it is both correct and the whole job here.
                 let pid = pid_to_signal(pid, reaped.load(Ordering::SeqCst));
 
-                // Step 2: graceful signal. Not dropping the master — the
-                // reader and writer hold their own dups of the same open file
-                // description, so dropping it closes nothing and raises no
-                // signal.
-                graceful_signal_group(pid);
+                // Step 2: the graceful step. What it does to `master` is the
+                // one place the platforms are opposites -- see the two
+                // `graceful_signal_group`s.
+                graceful_signal_group(pid, &mut master);
 
                 let exit = match wait_for_child_exited(control_rx, Instant::now() + GRACEFUL_WAIT) {
                     Some(result) => pty_exit_from_wait(result),
                     None => {
-                        // Step 4: hard kill. Not `killer.kill()` —
-                        // portable-pty 0.9's cloned killer sends SIGHUP on
-                        // Unix, which a child ignoring HUP survives. This
-                        // step has to send SIGKILL itself.
+                        // Step 4: the hard kill. Never `killer.kill()`: on
+                        // Unix portable-pty 0.9's cloned killer sends SIGHUP,
+                        // which a child ignoring HUP survives.
                         if let Err(e) = hard_kill_group(pid) {
                             warn!(?pid, error = %e, "hard kill failed");
                         }
@@ -706,6 +925,24 @@ fn control_thread_main(
 /// What it removes is the wide case -- a session that exited some time ago
 /// and was terminated afterwards -- leaving only the few instructions
 /// between the two.
+#[cfg(unix)]
+fn pid_to_signal(pid: Option<u32>, reaped: bool) -> Option<u32> {
+    if reaped {
+        return None;
+    }
+    pid
+}
+
+/// The pid a `Terminate` may act on, or `None` once the child is reaped.
+///
+/// The same rule as Unix, held for a weaker reason. Windows does not recycle
+/// a process id while any handle to the process is open, and the reaper's
+/// `Child` holds one until after it has published `reaped` -- so the
+/// stranger the Unix arm guards against cannot exist here. What remains is
+/// not signalling a process that has already been observed exiting: a
+/// `TerminateProcess` on it would fail harmlessly, and skipping it keeps the
+/// two platforms' `Terminate` arms answering the same question the same way.
+#[cfg(windows)]
 fn pid_to_signal(pid: Option<u32>, reaped: bool) -> Option<u32> {
     if reaped {
         return None;
@@ -716,7 +953,14 @@ fn pid_to_signal(pid: Option<u32>, reaped: bool) -> Option<u32> {
 /// Step 2: SIGHUP to the session's process group, then SIGTERM to the child.
 /// The child leads the group — portable-pty spawns it under `setsid` — so the
 /// group is the same target the hard kill uses.
-fn graceful_signal_group(pid: Option<u32>) {
+///
+/// **The master is left alone.** The reader and writer hold their own dups
+/// of the same open file description, so dropping it closes nothing and
+/// raises no signal (teleport `#S4`). That is the exact opposite of the
+/// Windows arm, which is why the two are separate functions and not one
+/// with a comment covering both.
+#[cfg(unix)]
+fn graceful_signal_group(pid: Option<u32>, _master: &mut Option<Box<dyn MasterPty + Send>>) {
     // A negative `pid_t` means "this process's whole group" to kill(2).
     // Never send one just because a u32 wrapped through the cast; no real pid
     // reaches that range, and skipping is the safe failure mode.
@@ -731,7 +975,25 @@ fn graceful_signal_group(pid: Option<u32>) {
     }
 }
 
+/// Step 2 on Windows: ClosePseudoConsole, by dropping the master.
+///
+/// There is no signal to send. Dropping the last reference to the
+/// pseudoconsole closes it (the slave's was dropped in `spawn`), and every
+/// process still attached to it -- the child and any grandchild started
+/// without a console of its own -- is torn down with it. Verified on real
+/// Windows 2026-09-05 through this path in teleport (`#S4`, a spike id there,
+/// not an issue number), and here by `tests/pty_primitive_windows.rs`'s
+/// `terminate_kills_the_grandchild_process_tree`.
+///
+/// The reader keeps draining: its handle is a clone of the output pipe, which
+/// reaches EOF once conhost has gone.
+#[cfg(windows)]
+fn graceful_signal_group(_pid: Option<u32>, master: &mut Option<Box<dyn MasterPty + Send>>) {
+    drop(master.take());
+}
+
 /// Step 4: SIGKILL to the whole process group.
+#[cfg(unix)]
 fn hard_kill_group(pid: Option<u32>) -> IoResult<()> {
     let Some(pid) = pid.and_then(|p| libc::pid_t::try_from(p).ok()) else {
         return Err(std::io::Error::other("no valid pid to kill"));
@@ -745,6 +1007,57 @@ fn hard_kill_group(pid: Option<u32>) -> IoResult<()> {
     // ESRCH: the group died between the graceful wait timing out and now.
     // Nothing left to kill is not a failure.
     if err.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+/// Step 4 on Windows: `TerminateProcess` on the child.
+///
+/// Reached only when closing the pseudoconsole did not end the child within
+/// `GRACEFUL_WAIT`. By then the console is already gone, so whatever was
+/// attached to it went with it; what can be left is the child itself, wedged
+/// in something that ignores the close event. Exit code 1, which is what
+/// `portable-pty`'s own killer uses and what a signalled child reports on
+/// Unix -- a hard kill looks the same on both platforms.
+///
+/// By pid rather than through a cloned `ChildKiller`, so the signature (and
+/// `OrphanGuard`, which has only a pid) matches Unix. That is safe here for
+/// the reason in `pid_to_signal`: the reaper's handle pins the pid.
+#[cfg(windows)]
+fn hard_kill_group(pid: Option<u32>) -> IoResult<()> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    let Some(pid) = pid else {
+        return Err(std::io::Error::other("no valid pid to kill"));
+    };
+    // SAFETY: OpenProcess takes plain values and returns a handle or null.
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        let err = std::io::Error::last_os_error();
+        // No such process: it exited between the graceful wait timing out
+        // and now. The Windows spelling of ESRCH.
+        return if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            Ok(())
+        } else {
+            Err(err)
+        };
+    }
+    // SAFETY: `handle` is a process handle this function just opened.
+    let ok = unsafe { TerminateProcess(handle, 1) };
+    let err = std::io::Error::last_os_error();
+    // SAFETY: closing the handle opened above, exactly once.
+    unsafe { CloseHandle(handle) };
+    if ok != 0 {
+        return Ok(());
+    }
+    // A process that has already exited refuses termination with access
+    // denied; that is the same "nothing left to kill" as above.
+    if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
         Ok(())
     } else {
         Err(err)
@@ -936,13 +1249,101 @@ mod reader_tests {
     }
 }
 
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::sync::mpsc::sync_channel;
+
+    /// Hands out each scripted chunk on its own `read`, then EOF.
+    struct Chunks(std::vec::IntoIter<Vec<u8>>);
+
+    impl Read for Chunks {
+        fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+            match self.0.next() {
+                None => Ok(0),
+                Some(bytes) => {
+                    buf[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+            }
+        }
+    }
+
+    fn probe(chunks: &[&[u8]]) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let (tx, rx) = sync_channel(8);
+        let script = chunks.iter().map(|c| c.to_vec()).collect::<Vec<_>>();
+        let mut probe = ConptyDsrProbe::new(Box::new(Chunks(script.into_iter())), tx);
+        let mut out = Vec::new();
+        probe.read_to_end(&mut out).unwrap();
+        drop(probe);
+        (out, rx.iter().collect())
+    }
+
+    /// The handshake query is answered, once, and removed from the output.
+    #[test]
+    fn the_startup_query_is_answered_and_swallowed() {
+        let (out, replies) = probe(&[b"\x1b[?9001h\x1b[6n", b"hello"]);
+        assert_eq!(out, b"\x1b[?9001hhello", "the query leaked into the output");
+        assert_eq!(
+            replies,
+            vec![b"\x1b[1;1R".to_vec()],
+            "conhost was not answered once"
+        );
+    }
+
+    /// **The subtle half.** A program's own cursor query later in the
+    /// session belongs to the attached client's terminal. A probe that kept
+    /// answering would hand it a fixed, wrong position.
+    #[test]
+    fn a_later_query_passes_through_untouched() {
+        let (out, replies) = probe(&[b"\x1b[6n", b"prompt> ", b"\x1b[6n"]);
+        assert_eq!(out, b"prompt> \x1b[6n", "the program's own query was eaten");
+        assert_eq!(
+            replies.len(),
+            1,
+            "the probe answered a query that was not conhost's"
+        );
+    }
+
+    /// No query within the budget: everything scanned is still delivered,
+    /// and the probe stops looking.
+    #[test]
+    fn without_a_query_the_budget_runs_out_harmlessly() {
+        let filler = vec![b'x'; ConptyDsrProbe::PROBE_BYTE_BUDGET + 10];
+        let chunks: Vec<&[u8]> = filler.chunks(256).chain([&b"\x1b[6n"[..]]).collect();
+        let (out, replies) = probe(&chunks);
+        assert!(replies.is_empty(), "answered a query past the budget");
+        assert_eq!(&out[..filler.len()], &filler[..], "scanned bytes were lost");
+        assert!(out.ends_with(b"\x1b[6n"));
+    }
+
+    /// The hard-kill arm, which no ConPTY fixture reaches on its own: closing
+    /// the console ends everything the fixtures can spawn, so step 4 never
+    /// runs there. Driven directly instead, against a process of its own.
+    #[test]
+    fn the_hard_kill_terminates_the_child_with_code_one() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawning ping");
+        hard_kill_group(Some(child.id())).expect("hard kill");
+        let status = child.wait().expect("wait");
+        assert_eq!(status.code(), Some(1), "a hard kill reports 1, as on Unix");
+
+        // Already gone: nothing left to kill is not a failure. The pid is
+        // still pinned by `child`'s handle, so it names the exited process.
+        hard_kill_group(Some(child.id())).expect("killing an exited child is not an error");
+    }
+}
+
 /// The login-shell wrapper (docs/03-pty.md, anchor#10).
 ///
 /// The forms are asserted by *running* them wherever the shell is installed,
 /// not by matching the argv strings. A string assertion restates the code it
 /// is checking and so passes for any form, correct or not; only an exec
 /// proves that `a b` stayed one argument and `*` stayed a star.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod login_shell_tests {
     use super::*;
 

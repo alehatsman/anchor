@@ -1,5 +1,9 @@
 //! M3: the control ops, driven over a real socket against a real daemon
 //! state — create a session, find it by label, read its log, terminate it.
+//!
+//! Unix-only: it drives a real unix socket and a real `/bin/sh`. On
+//! Windows the transport is a named pipe (docs/09-windows.md §3).
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;

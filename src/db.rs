@@ -57,7 +57,9 @@ pub fn open(path: &Path) -> Result<Connection> {
     // The database holds every session's command, cwd and environment. Create
     // it owner-only ourselves: `Connection::open` would use the umask, and
     // SQLite gives `-wal` and `-shm` the mode of the main file, so this one
-    // call covers all three.
+    // call covers all three. On Windows all three inherit the data
+    // directory's owner-only DACL instead (`winsec`), which is checked by
+    // `the_data_dir_is_owner_only_on_windows` in `tests/windows_transport.rs`.
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

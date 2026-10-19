@@ -6,6 +6,10 @@
 //! clients that vanish mid-replay. The invariant under all of them is the
 //! one docs/03-pty.md opens with — the PTY reader never waits for a
 //! subscriber, and one bad client never harms another.
+//!
+//! Unix-only: it drives a real unix socket and a real `/bin/sh`. On
+//! Windows the transport is a named pipe (docs/09-windows.md §3).
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
