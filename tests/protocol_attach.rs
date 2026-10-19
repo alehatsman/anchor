@@ -115,6 +115,28 @@ impl Conn {
         }
     }
 
+    /// The offset and payload of the next OUTPUT frame, skipping any other tag.
+    fn first_output(&mut self) -> (u64, Vec<u8>) {
+        loop {
+            let (tag, offset, payload) = self.frame();
+            if tag == frame::OUTPUT {
+                return (offset, payload);
+            }
+        }
+    }
+
+    /// Claims the lease. Frames on one connection are handled in order, so
+    /// whatever was sent before this has been handled -- or ignored -- by the
+    /// time the claim takes effect. That is the only ordering barrier a
+    /// negative assertion has: two connections are two daemon tasks and
+    /// nothing orders them against each other.
+    fn claim(&mut self) {
+        self.writer
+            .write_all(&frame::encode(frame::LEASE, 0, &[1]))
+            .unwrap();
+        self.writer.flush().unwrap();
+    }
+
     fn send_input(&mut self, bytes: &[u8]) {
         self.writer
             .write_all(&frame::encode(frame::INPUT, 0, bytes))
@@ -204,12 +226,15 @@ async fn a_controller_types_and_observers_only_watch() {
         o.read_until("hello-from-controller");
     }
 
-    // An observer's input is ignored, not applied. Prove it by sending it,
-    // then sending a known marker from the controller: the marker arrives
-    // and the observer's bytes never do.
+    // An observer's input is ignored, not applied. Prove it on ONE
+    // connection, where order is guaranteed: the observer sends the bytes,
+    // claims the lease, and types a marker. The claim is handled after the
+    // bytes, so the marker is applied and the bytes -- were they ever
+    // applied -- would already be in the output ahead of it.
     observers[0].send_input(b"ignored-input\n");
-    controller.send_input(b"marker-after\n");
-    let seen = controller.read_until("marker-after");
+    observers[0].claim();
+    observers[0].send_input(b"marker-after\n");
+    let seen = observers[0].read_until("marker-after");
     assert!(
         !seen.windows(13).any(|w| w == b"ignored-input"),
         "an observer must not be able to write to the PTY"
@@ -230,12 +255,14 @@ async fn detach_and_reconnect_from_an_offset_has_no_gap() {
         json!({ "session": &id, "from": 0, "control": true }),
     );
     assert_eq!(first.frame().2, vec![1]);
-    let seen = first.read_until("ready");
-    let resume_at = seen.len() as u64;
+    // `read_until` starts a fresh accumulator per call, so the bytes consumed
+    // are the SUM of the two stretches. Taking the larger of the two lands
+    // the offset inside the old output, where a gap cannot be seen.
+    let banner_len = first.read_until("ready").len() as u64;
 
     first.send_input(b"before-detach\n");
-    let seen = first.read_until("before-detach");
-    let resume_at = resume_at.max(seen.len() as u64);
+    let echoed_len = first.read_until("before-detach").len() as u64;
+    let resume_at = banner_len + echoed_len;
 
     // Drop the connection entirely — the session must not notice.
     drop(first);
@@ -270,10 +297,35 @@ async fn detach_and_reconnect_from_an_offset_has_no_gap() {
     assert_eq!(second.frame().2, vec![1], "the lease is grantable again");
 
     second.send_input(b"after-reconnect\n");
-    let after = second.read_until("after-reconnect");
+    // No gap, no duplicate, stated as the daemon states it: the first byte
+    // after the resume point carries exactly the resume offset.
+    let (offset, after) = second.first_output();
+    assert_eq!(
+        offset, resume_at,
+        "the stream must continue exactly where the client stopped"
+    );
     assert!(
-        !after.windows(13).any(|w| w == b"before-detach"),
-        "resuming from an offset must not replay what was already consumed"
+        after.starts_with(b"after-reconnect"),
+        "the first byte after the resume point is the new echo, not a replay: {:?}",
+        String::from_utf8_lossy(&after)
+    );
+
+    // The same, for an offset that is genuinely in the past: replay starts at
+    // the byte asked for, not one after it. (Resuming at the tail, above,
+    // never reaches the replay arm of `Session::attach`.)
+    let mut mid = Conn::connect(&socket);
+    let ready = mid.call("attach", json!({ "session": &id, "from": banner_len }));
+    assert_eq!(ready["ok"], true, "mid-stream attach failed: {ready}");
+    assert_eq!(mid.frame().0, frame::LEASE);
+    let (offset, payload) = mid.first_output();
+    assert_eq!(
+        offset, banner_len,
+        "replay must start at the requested byte"
+    );
+    assert!(
+        payload.starts_with(b"before-detach"),
+        "replay from {banner_len} must begin with the first byte after the banner, got {:?}",
+        String::from_utf8_lossy(&payload)
     );
 
     control.call("terminate", json!({ "session": &id }));
@@ -392,9 +444,12 @@ async fn a_lease_frame_claims_control_and_the_loser_is_told() {
     second.read_until("after-claim");
 
     // The preempted connection's input is ignored from here on.
+    // Ordered on the preempted connection itself: its stale input, then a
+    // claim, then a marker.
     first.send_input(b"should-be-ignored\n");
-    second.send_input(b"marker-two\n");
-    let seen = second.read_until("marker-two");
+    first.claim();
+    first.send_input(b"marker-two\n");
+    let seen = first.read_until("marker-two");
     assert!(
         !seen.windows(17).any(|w| w == b"should-be-ignored"),
         "a preempted connection must not be able to write"
@@ -435,9 +490,11 @@ async fn a_lease_frame_that_does_not_claim_changes_nothing() {
     holder.send_input(b"still-mine\n");
     holder.read_until("still-mine");
 
+    // The observer's own claim, after its own input, is the barrier.
     observer.send_input(b"not-yours\n");
-    holder.send_input(b"marker\n");
-    let seen = holder.read_until("marker");
+    observer.claim();
+    observer.send_input(b"marker\n");
+    let seen = observer.read_until("marker");
     assert!(
         !seen.windows(9).any(|w| w == b"not-yours"),
         "a lease frame with payload 0 must not grant control"
@@ -504,13 +561,30 @@ async fn resize_follows_the_lease() {
     let mut observer = Conn::connect(&socket);
     observer.call("attach", json!({ "session": &id, "from": 0 }));
     assert_eq!(observer.frame().2, vec![0]);
+
+    // Let the 100 ms coalescing window close. This is not a wait for a
+    // result -- nothing below depends on it for correctness -- it is what
+    // makes this test able to FAIL: a resize that arrived inside the window
+    // is only queued, and an observer resize wrongly honoured would still
+    // look "not applied" when we look.
+    tokio::time::sleep(Duration::from_millis(150)).await;
     observer
         .writer
         .write_all(&frame::encode(frame::RESIZE, 0, &frame::encode_size(20, 5)))
         .unwrap();
     observer.writer.flush().unwrap();
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The claim is handled after the resize frame on the same connection;
+    // its grant is the proof that the resize was read and refused.
+    observer.claim();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (tag, _, payload) = observer.frame();
+        if tag == frame::LEASE && payload == vec![1] {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the claim was never granted");
+    }
     let got = setup.call("get", json!({ "session": &id }))["session"].clone();
     assert_eq!(got["cols"], 132, "an observer must not resize");
     assert_eq!(got["rows"], 50);
@@ -616,7 +690,7 @@ async fn an_input_frame_larger_than_a_chunk_ends_the_connection() {
 
     // Exactly a chunk is legal, and the connection carries on after it.
     controller.send_input(&vec![b'.'; 64 * 1024]);
-    controller.send_input(b"\x04"); // EOT: ends `cat`'s current line
+    controller.send_input(b"\x04"); // 0x04 is not EOF here: the session is in raw mode, so it is just a byte
     controller.send_input(b"still-here\n");
     controller.read_until("still-here");
 
