@@ -9,7 +9,8 @@ anchor provides a **supervised, attachable, replayable PTY session**:
 
 1. spawn spec — argv, cwd, env, PTY size, login-shell wrapping
 2. labels — arbitrary key/value, owned by the caller, queryable
-3. lifecycle — `running → closing → exited`, plus `lost`
+3. lifecycle — `running → closing → exited`, plus `lost` — and `purge`:
+   forgetting a terminal session is an explicit client act
 4. output log — append-only, addressable by byte offset
 5. subscribers — many, bounded, backpressured
 6. control lease — exactly one writer of input and size
@@ -32,6 +33,7 @@ Ask: **can a client do this with what anchor already exposes?**
 | "limit memory/CPU" | no | that is a cgroup, and therefore systemd. |
 | "web UI" | no | that is teleport. |
 | "windows, panes, layouts" | no | that is tmux. |
+| "auto-delete old sessions" | no | retention is policy. teleport already does it (`retain_days`, `run_gc_pass`); a client lists, decides, and calls `purge`. Nothing in anchor ever expires a session, and a log can reach 1 GiB. |
 
 The honest test: **if the answer involves policy, it belongs to a client.**
 anchor provides mechanism.
@@ -56,7 +58,7 @@ Only the things that cannot be correct in a client:
 - not a terminal multiplexer (tmux, zellij)
 - not a remote access product (teleport, ssh)
 - not a scheduler (cron, systemd timers)
-- not multi-user — one user, one daemon, loopback only
+- not multi-user — one user, one daemon, unix socket (mode 0600), no TCP
 
 ## Open questions
 
@@ -66,8 +68,9 @@ That is a small generalization and a large scope risk — it invites "then why
 not restart policies". Deferred past v1. Revisit only with a concrete
 consumer.
 
-**Crash survival.** If `anchord` dies, its PTYs die with it; the master fd
-has no handoff. Teleport documented the fix (a broker process per PTY) and
+**Crash survival.** If `anchord` dies, its PTYs lose their master and are
+hung up; a child that ignores SIGHUP keeps running as an orphan anchor no
+longer tracks, and its row is `lost`. The master fd has no handoff. Teleport documented the fix (a broker process per PTY) and
 deliberately did not pay for it. anchor inherits that decision. The reason
 anchor exists is to make *updates* survivable by being small and stable —
 not to make crashes survivable. Do not conflate the two.

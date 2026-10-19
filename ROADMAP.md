@@ -33,8 +33,9 @@ Port from `teleport/daemon/tests/`: `pty_primitive`, `output_log`,
 
 Exit:
 - every ported test passes
-- a 5s burst of output to a deliberately slow subscriber disconnects **that
-  subscriber** and the PTY reader never stalls
+- a 10 MiB burst of output past the 8 MiB bound
+  (`tests/session_backpressure.rs:325`) to a deliberately slow subscriber
+  disconnects **that subscriber** and the PTY reader never stalls
 - a child that ignores SIGHUP and SIGTERM is still reaped
 - kill `anchord`, restart: sessions are `LOST`, logs are intact and readable
 
@@ -73,12 +74,14 @@ Scope: an anchor client in teleport; its session layer switchable; default
 **off**.
 
 Exit: **teleport's own test suite passes against the anchor path.** That is
-the acceptance criterion for the whole extraction. Teleport's default is
+the acceptance criterion for the whole extraction. Evidence lives in teleport,
+not here: `teleport/daemon/tests/anchor_http.rs` (its HTTP surface against an
+external `anchord`) and `daemon/tests/anchor_client.rs`. Teleport's default is
 unchanged and it ships normally throughout.
 
 ---
 
-## M5 — Flip the default, prove the payoff ✅
+## M5 — Prove the payoff ✅
 
 > Done: an agent survives teleport restarting under it (demonstrated by
 > `an_agent_survives_teleport_restarting_under_it`), anchord restarts without
@@ -91,7 +94,7 @@ unchanged and it ships normally throughout.
 > `4912d9c`, 2026-10-16: a session created by the old teleportd survived the
 > upgrade with its transcript intact, and `anchord` was rebuilt and bounced
 > under a running teleportd that never noticed. `use_anchor=true` is deployed
-> on `work_mac`. See teleport `docs/20-retiring-the-in-process-pty.md`.
+> on `work_mac` — an opt-in flag, **not** the default. See teleport `docs/20-retiring-the-in-process-pty.md`.
 >
 > **Closed 2026-10-19.** anchor now has two real consumers driving it —
 > teleport, and [tally](https://github.com/alehatsman/tally), which is a
@@ -106,8 +109,13 @@ unchanged and it ships normally throughout.
 > fixed by gating its `anchor_*` modules on `unix` — the gate holds until
 > anchord can host a session on Windows, which is exactly M6's exit.
 
-Scope: default teleport to anchor; packaging so `anchord` is a separate
-launchd/systemd unit with its own lifecycle.
+Scope: packaging so `anchord` is a separate launchd/systemd unit with its
+own lifecycle. The original scope also said "default teleport to anchor";
+**that was not done.** teleport's `use_anchor` is still `false`
+(`teleport/daemon/src/config.rs:140`, as of teleport `d7f34e9`), and
+teleport `docs/20-retiring-the-in-process-pty.md:12` says "Nothing here is a
+decision to flip the default." The flip is listed explicitly under "Later,
+unscheduled" so it is not forgotten.
 
 Exit, met: **update teleport while agents are running, and they survive.**
 That is the thing anchor exists for. Demonstrated against a live daemon and
@@ -164,6 +172,10 @@ a tripwire rather than a count.
 
 ## Later, unscheduled
 
+- **flip teleport's default to anchor** (`use_anchor: true`). Promised by
+  M5's original scope and not done; nothing gates it except a decision in
+  teleport, and until it happens the in-process PTY layer is the default
+  everywhere
 - non-PTY sessions (only with a real consumer — see scope doc)
 - crash survival via per-PTY broker processes (explicitly deferred)
 
@@ -177,6 +189,6 @@ M1  pty + tests ← the only real risk
 M2  labels      ← the new capability
 M3  protocol    ← the surface
 M4  teleport    ← proof against a real consumer
-M5  flip        ← the payoff, demonstrated
+M5  payoff      ← demonstrated behind use_anchor=true; the default flip is not done
 M6  windows     ← the last platform teleport cannot yet hand over
 ```

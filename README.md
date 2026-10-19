@@ -22,12 +22,17 @@ noticed. That is the entire pitch.
 
 ## Status
 
-**M0–M5 are done; the payoff is demonstrated. M6 — Windows — is scheduled**,
-so that teleport can rely on anchor on every platform it ships rather than
-keeping an in-process PTY layer alive for one of them.
+**M0–M5 are done; the payoff is demonstrated** — when teleport runs with
+`use_anchor=true`. That flag is opt-in: teleport's default is still its
+in-process PTY layer (`use_anchor: false`, teleport `daemon/src/config.rs:140`,
+as of teleport `d7f34e9`), and flipping it is not yet scheduled. **M6 —
+Windows — is scheduled**, so that teleport can rely on anchor on every
+platform it ships rather than keeping an in-process PTY layer alive for one
+of them.
 
 `anchord` owns real PTY
-sessions: four threads each, an append-only output log addressable by byte
+sessions: four threads each in the PTY layer, plus two listener threads
+(exit and EOF) per session, an append-only output log addressable by byte
 offset, many bounded subscribers with backpressure, a control lease, and
 termination that reaps a child ignoring SIGHUP and SIGTERM. Ported from
 teleport along with its test suite, which is the point — those fixtures are
@@ -77,12 +82,13 @@ detail in these docs — read it alongside them.
 A **supervised, attachable, replayable PTY session**, and nothing else:
 
 - **spawn spec** — argv, cwd, env, PTY size, login-shell wrapping
-- **labels** — arbitrary key/value, owned by the caller
-- **lifecycle** — `running → closing → exited`, plus `lost`
+- **labels** — arbitrary key/value, owned by the caller, queryable
+- **lifecycle** — `running → closing → exited`, plus `lost` — and `purge`:
+  forgetting a terminal session is an explicit client act
 - **output log** — append-only, addressable by byte offset
-- **subscribers** — many, bounded, with backpressure
+- **subscribers** — many, bounded, backpressured
 - **control lease** — exactly one writer of input and size
-- **reaping** — exit codes, independent of output EOF
+- **reaping** — exit code, independent of output EOF
 
 Seven bullets. Everything not on that list belongs to a client.
 
@@ -99,7 +105,7 @@ the answer is no.
 **Not a terminal multiplexer.** No windows, no panes, no layouts, no copy
 mode, no config language. tmux already exists and is better at it.
 
-**Not remote.** Binds loopback. Reaching it across a network is a client's
+**Not remote.** Binds a unix socket, mode 0600; no TCP. Reaching it across a network is a client's
 job — teleport does exactly that, with its own auth and transport.
 
 The closest honest analogy is **containerd**: a runtime extracted from a
@@ -137,7 +143,9 @@ rarely-changed daemon hold the PTYs while everything above it ships freely.
 
 That second reason holds even if no other client is ever built.
 
-**This now works, and it is demonstrated rather than claimed.** teleport's
+**This now works when teleport runs with `use_anchor=true`, and it is
+demonstrated rather than claimed.** The flag is opt-in; teleport's default
+has not been flipped to anchor. teleport's
 `an_agent_survives_teleport_restarting_under_it` starts an agent, drops the
 teleport that spawned it, starts a new one against the same `anchord`, and
 requires the agent to still be running with its transcript intact. Its
@@ -146,7 +154,9 @@ updater restarts under load only when the daemon advertises
 
 ### The boundary, stated plainly
 
-**If `anchord` dies, its PTYs die with it.** The master fd has no handoff.
+**If `anchord` dies, its PTYs lose their master and are hung up.** The master
+fd has no handoff. A child that ignores SIGHUP keeps running as an orphan
+that anchor no longer tracks; its row is `lost`.
 anchor makes *updates* survivable by being small and changing rarely; it does
 not make *crashes* survivable. teleport documented that fix — a broker
 process per PTY — and deliberately declined to pay for it, and anchor
