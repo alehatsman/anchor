@@ -22,7 +22,11 @@ noticed. That is the entire pitch.
 
 ## Status
 
-**M5 — the payoff, demonstrated. M0–M4 are done.** `anchord` owns real PTY
+**M0–M5 are done; the payoff is demonstrated. M6 — Windows — is scheduled**,
+so that teleport can rely on anchor on every platform it ships rather than
+keeping an in-process PTY layer alive for one of them.
+
+`anchord` owns real PTY
 sessions: four threads each, an append-only output log addressable by byte
 offset, many bounded subscribers with backpressure, a control lease, and
 termination that reaps a child ignoring SIGHUP and SIGTERM. Ported from
@@ -48,6 +52,8 @@ noticed. See
 
 ```sh
 cargo test                # ported fixtures, protocol, CLI, restart recovery
+                          # CI runs this on Linux and macOS both: they differ
+                          # in ways the suite has already caught
 cargo run --bin anchord   # or: anchor daemon
 
 anchor service install    # register anchord with launchd/systemd, so it
