@@ -30,6 +30,11 @@ pub async fn run(paths: &Paths) -> Result<()> {
         "anchord starting"
     );
 
+    // Armed before the bind, not at the `select!` that awaits it: the socket
+    // is connectable as soon as it is bound, and a signal that lands while
+    // the database is still opening must be handled, not fatal.
+    let stop = arm_stop_signal();
+
     // Bind before touching the database -- not just before touching a row.
     // `Store::open` migrates: DDL, a `meta` write, a `journal_mode` change. A
     // stray `anchord` from a newer build (an upgrade where the supervisor
@@ -83,55 +88,69 @@ pub async fn run(paths: &Paths) -> Result<()> {
     // live log its final fsync.
     tokio::select! {
         result = serving => result,
-        signal = stop_signal() => {
+        signal = stop => {
             tracing::info!(signal, "stopping");
             Ok(())
         }
     }
 }
 
-/// Resolves on the first SIGTERM or SIGINT, naming the one that arrived.
+/// Installs the SIGTERM/SIGINT handlers *now* and returns a future that
+/// resolves on the first of them, naming the one that arrived.
+///
+/// Installing is synchronous, which is the point: a unix socket is connectable
+/// the moment it is bound, so a client can signal the daemon while it is still
+/// opening the database. Armed lazily at the `select!` below, that window
+/// had the default disposition and the signal killed the process outright.
+/// A signal that arrives after this returns is queued on the stream and is
+/// seen as soon as the future is polled, however late.
 ///
 /// SIGINT too: a daemon run in the foreground is stopped with Ctrl-C, and a
 /// developer deserves the same final fsync launchd gets.
 #[cfg(unix)]
-async fn stop_signal() -> &'static str {
+fn arm_stop_signal() -> impl std::future::Future<Output = &'static str> {
     use tokio::signal::unix::{signal, SignalKind};
 
     // A failure to install a handler is not a reason to refuse to serve: the
     // daemon simply keeps the default disposition for that signal, which is
     // exactly where it was before this existed.
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "no SIGTERM handler; shutdown will not be clean");
-            std::future::pending().await
-        }
-    };
-    let mut int = match signal(SignalKind::interrupt()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "no SIGINT handler");
-            // SIGTERM still works, and it is the one the service manager
-            // sends, so this is a degraded shutdown rather than none.
-            term.recv().await;
-            return "SIGTERM";
-        }
-    };
+    let term = signal(SignalKind::terminate())
+        .map_err(|e| tracing::warn!(error = %e, "no SIGTERM handler; shutdown will not be clean"))
+        .ok();
+    let int = signal(SignalKind::interrupt())
+        .map_err(|e| tracing::warn!(error = %e, "no SIGINT handler"))
+        .ok();
 
-    tokio::select! {
-        _ = term.recv() => "SIGTERM",
-        _ = int.recv() => "SIGINT",
+    async move {
+        match (term, int) {
+            (Some(mut term), Some(mut int)) => tokio::select! {
+                _ = term.recv() => "SIGTERM",
+                _ = int.recv() => "SIGINT",
+            },
+            // SIGTERM is the one the service manager sends, so losing SIGINT
+            // is a degraded shutdown rather than none.
+            (Some(mut term), None) => {
+                term.recv().await;
+                "SIGTERM"
+            }
+            (None, Some(mut int)) => {
+                int.recv().await;
+                "SIGINT"
+            }
+            (None, None) => std::future::pending().await,
+        }
     }
 }
 
 #[cfg(not(unix))]
-async fn stop_signal() -> &'static str {
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => "CTRL-C",
-        Err(e) => {
-            tracing::warn!(error = %e, "no ctrl-c handler; shutdown will not be clean");
-            std::future::pending().await
+fn arm_stop_signal() -> impl std::future::Future<Output = &'static str> {
+    async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => "CTRL-C",
+            Err(e) => {
+                tracing::warn!(error = %e, "no ctrl-c handler; shutdown will not be clean");
+                std::future::pending().await
+            }
         }
     }
 }

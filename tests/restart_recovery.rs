@@ -297,3 +297,52 @@ fn a_daemon_that_loses_the_bind_never_opens_the_database() {
         "a daemon that lost the bind created or migrated the database"
     );
 }
+
+/// A signal that lands while the daemon is still opening its database must
+/// be handled, not fatal.
+///
+/// The socket is connectable the moment it is bound, and the bind now comes
+/// before `Store::open`, so a supervisor (or a test) can SIGTERM the daemon in
+/// that window. Made deterministic by holding a write transaction on the
+/// database: anchord binds, connects succeed, and `Store::open` then blocks on
+/// the lock -- exactly where the default disposition used to kill it.
+#[test]
+fn a_signal_during_database_open_is_handled_not_fatal() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = DataDir::new("sig-open");
+    let db = dir.0.join("anchor/anchor.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let blocker = rusqlite::Connection::open(&db).expect("creating the database");
+    blocker
+        .pragma_update(None, "journal_mode", "WAL")
+        .expect("wal");
+    blocker.execute_batch("BEGIN IMMEDIATE;").expect("lock");
+
+    let mut daemon = Daemon::start(&dir);
+    let _client = connect(&dir.socket());
+    // Bound and connectable; still stuck behind the lock.
+    assert!(
+        daemon.0.try_wait().expect("polling anchord").is_none(),
+        "anchord exited before the signal"
+    );
+
+    // SAFETY: plain kill(2) on our own child.
+    unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    blocker.execute_batch("ROLLBACK;").expect("unlock");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = daemon.0.try_wait().expect("polling anchord") {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "anchord never exited");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        status.signal(),
+        None,
+        "anchord died of the signal instead of handling it: {status:?}"
+    );
+    assert_eq!(status.code(), Some(0), "unclean exit: {status:?}");
+}
