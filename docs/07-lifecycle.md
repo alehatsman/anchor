@@ -97,8 +97,22 @@ What it deliberately does **not** do:
 
 ## Edge cases the implementation must handle
 
-- **Install is idempotent.** Running it twice is not an error and does not
-  stack two registrations.
+- **Install is idempotent, and that has to mean *inert*.** Running it twice
+  is not an error, does not stack two registrations, and — the part that
+  costs something when it is got wrong — does not touch the running daemon.
+  `install` renders the registration, compares it against the one on disk,
+  and returns without acting when the two are identical. Replacing a
+  registration on macOS means `launchctl bootout`, which stops anchord, and
+  every session it was holding dies with it (the boundary above). An install
+  that is idempotent on paper and kills live sessions in practice would
+  break the one property anchor exists for.
+- **A registration that really did change is applied, and said out loud.**
+  On macOS the daemon is restarted and `install` prints that it was, because
+  the restart costs the sessions. On Linux the changed unit is written and
+  reloaded, but systemd will not restart an already-running service, so the
+  old anchord keeps going until it next stops. The platforms differ here
+  deliberately: converging them means restarting anchord on Linux too, which
+  would kill sessions to fix a cosmetic inconsistency.
 - **The binary path is recorded absolutely**, resolved from the running
   executable. A relative path resolves against the service manager's working
   directory, not the user's.
