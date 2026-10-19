@@ -267,3 +267,33 @@ fn a_second_daemon_does_not_touch_the_live_one_s_sessions() {
 
     daemon.kill();
 }
+
+/// A daemon that cannot take the socket must not have opened the database.
+///
+/// `Store::open` migrates -- DDL, a `meta` write, a journal-mode change -- so
+/// opening before the bind lets a stray newer `anchord` rewrite the schema
+/// under the daemon that is serving it, then die. The socket is the only
+/// cross-process lock; here the test holds it, and a fresh data dir makes
+/// "never opened" observable: `anchor.db` must not exist.
+#[test]
+fn a_daemon_that_loses_the_bind_never_opens_the_database() {
+    let dir = DataDir::new("bind-first");
+    let _held = std::os::unix::net::UnixListener::bind(dir.socket()).expect("holding the socket");
+
+    let refused = Command::new(bin("anchord"))
+        .env("XDG_DATA_HOME", &dir.0)
+        .env("XDG_RUNTIME_DIR", dir.0.join("run"))
+        .env("ANCHOR_LOG", "error")
+        .output()
+        .expect("running anchord");
+    assert!(!refused.status.success(), "the bind must have been refused");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("already running"),
+        "expected the bind refusal, got: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        !dir.0.join("anchor/anchor.db").exists(),
+        "a daemon that lost the bind created or migrated the database"
+    );
+}

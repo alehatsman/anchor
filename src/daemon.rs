@@ -4,13 +4,13 @@
 //! Order matters, per docs/02-model.md:
 //!
 //! ```text
-//! resolve data dir -> open SQLite (WAL), migrate -> bind unix socket
+//! resolve data dir -> bind unix socket -> open SQLite (WAL), migrate
 //! -> mark live sessions LOST -> reconcile output_bytes -> serve
 //! ```
 //!
-//! The bind comes before the recovery writes, not after. See the comment on
-//! it: recovery is destructive, and only the process that holds the socket
-//! has the right to perform it.
+//! The bind comes before the database is opened, not after. See the comment
+//! on it: migration and recovery both write, and only the process that holds
+//! the socket has the right to.
 
 use std::sync::{Arc, Mutex};
 
@@ -30,21 +30,29 @@ pub async fn run(paths: &Paths) -> Result<()> {
         "anchord starting"
     );
 
+    // Bind before touching the database -- not just before touching a row.
+    // `Store::open` migrates: DDL, a `meta` write, a `journal_mode` change. A
+    // stray `anchord` from a newer build (an upgrade where the supervisor
+    // races the old daemon) would otherwise apply its migrations to the
+    // database the running daemon is serving, then die at the bind, leaving
+    // the old daemon on a schema it does not know. The socket is the only
+    // cross-process lock there is; `busy_timeout` merely serialises writers.
+    //
+    // Startup recovery is the sharper edge: it rewrites every live session
+    // to LOST, which is right after a crash and catastrophic otherwise -- a
+    // second launch would tell the running daemon's clients their sessions
+    // are gone while the PTYs are still running. Whoever holds the socket is
+    // the only process that may decide what a live row means.
+    //
+    // If `Store::open` then fails, the listener drops and leaves a stale
+    // socket file; the next start already removes that (`server::bind`).
+    let listener = crate::server::bind(paths.socket_path())?;
+
     let store = Store::open(paths)?;
     tracing::info!(
         version = crate::db::schema_version(store.conn())?,
         "schema ready"
     );
-
-    // Bind before touching a single row. Startup recovery rewrites every
-    // live session to LOST, which is right after a crash and catastrophic
-    // otherwise: an accidental second launch — a stray `anchord` in a
-    // shell, a supervisor racing itself — would tell the running daemon's
-    // clients their sessions are gone while the PTYs are still running.
-    //
-    // Claiming the socket first makes that impossible: whoever holds it is
-    // the only process that may decide what a live row means.
-    let listener = crate::server::bind(paths.socket_path())?;
 
     // A restart means no PTY survived: anything still claiming to be live is
     // lost. The log files are intact and remain readable.
