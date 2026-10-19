@@ -267,3 +267,82 @@ fn a_second_daemon_does_not_touch_the_live_one_s_sessions() {
 
     daemon.kill();
 }
+
+/// A daemon that cannot take the socket must not have opened the database.
+///
+/// `Store::open` migrates -- DDL, a `meta` write, a journal-mode change -- so
+/// opening before the bind lets a stray newer `anchord` rewrite the schema
+/// under the daemon that is serving it, then die. The socket is the only
+/// cross-process lock; here the test holds it, and a fresh data dir makes
+/// "never opened" observable: `anchor.db` must not exist.
+#[test]
+fn a_daemon_that_loses_the_bind_never_opens_the_database() {
+    let dir = DataDir::new("bind-first");
+    let _held = std::os::unix::net::UnixListener::bind(dir.socket()).expect("holding the socket");
+
+    let refused = Command::new(bin("anchord"))
+        .env("XDG_DATA_HOME", &dir.0)
+        .env("XDG_RUNTIME_DIR", dir.0.join("run"))
+        .env("ANCHOR_LOG", "error")
+        .output()
+        .expect("running anchord");
+    assert!(!refused.status.success(), "the bind must have been refused");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("already running"),
+        "expected the bind refusal, got: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        !dir.0.join("anchor/anchor.db").exists(),
+        "a daemon that lost the bind created or migrated the database"
+    );
+}
+
+/// A signal that lands while the daemon is still opening its database must
+/// be handled, not fatal.
+///
+/// The socket is connectable the moment it is bound, and the bind now comes
+/// before `Store::open`, so a supervisor (or a test) can SIGTERM the daemon in
+/// that window. Made deterministic by holding a write transaction on the
+/// database: anchord binds, connects succeed, and `Store::open` then blocks on
+/// the lock -- exactly where the default disposition used to kill it.
+#[test]
+fn a_signal_during_database_open_is_handled_not_fatal() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = DataDir::new("sig-open");
+    let db = dir.0.join("anchor/anchor.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let blocker = rusqlite::Connection::open(&db).expect("creating the database");
+    blocker
+        .pragma_update(None, "journal_mode", "WAL")
+        .expect("wal");
+    blocker.execute_batch("BEGIN IMMEDIATE;").expect("lock");
+
+    let mut daemon = Daemon::start(&dir);
+    let _client = connect(&dir.socket());
+    // Bound and connectable; still stuck behind the lock.
+    assert!(
+        daemon.0.try_wait().expect("polling anchord").is_none(),
+        "anchord exited before the signal"
+    );
+
+    // SAFETY: plain kill(2) on our own child.
+    unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    blocker.execute_batch("ROLLBACK;").expect("unlock");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = daemon.0.try_wait().expect("polling anchord") {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "anchord never exited");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        status.signal(),
+        None,
+        "anchord died of the signal instead of handling it: {status:?}"
+    );
+    assert_eq!(status.code(), Some(0), "unclean exit: {status:?}");
+}

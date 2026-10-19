@@ -147,6 +147,29 @@ fn a_longer_log_file_corrects_a_stale_cached_offset() {
     assert_eq!(after.log_capped_at, None);
 }
 
+/// A recorded cap and a stream ahead of the file are both kept as they are:
+/// the file stopped growing at the cap, so the stream length is the row's to
+/// carry, and recovery must not rewind it to the file length.
+#[test]
+fn a_recorded_cap_and_a_stream_ahead_of_it_survive_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths(&dir);
+    let mut store = Store::open(&paths).unwrap();
+
+    let mut session = sample_session();
+    session.output_bytes = 200;
+    session.log_capped_at = Some(12);
+    store.insert(&session).unwrap();
+
+    std::fs::create_dir_all(paths.session_dir(&session.id)).unwrap();
+    std::fs::write(paths.output_log(&session.id), b"hello anchor").unwrap();
+
+    assert_eq!(store.reconcile_output_bytes(&paths).unwrap(), 0);
+    let after = store.get(&session.id).unwrap().unwrap();
+    assert_eq!(after.output_bytes, 200, "the stream length was rewound");
+    assert_eq!(after.log_capped_at, Some(12));
+}
+
 #[test]
 fn a_missing_log_file_caps_at_zero_without_losing_the_offset() {
     let dir = tempfile::tempdir().unwrap();

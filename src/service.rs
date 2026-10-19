@@ -256,16 +256,25 @@ mod platform {
         let listed = Command::new("launchctl")
             .args(["print", &format!("gui/{uid}/{LABEL}")])
             .output();
-        let running = listed.is_ok_and(|o| o.status.success());
         Ok(format!(
             "installed at {}\n{}",
             path.display(),
-            if running {
-                "loaded in launchd"
-            } else {
-                "not loaded — starts at next login, or run `anchor service install` again"
-            }
+            launchd_state(listed)
         ))
+    }
+
+    /// What `launchctl print` can honestly support. Its exit status says the
+    /// agent is registered, which a crash-looping agent also is; it does not
+    /// say anchord is running, so neither does this.
+    pub(super) fn launchd_state(listed: std::io::Result<std::process::Output>) -> String {
+        match listed {
+            Err(e) => format!("cannot tell: running launchctl failed: {e}"),
+            Ok(o) if o.status.success() => {
+                "registered with launchd (not checked: whether anchord is running)".into()
+            }
+            Ok(_) => "not registered — starts at next login, or run `anchor service install` again"
+                .into(),
+        }
     }
 }
 
@@ -292,9 +301,17 @@ mod platform {
     /// Quotes a value for a unit `Key=value` line. `systemd.service(5)`
     /// documents shell-style quoting here; without it a path containing a
     /// space splits `ExecStart` into several words and the unit fails to
-    /// start, after `install` has already reported success.
+    /// start, after `install` has already reported success. `%` is doubled
+    /// because systemd expands `%` specifiers (`%h`, `%n`, ...) in
+    /// `ExecStart`, which would mangle a path that contains one.
     fn quote(value: &str) -> String {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+        format!(
+            "\"{}\"",
+            value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('%', "%%")
+        )
     }
 
     fn systemctl(args: &[&str]) -> bool {
@@ -396,16 +413,35 @@ mod platform {
         if !path.exists() {
             return Ok("not installed".into());
         }
-        let active = systemctl(&["is-active", "--quiet", UNIT]);
+        let active = Command::new("systemctl")
+            .args(["--user", "is-active", UNIT])
+            .output();
         Ok(format!(
             "installed at {}\n{}",
             path.display(),
-            if active {
-                "running"
-            } else {
-                "not running — starts at next login, or run `anchor service install` again"
-            }
+            systemd_state(active)
         ))
+    }
+
+    /// `is-active` prints the unit state (`inactive`, `failed`, ...) and a
+    /// missing user bus prints its complaint to stderr; say whichever it was
+    /// instead of collapsing every failure to "not running".
+    pub(super) fn systemd_state(active: std::io::Result<std::process::Output>) -> String {
+        match active {
+            Err(e) => format!("cannot tell: running systemctl failed: {e}"),
+            Ok(o) if o.status.success() => "running".into(),
+            Ok(o) => {
+                let said = String::from_utf8_lossy(if o.stdout.is_empty() {
+                    o.stderr.as_slice()
+                } else {
+                    o.stdout.as_slice()
+                });
+                format!(
+                    "not running ({}) — starts at next login, or run `anchor service install` again",
+                    said.trim()
+                )
+            }
+        }
     }
 }
 
@@ -455,6 +491,72 @@ pub fn status() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `%` in the path is a specifier to systemd, not a literal; it has to
+    /// be doubled in `ExecStart`. Unverified against a real systemd here: the
+    /// rule is `systemd.service(5)`'s, and this checks only that we apply it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_percent_in_the_path_is_escaped_for_systemd() {
+        let rendered = platform::render(&PathBuf::from("/opt/100%/anchord"));
+        assert!(
+            rendered.contains("ExecStart=\"/opt/100%%/anchord\""),
+            "a bare % is expanded as a specifier: {rendered}"
+        );
+    }
+
+    /// `status` must not claim more than `launchctl print` told it: a failure
+    /// to run it is "cannot tell", and a zero exit is "registered", never
+    /// "running".
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_status_says_only_what_it_knows() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{ExitStatus, Output};
+
+        let out = |code| Output {
+            status: ExitStatus::from_raw(code),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+
+        let cannot =
+            platform::launchd_state(Err(std::io::Error::from(std::io::ErrorKind::NotFound)));
+        assert!(cannot.starts_with("cannot tell"), "{cannot}");
+
+        let registered = platform::launchd_state(Ok(out(0)));
+        assert!(registered.starts_with("registered"), "{registered}");
+
+        let missing = platform::launchd_state(Ok(out(1 << 8)));
+        assert!(missing.starts_with("not registered"), "{missing}");
+    }
+
+    /// Same contract on Linux: a missing `systemctl` is not "not running",
+    /// and the unit's own words (`failed`, a bus error) are passed on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_status_says_only_what_it_knows() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{ExitStatus, Output};
+
+        let cannot =
+            platform::systemd_state(Err(std::io::Error::from(std::io::ErrorKind::NotFound)));
+        assert!(cannot.starts_with("cannot tell"), "{cannot}");
+
+        let failed = platform::systemd_state(Ok(Output {
+            status: ExitStatus::from_raw(3 << 8),
+            stdout: b"failed\n".to_vec(),
+            stderr: Vec::new(),
+        }));
+        assert!(failed.contains("(failed)"), "{failed}");
+
+        let running = platform::systemd_state(Ok(Output {
+            status: ExitStatus::from_raw(0),
+            stdout: b"active\n".to_vec(),
+            stderr: Vec::new(),
+        }));
+        assert_eq!(running, "running");
+    }
 
     /// A path with a space must survive the unit format's quoting. Getting
     /// this wrong is silent: `install` reports success and the service

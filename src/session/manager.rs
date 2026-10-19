@@ -126,7 +126,7 @@ impl SessionManager {
         let id = model::new_session_id();
         let created_at = crate::now_ms();
 
-        let log = OutputLog::open(&self.root.join(&id), self.limits, None)?;
+        let log = OutputLog::open(&self.root.join(&id), self.limits)?;
         let sync = log.sync_handle();
         self.syncer.register(&sync);
         let fanout = Arc::new(Mutex::new(Fanout::new(log)));

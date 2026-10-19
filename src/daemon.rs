@@ -4,13 +4,13 @@
 //! Order matters, per docs/02-model.md:
 //!
 //! ```text
-//! resolve data dir -> open SQLite (WAL), migrate -> bind unix socket
+//! resolve data dir -> bind unix socket -> open SQLite (WAL), migrate
 //! -> mark live sessions LOST -> reconcile output_bytes -> serve
 //! ```
 //!
-//! The bind comes before the recovery writes, not after. See the comment on
-//! it: recovery is destructive, and only the process that holds the socket
-//! has the right to perform it.
+//! The bind comes before the database is opened, not after. See the comment
+//! on it: migration and recovery both write, and only the process that holds
+//! the socket has the right to.
 
 use std::sync::{Arc, Mutex};
 
@@ -30,21 +30,34 @@ pub async fn run(paths: &Paths) -> Result<()> {
         "anchord starting"
     );
 
+    // Armed before the bind, not at the `select!` that awaits it: the socket
+    // is connectable as soon as it is bound, and a signal that lands while
+    // the database is still opening must be handled, not fatal.
+    let stop = arm_stop_signal();
+
+    // Bind before touching the database -- not just before touching a row.
+    // `Store::open` migrates: DDL, a `meta` write, a `journal_mode` change. A
+    // stray `anchord` from a newer build (an upgrade where the supervisor
+    // races the old daemon) would otherwise apply its migrations to the
+    // database the running daemon is serving, then die at the bind, leaving
+    // the old daemon on a schema it does not know. The socket is the only
+    // cross-process lock there is; `busy_timeout` merely serialises writers.
+    //
+    // Startup recovery is the sharper edge: it rewrites every live session
+    // to LOST, which is right after a crash and catastrophic otherwise -- a
+    // second launch would tell the running daemon's clients their sessions
+    // are gone while the PTYs are still running. Whoever holds the socket is
+    // the only process that may decide what a live row means.
+    //
+    // If `Store::open` then fails, the listener drops and leaves a stale
+    // socket file; the next start already removes that (`server::bind`).
+    let listener = crate::server::bind(paths.socket_path())?;
+
     let store = Store::open(paths)?;
     tracing::info!(
         version = crate::db::schema_version(store.conn())?,
         "schema ready"
     );
-
-    // Bind before touching a single row. Startup recovery rewrites every
-    // live session to LOST, which is right after a crash and catastrophic
-    // otherwise: an accidental second launch — a stray `anchord` in a
-    // shell, a supervisor racing itself — would tell the running daemon's
-    // clients their sessions are gone while the PTYs are still running.
-    //
-    // Claiming the socket first makes that impossible: whoever holds it is
-    // the only process that may decide what a live row means.
-    let listener = crate::server::bind(paths.socket_path())?;
 
     // A restart means no PTY survived: anything still claiming to be live is
     // lost. The log files are intact and remain readable.
@@ -75,55 +88,69 @@ pub async fn run(paths: &Paths) -> Result<()> {
     // live log its final fsync.
     tokio::select! {
         result = serving => result,
-        signal = stop_signal() => {
+        signal = stop => {
             tracing::info!(signal, "stopping");
             Ok(())
         }
     }
 }
 
-/// Resolves on the first SIGTERM or SIGINT, naming the one that arrived.
+/// Installs the SIGTERM/SIGINT handlers *now* and returns a future that
+/// resolves on the first of them, naming the one that arrived.
+///
+/// Installing is synchronous, which is the point: a unix socket is connectable
+/// the moment it is bound, so a client can signal the daemon while it is still
+/// opening the database. Armed lazily at the `select!` below, that window
+/// had the default disposition and the signal killed the process outright.
+/// A signal that arrives after this returns is queued on the stream and is
+/// seen as soon as the future is polled, however late.
 ///
 /// SIGINT too: a daemon run in the foreground is stopped with Ctrl-C, and a
 /// developer deserves the same final fsync launchd gets.
 #[cfg(unix)]
-async fn stop_signal() -> &'static str {
+fn arm_stop_signal() -> impl std::future::Future<Output = &'static str> {
     use tokio::signal::unix::{signal, SignalKind};
 
     // A failure to install a handler is not a reason to refuse to serve: the
     // daemon simply keeps the default disposition for that signal, which is
     // exactly where it was before this existed.
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "no SIGTERM handler; shutdown will not be clean");
-            std::future::pending().await
-        }
-    };
-    let mut int = match signal(SignalKind::interrupt()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "no SIGINT handler");
-            // SIGTERM still works, and it is the one the service manager
-            // sends, so this is a degraded shutdown rather than none.
-            term.recv().await;
-            return "SIGTERM";
-        }
-    };
+    let term = signal(SignalKind::terminate())
+        .map_err(|e| tracing::warn!(error = %e, "no SIGTERM handler; shutdown will not be clean"))
+        .ok();
+    let int = signal(SignalKind::interrupt())
+        .map_err(|e| tracing::warn!(error = %e, "no SIGINT handler"))
+        .ok();
 
-    tokio::select! {
-        _ = term.recv() => "SIGTERM",
-        _ = int.recv() => "SIGINT",
+    async move {
+        match (term, int) {
+            (Some(mut term), Some(mut int)) => tokio::select! {
+                _ = term.recv() => "SIGTERM",
+                _ = int.recv() => "SIGINT",
+            },
+            // SIGTERM is the one the service manager sends, so losing SIGINT
+            // is a degraded shutdown rather than none.
+            (Some(mut term), None) => {
+                term.recv().await;
+                "SIGTERM"
+            }
+            (None, Some(mut int)) => {
+                int.recv().await;
+                "SIGINT"
+            }
+            (None, None) => std::future::pending().await,
+        }
     }
 }
 
 #[cfg(not(unix))]
-async fn stop_signal() -> &'static str {
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => "CTRL-C",
-        Err(e) => {
-            tracing::warn!(error = %e, "no ctrl-c handler; shutdown will not be clean");
-            std::future::pending().await
+fn arm_stop_signal() -> impl std::future::Future<Output = &'static str> {
+    async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => "CTRL-C",
+            Err(e) => {
+                tracing::warn!(error = %e, "no ctrl-c handler; shutdown will not be clean");
+                std::future::pending().await
+            }
         }
     }
 }
