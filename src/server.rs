@@ -120,6 +120,11 @@ impl State {
 /// `too_large` rather than buffered.
 const MAX_LINE_BYTES: u64 = 1024 * 1024;
 
+/// How much of a refused line is read and thrown away after `too_large`,
+/// and for how long, so closing does not reset the reply away.
+const TOO_LARGE_DRAIN_BYTES: u64 = 16 * MAX_LINE_BYTES;
+const TOO_LARGE_DRAIN_TIME: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The usable length of `sockaddr_un.sun_path`, minus the NUL.
 ///
 /// 104 on macOS and the BSDs, 108 on Linux; the smaller is used on both
@@ -505,6 +510,23 @@ async fn handle_connection(
             .await?;
             // The rest of that line is unread; the client reconnects rather
             // than desynchronising the framing.
+            //
+            // Not a bare close, though. Closing a unix socket with bytes
+            // still in its receive queue makes Linux reset the connection,
+            // and a reset can discard the reply above before the client
+            // reads it -- `ECONNRESET` where `too_large` was owed, seen on
+            // GitHub's ubuntu runner (anchor#33). So: end our half, then
+            // drain what the client is still sending, bounded in bytes and
+            // time so a client that never stops cannot hold the task.
+            let _ = write_half.shutdown().await;
+            let _ = tokio::time::timeout(
+                TOO_LARGE_DRAIN_TIME,
+                tokio::io::copy(
+                    &mut (&mut reader).take(TOO_LARGE_DRAIN_BYTES),
+                    &mut tokio::io::sink(),
+                ),
+            )
+            .await;
             return Ok(());
         }
         // Answered, not dropped. The whole line was consumed, so the

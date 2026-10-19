@@ -298,10 +298,11 @@ async fn an_oversized_line_is_answered_then_the_connection_is_closed() {
     let padding = "x".repeat(2 * 1024 * 1024);
     let line = format!(r#"{{"id":7,"op":"ping","pad":"{padding}"}}"#) + "\n";
 
-    // The write is expected to fail partway: the daemon answers and closes
-    // at the cap, long before the client has finished sending. A client
-    // must drain the reply anyway rather than reading `EPIPE` as "the
-    // daemon died" -- which is the mistake the answer exists to prevent.
+    // The write may fail partway: the daemon answers at the cap and drains
+    // only so much before it closes, so a long enough line still meets
+    // `EPIPE`. A client must read the reply anyway rather than taking the
+    // failed write as "the daemon died" -- the mistake the answer exists to
+    // prevent.
     let _ = client.writer.write_all(line.as_bytes());
     let _ = client.writer.flush();
 

@@ -108,7 +108,7 @@ impl Client {
             .and_then(|()| self.writer.flush());
 
         // Read before acting on a failed write. The daemon answers a line it
-        // refuses (`too_large`) and closes mid-send, so the write is the
+        // refuses (`too_large`) and can close mid-send, so the write is the
         // part that fails and the reply is the part that says why --
         // docs/04-protocol.md says to read it first.
         let mut response = String::new();

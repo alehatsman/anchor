@@ -170,9 +170,12 @@ desynchronised mid-line: the rest of that line was never read, so anything
 following it would be parsed as the next request and every request after
 would be off by one.
 
-A client sending one will usually see its own write fail before it finishes
-— the daemon answers and closes at the cap, with megabytes still in flight.
-The reply is already on the wire. **Read it before acting on the write
+A client sending one may see its own write fail before it finishes — the
+daemon answers at the cap, ends its side, and drains at most 16 MiB or 2 s
+of what is still arriving before it closes. (The drain is there because
+closing a unix socket with unread input makes Linux reset the connection,
+which can discard the reply before the client reads it.) The reply is
+already on the wire. **Read it before acting on the write
 error**, or the one case the daemon took care to report arrives looking
 exactly like the daemon dying.
 
