@@ -58,7 +58,7 @@ jobs:
       # history the comment on the clippy step above describes. Count what
       # would run, the way scripts/check-citations.py refuses to pass having
       # found no citations. The floor is deliberately below today's count
-      # (154 on both runners): it exists to catch a suite vanishing, not to
+      # (169 on both runners at the time of writing): it exists to catch a suite vanishing, not to
       # make deleting a test a CI edit. Raise it when the count grows.
       - name: the suite must not pass by not running
         shell: bash
