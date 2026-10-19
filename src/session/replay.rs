@@ -1,10 +1,15 @@
 //! The catch-up half of an attach -- read history off `fanout.rs`'s mutex in
 //! bounded rounds, registering a live subscriber only once the remaining gap
-//! is small enough to fit its queue. See the parent module doc
-//! (`session/mod.rs`, the D1 callout) and
-//! docs/04-protocol.md for the design
+//! is small enough to fit its queue. See docs/04-protocol.md for the design
 //! this implements; `mod.rs`'s `Session::attach` is the only place that
 //! constructs a [`Replay`].
+//!
+//! **The queue-overflow race** is the failure this shape exists to prevent:
+//! a subscriber registered *before* its history is served has its live queue
+//! spent on the replay backlog, and is dropped as too slow before it has seen
+//! a live byte. Hence no subscriber exists while history is read, and one is
+//! registered only once the remaining gap fits. Comments below refer to it by
+//! that name.
 
 use std::sync::Arc;
 
@@ -17,7 +22,7 @@ use super::fanout::{Fanout, Subscription};
 /// The most history a subscriber may still owe its client at the moment it is
 /// registered. One eighth of the queue bound, so seven eighths stay free for
 /// live output while the client writes that last stretch out -- which is the
-/// headroom D1 says the design was missing
+/// headroom the queue-overflow race showed the design was missing
 /// (docs/04-protocol.md).
 ///
 /// This derivation is only honest while the queue bound is *actually* a byte
@@ -141,7 +146,7 @@ impl HistoryReplay {
     /// Advances the catch-up loop. `bytes` must be the round's own bytes --
     /// checked by length, not just present for the type checker's sake -- so
     /// passing back the wrong thing (or a placeholder) fails loudly here
-    /// rather than quietly reintroducing the pre-fetch race D1 closed.
+    /// rather than quietly reintroducing the queue-overflow race.
     pub fn written(self, bytes: Vec<u8>) -> Result<ReplayStep, AttachError> {
         assert_eq!(
             bytes.len(),
@@ -349,7 +354,7 @@ mod tests {
     }
 
     /// Builds a `Replay` straight onto a scratch `Fanout`, skipping the PTY
-    /// that `Session::attach` would need. The two D1 fixtures below are about
+    /// that `Session::attach` would need. The two queue-overflow fixtures below are about
     /// the catch-up loop's arithmetic, and that is entirely decided by the
     /// log and the subscriber list -- driving it with a real child would add
     /// timing to a question that has none.
@@ -378,7 +383,7 @@ mod tests {
         }
     }
 
-    /// **D1, structurally.** No subscriber exists while history is still
+    /// **The queue-overflow race, structurally.** No subscriber exists while history is still
     /// being served, so the 8 MiB queue bound cannot be spent on replay --
     /// which is the whole failure
     /// (docs/04-protocol.md). Needs
@@ -449,7 +454,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The other half of D1: convergence is not guaranteed, so the loop must
+    /// The other half of the queue-overflow race: convergence is not guaranteed, so the loop must
     /// have a floor. A producer the client never outruns makes the gap grow
     /// every round; after `MAX_STALLED_ROUNDS` the daemon stops trying,
     /// clamps replay to the freshest `LIVE_GAP_BYTES`, and reports the hole
@@ -513,7 +518,7 @@ mod tests {
     /// argument rather than being reachable off bare `self` -- so a caller
     /// that tries to advance without holding the right bytes (a pre-fetch,
     /// or a placeholder) is caught here instead of silently reintroducing
-    /// the queue-overflow race D1 closed.
+    /// the queue-overflow race.
     #[test]
     #[should_panic(expected = "HistoryReplay::written must be called with this round's own bytes")]
     fn written_rejects_bytes_that_are_not_this_round_s_own() {

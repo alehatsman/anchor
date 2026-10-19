@@ -12,7 +12,19 @@ use tokio::sync::{mpsc, Semaphore};
 
 use crate::log::{LogEvent, OutputLog};
 
-use super::types::Chunk;
+/// One chunk of output, tagged with the offset of its first byte — the
+/// contract a subscriber needs in order to reconnect without a gap or a
+/// duplicate.
+///
+/// `bytes` is an `Arc<[u8]>` so fanning out to N subscribers costs N refcount
+/// clones, not N copies of the chunk.
+#[derive(Debug, Clone)]
+pub struct Chunk {
+    /// Offset of `bytes`'s first byte in the session's output stream.
+    pub offset: u64,
+    /// The chunk's payload.
+    pub bytes: Arc<[u8]>,
+}
 
 /// Queue bound per subscriber: a memory budget, in bytes
 /// (docs/03-pty.md#backpressure).
@@ -195,8 +207,10 @@ pub struct Subscription {
 }
 
 impl Subscription {
-    /// Waits for the next chunk. `None` means the session's fan-out closure
-    /// (and therefore the reader thread's handle to it) is gone.
+    /// Waits for the next chunk. `None` means the subscription has ended:
+    /// the session reached EOF and closed it, this subscriber overflowed its
+    /// budget and was dropped, or the fan-out is gone. [`overflowed`](Self::overflowed)
+    /// tells the second from the others.
     pub async fn recv(&mut self) -> Option<Chunk> {
         let chunk = self.rx.recv().await?;
         self.budget.add_permits(queue_cost(chunk.bytes.len()));
@@ -216,7 +230,7 @@ impl Subscription {
     }
 
     /// Non-blocking drain, used only when finalizing an `exit` frame: even
-    /// with the bounded eof/grace wait in `ws.rs`, a chunk can become ready
+    /// with the bounded eof/grace wait in `stream.rs`, a chunk can become ready
     /// in the same poll that decides to finalize, so this mops it up before
     /// `final_offset` is read. `None` covers both "nothing queued right now"
     /// and "the fan-out is gone" -- finalizing treats them the same.

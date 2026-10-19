@@ -3,7 +3,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use parking_lot::Mutex;
@@ -40,13 +39,11 @@ pub enum CreateError {
     InvalidCwd(PathBuf),
     #[error("command not found: {0}")]
     ExecutableNotFound(String),
-    #[error("too many sessions: {max} already running")]
-    TooManySessions { max: usize },
     #[error("invalid label: {0}")]
     InvalidLabel(#[from] model::labels::InvalidLabel),
     #[error("cols and rows must be between 1 and 1000, got {cols}x{rows}")]
     InvalidSize { cols: u16, rows: u16 },
-    #[error("opening the output log: {0}")]
+    #[error("session storage: {0}")]
     Log(#[from] anyhow::Error),
     #[error("spawning the child: {0}")]
     Spawn(#[source] anyhow::Error),
@@ -63,21 +60,8 @@ pub struct SessionManager {
     limits: LogLimits,
     syncer: LogSyncer,
     sessions: Mutex<Vec<Arc<Session>>>,
-    max_sessions: Option<usize>,
-    /// Counts creates in flight so two concurrent ones cannot both pass the
-    /// cap check before either inserts.
-    reserved: AtomicUsize,
     store: Option<Arc<StdMutex<Store>>>,
     persister: Option<OutputPersister>,
-}
-
-/// Decrements the in-flight count on every exit path from `create`.
-struct ReservationGuard<'a>(&'a AtomicUsize);
-
-impl Drop for ReservationGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
 }
 
 impl SessionManager {
@@ -93,17 +77,9 @@ impl SessionManager {
             limits,
             syncer: LogSyncer::new(limits.sync_interval),
             sessions: Mutex::new(Vec::new()),
-            max_sessions: None,
-            reserved: AtomicUsize::new(0),
             store: None,
             persister: None,
         }
-    }
-
-    /// Caps how many sessions may exist at once.
-    pub fn with_max_sessions(mut self, max_sessions: usize) -> Self {
-        self.max_sessions = Some(max_sessions);
-        self
     }
 
     /// Persists session rows to `store`. Without one the manager is
@@ -119,17 +95,6 @@ impl SessionManager {
         &self.root
     }
 
-    fn reserve_slot(&self) -> Result<ReservationGuard<'_>, CreateError> {
-        let reserved = self.reserved.fetch_add(1, Ordering::SeqCst) + 1;
-        let guard = ReservationGuard(&self.reserved);
-        if let Some(max) = self.max_sessions {
-            if self.sessions.lock().len() + reserved > max {
-                return Err(CreateError::TooManySessions { max });
-            }
-        }
-        Ok(guard)
-    }
-
     /// Spawns a session.
     ///
     /// Order matters, per docs/02-model.md: validate, open the log, insert
@@ -140,8 +105,6 @@ impl SessionManager {
         spec: &SpawnSpec,
         labels: BTreeMap<String, String>,
     ) -> Result<Arc<Session>, CreateError> {
-        let _reservation = self.reserve_slot()?;
-
         if !spec.cwd.is_dir() {
             return Err(CreateError::InvalidCwd(spec.cwd.clone()));
         }
@@ -198,7 +161,7 @@ impl SessionManager {
         // closure has to own its own handles to what it updates.
         let publish_fanout = Arc::clone(&fanout);
         let persister = self.persister.clone();
-        let last_persist_ms = Arc::new(AtomicI64::new(0));
+        let mut last_persist_ms = 0i64;
         let id_for_closure = id.clone();
 
         let env: Vec<(String, String)> = spec
@@ -231,12 +194,8 @@ impl SessionManager {
                 // Throttled, and the queue drops rather than waits — the
                 // reader thread never blocks on SQLite.
                 let now = crate::now_ms();
-                let last = last_persist_ms.load(Ordering::Relaxed);
-                if now - last >= OUTPUT_BYTES_PERSIST_INTERVAL_MS
-                    && last_persist_ms
-                        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                {
+                if now - last_persist_ms >= OUTPUT_BYTES_PERSIST_INTERVAL_MS {
+                    last_persist_ms = now;
                     persister.note_output_bytes(&id_for_closure, next_offset, capped_at);
                 }
             }
@@ -287,10 +246,20 @@ impl SessionManager {
         // half-wired session. Panicking here would take down the caller's
         // connection without an answer — which is exactly how this was
         // found, under thread pressure from a parallel test suite.
+        //
+        // By now the child is running and `pty::spawn` has stood its guard
+        // down, and this session is not in `sessions`, so nobody could ever
+        // `terminate` it: stop it here before failing, or it runs on as an
+        // unreachable orphan. The eof listener goes first so that, whichever
+        // spawn fails, no listener is left that would later `mark_exited`
+        // over the `spawn_failed` row `fail_row` writes.
+        let wiring_failed = |e: std::io::Error| {
+            let _ = session.terminate();
+            self.fail_row(&id, CreateError::Spawn(e.into()))
+        };
+        spawn_eof_listener(Arc::clone(&session), spawned.eof_rx).map_err(wiring_failed)?;
         spawn_exit_listener(Arc::clone(&session), spawned.exit_rx, self.store.clone())
-            .map_err(|e| self.fail_row(&id, CreateError::Spawn(e.into())))?;
-        spawn_eof_listener(Arc::clone(&session), spawned.eof_rx)
-            .map_err(|e| self.fail_row(&id, CreateError::Spawn(e.into())))?;
+            .map_err(wiring_failed)?;
 
         self.sessions.lock().push(Arc::clone(&session));
         Ok(session)
@@ -440,7 +409,9 @@ impl SessionManager {
         }
 
         match &self.store {
-            Some(store) => lock(store).delete(id).map_err(CreateError::Log),
+            Some(store) => lock(store)
+                .delete(id)
+                .map_err(|e| CreateError::Log(e.context("deleting the session row"))),
             // No store: the session existed only in memory, and purging it
             // from the directory above is the whole of forgetting it.
             None => Ok(true),
@@ -488,18 +459,16 @@ fn spawn_exit_listener(
             let Ok(exit) = exit_rx.recv() else { return };
 
             let (exit_code, reason) = match exit.status {
-                // -1 is the conventional "could not be represented" sentinel
-                // for a status that is not a plain exit code, e.g. a signal
-                // death.
+                // The `-1` arm is effectively unreachable: it needs a u32
+                // above i32::MAX. portable-pty reports a signalled child as
+                // exit code 1 (`status.code().unwrap_or(1)`), so a session
+                // killed by SIGHUP/SIGTERM/SIGKILL is recorded as `exit_code:
+                // 1`, indistinguishable from `exit 1`.
                 Some(status) => (Some(i32::try_from(status.exit_code()).unwrap_or(-1)), None),
-                None => (
-                    None,
-                    Some(match exit.lost_reason {
-                        Some(pty::LostReason::KillTimeout) => lost_reason::KILL_TIMEOUT,
-                        // A wait() that errored leaves no exit code either.
-                        Some(pty::LostReason::WaitError) | None => lost_reason::KILL_TIMEOUT,
-                    }),
-                ),
+                // No status means the child was never observed exiting: a kill
+                // timeout, or a `wait()` that errored. Neither leaves an exit
+                // code, and both are recorded as `kill_timeout`.
+                None => (None, Some(lost_reason::KILL_TIMEOUT)),
             };
 
             let exited_at = crate::now_ms();
@@ -578,29 +547,7 @@ fn resolve_executable(command: &str, cwd: &Path, login_shell: bool) -> bool {
             }
         }
     }
-    login_shell && resolves_in_login_shell(command, cwd)
-}
-
-/// Asks the user's login shell whether it can find `command`. The daemon's
-/// own `PATH` is not the one the session will get.
-fn resolves_in_login_shell(command: &str, cwd: &Path) -> bool {
-    // `command -v --` keeps a name that looks like an option from being
-    // parsed as one; the name itself is a separate argv entry either way.
-    std::process::Command::new(pty::login_shell_path())
-        .args([
-            "-l",
-            "-c",
-            r#"command -v -- "$1" >/dev/null 2>&1"#,
-            "sh",
-            command,
-        ])
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    login_shell && pty::resolves_in_login_shell(command, cwd)
 }
 
 fn is_executable_file(path: &Path) -> bool {
