@@ -38,7 +38,8 @@ anchor create --label wm.item=mr:218 -- claude
 anchor ls --label wm.item=mr:218
 anchor attach <id>          # raw passthrough, ~. to detach
 anchor logs <id> --from 0
-anchor kill <id>
+anchor kill <id>            # terminate it
+anchor purge <id>           # forget it: row, labels and output
 ```
 
 Close the terminal, reconnect from another one, and the process never

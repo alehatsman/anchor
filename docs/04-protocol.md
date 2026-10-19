@@ -292,6 +292,7 @@ anchor get <id>                   one session as JSON
 anchor attach <id>                raw-mode passthrough, ~. to detach
 anchor logs <id> [--from N]       dump output
 anchor kill <id>                  terminate
+anchor purge <id>                 forget: row, labels and output
 anchor label <id> k=v             set/remove labels
 anchor daemon                     run anchord in the foreground
 anchor service install|uninstall|status

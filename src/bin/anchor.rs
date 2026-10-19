@@ -74,6 +74,9 @@ enum Command {
     },
     /// Terminate a session.
     Kill { id: String },
+    /// Forget a session: its row, its labels and its output. Refuses a
+    /// session that is still running — `kill` it first.
+    Purge { id: String },
     /// Set or remove labels. `k=v` sets, `k-` removes.
     Label {
         id: String,
@@ -169,6 +172,15 @@ fn main() -> Result<()> {
         Command::Kill { id } => {
             let response = client.call("terminate", json!({ "session": id }))?;
             println!("{}", response["state"].as_str().unwrap_or("exited"));
+            Ok(())
+        }
+        // The daemon already answers `already_exited` for a running session
+        // and `not_found` for an unknown id, and `call` turns either into an
+        // error carrying the code. Adding logic here would only give the two
+        // a second opinion.
+        Command::Purge { id } => {
+            client.call("purge", json!({ "session": id }))?;
+            println!("purged");
             Ok(())
         }
         Command::Label { id, changes } => label(&mut client, &id, &changes),
