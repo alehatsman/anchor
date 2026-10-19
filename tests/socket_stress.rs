@@ -26,13 +26,23 @@ use serde_json::{json, Value};
 const WRITE_TIMEOUT: Duration = Duration::from_millis(2000);
 
 fn harness() -> (tempfile::TempDir, PathBuf) {
-    // SAFETY: set before any other thread in this binary reads it.
-    unsafe {
-        std::env::set_var(
-            "ANCHOR_WRITE_TIMEOUT_MS",
-            WRITE_TIMEOUT.as_millis().to_string(),
-        )
-    };
+    // Every #[tokio::test] in this binary calls harness() from its own
+    // thread, and the daemon reads the variable on those threads' runtimes.
+    // `set_var` racing any other access to the environment is a data race,
+    // so it is done exactly once, and with the same value, behind `Once`.
+    static SET_TIMEOUT: std::sync::Once = std::sync::Once::new();
+    SET_TIMEOUT.call_once(|| {
+        // SAFETY: `Once` makes this the only writer. Readers in this binary
+        // are the daemons the tests start, and each harness() returns -- and
+        // so passes through `call_once`, which blocks until this has run --
+        // before it starts one.
+        unsafe {
+            std::env::set_var(
+                "ANCHOR_WRITE_TIMEOUT_MS",
+                WRITE_TIMEOUT.as_millis().to_string(),
+            )
+        };
+    });
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("anchor.sock");
     let paths = anchor::paths::Paths::new(dir.path().join("data"), socket.clone());
@@ -143,20 +153,28 @@ async fn a_storm_of_attachers_each_gets_a_gapless_stream() {
                 let mut frames = Vec::new();
                 let mut bytes = 0usize;
                 let deadline = Instant::now() + Duration::from_secs(20);
-                // Read a decent stretch, then leave.
+                // Read a decent stretch, then leave. Leaving is the loop's own
+                // doing: an error or an exit before the target is the daemon
+                // dropping a client in the middle of a storm, which is what
+                // this test exists to catch.
                 while bytes < 200_000 && Instant::now() < deadline {
                     match conn.frame() {
                         Ok((frame::OUTPUT, offset, payload)) => {
                             bytes += payload.len();
                             frames.push((offset, payload.len()));
                         }
-                        Ok((frame::LEASE, _, _)) => {}
-                        Ok((frame::EXIT, _, _)) | Err(_) => break,
+                        Ok((frame::EXIT, _, _)) => {
+                            panic!("attacher {n}: told the session exited after {bytes} bytes")
+                        }
                         Ok(_) => {}
+                        Err(e) => panic!("attacher {n}: disconnected after {bytes} bytes: {e}"),
                     }
                 }
                 assert_contiguous(&frames, 0, &format!("attacher {n}"));
-                assert!(bytes > 0, "attacher {n} received nothing");
+                assert!(
+                    bytes >= 200_000,
+                    "attacher {n} got only {bytes} of 200000 bytes before its deadline"
+                );
             })
         })
         .collect();
@@ -238,7 +256,19 @@ async fn a_client_that_stops_reading_never_stalls_the_session() {
                 panic!("a dropped subscriber was told the session exited; it is still running")
             }
             Ok(_) => {}
-            Err(_) => break, // connection closed, which is the contract
+            // Closed is the contract. A *timeout* is not closed: it is the
+            // daemon leaving the socket open with nobody serving it.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                break
+            }
+            Err(e) => panic!("the dropped client's socket was not closed: {e}"),
         }
     }
 
@@ -303,10 +333,19 @@ async fn reconnecting_at_the_last_offset_loses_nothing() {
     first.call("attach", json!({ "session": &id, "from": 0 }));
     let mut consumed = 0u64;
     let mut frames = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
     while consumed < 100_000 {
-        if let Ok((frame::OUTPUT, offset, payload)) = first.frame() {
-            frames.push((offset, payload.len()));
-            consumed = offset + payload.len() as u64;
+        assert!(
+            Instant::now() < deadline,
+            "the first connection stalled at {consumed} bytes"
+        );
+        match first.frame() {
+            Ok((frame::OUTPUT, offset, payload)) => {
+                frames.push((offset, payload.len()));
+                consumed = offset + payload.len() as u64;
+            }
+            Ok(_) => {}
+            Err(e) => panic!("the first connection was closed at {consumed} bytes: {e}"),
         }
     }
     assert_contiguous(&frames, 0, "first connection");
@@ -318,10 +357,19 @@ async fn reconnecting_at_the_last_offset_loses_nothing() {
 
     let mut frames = Vec::new();
     let mut bytes = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(20);
     while bytes < 50_000 {
-        if let Ok((frame::OUTPUT, offset, payload)) = second.frame() {
-            bytes += payload.len();
-            frames.push((offset, payload.len()));
+        assert!(
+            Instant::now() < deadline,
+            "the resumed connection stalled at {bytes} bytes"
+        );
+        match second.frame() {
+            Ok((frame::OUTPUT, offset, payload)) => {
+                bytes += payload.len();
+                frames.push((offset, payload.len()));
+            }
+            Ok(_) => {}
+            Err(e) => panic!("the resumed connection was closed at {bytes} bytes: {e}"),
         }
     }
     // The resumed stream starts exactly where the first one stopped.
