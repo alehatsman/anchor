@@ -26,7 +26,8 @@ sensible candidate is the OS's own per-user service manager.
 ```text
 anchor service install     register anchord with the user's service manager
 anchor service uninstall   remove it
-anchor service status      what is registered, and whether it is running
+anchor service status      what is registered; on macOS, only whether it is loaded
+                           in launchd (not whether anchord is running)
 ```
 
 - **macOS** — a launchd **user agent** in `~/Library/LaunchAgents`.
@@ -48,7 +49,9 @@ The unit restarts anchord if it exits. That is worth having — the next
 session works without anyone noticing — but be exact about what it does not
 do:
 
-**If anchord dies, its PTYs die.** The master fd has no handoff. A restarted
+**If anchord dies, its PTYs lose their master and are hung up.** A child
+that ignores SIGHUP keeps running as an orphan anchor no longer tracks, and
+its row is `lost`. The master fd has no handoff. A restarted
 anchord is a clean daemon whose previous sessions are marked `lost`
 ([02-model.md](02-model.md)). Restart buys continuity of *the service*, not
 of *the sessions*.
@@ -91,8 +94,10 @@ What it deliberately does **not** do:
 - **It does not mark sessions `lost`.** Startup does that, has to do it
   anyway for the crash case, and is the only place that decides what a live
   row means (see the bind-before-recovery note in `daemon.rs`).
-- **It does not terminate sessions gracefully.** PTYs die with the daemon —
-  the master fd closes, and the kernel hangs up each child. That boundary is
+- **It does not terminate sessions gracefully.** PTYs lose their master with
+  the daemon — the master fd closes, and the kernel hangs up each child. A
+  child that ignores SIGHUP survives that as an untracked orphan, and its
+  row is `lost`. That boundary is
   the section above, and a shutdown path is not where it gets renegotiated.
 
 ## Edge cases the implementation must handle
@@ -103,7 +108,7 @@ What it deliberately does **not** do:
   `install` renders the registration, compares it against the one on disk,
   and returns without acting when the two are identical. Replacing a
   registration on macOS means `launchctl bootout`, which stops anchord, and
-  every session it was holding dies with it (the boundary above). An install
+  every session it was holding loses its master with it (the boundary above). An install
   that is idempotent on paper and kills live sessions in practice would
   break the one property anchor exists for.
 - **A registration that really did change is applied, and said out loud.**

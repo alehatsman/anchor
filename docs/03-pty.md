@@ -18,6 +18,10 @@ Anything else is a deadlock waiting for a bad network.
 
 ## Thread model — four dedicated OS threads per session
 
+These four are the PTY layer's. `create` also starts a `session-exit` and a
+`session-eof` listener thread per session (`src/session/manager.rs:290`,
+`:292`), so a session is six OS threads in all.
+
 ```text
                   ┌── reader   read() → append log → advance offset → fanout
                   ├── writer   write()            (can block indefinitely)
@@ -106,7 +110,8 @@ resize. Everyone else observes. Transfer is explicit.
 
 - coalesce: at most one resize per 100ms per session, keep the latest
 - clamp both dimensions to `1..=1000`, reject otherwise as a protocol error
-- persist applied cols/rows, throttled to ~1/s
+- persist applied cols/rows. Every applied size is queued, so the rate is the
+  coalescing rate — up to 10/s — not 1/s
 
 ## Termination
 
@@ -129,8 +134,9 @@ Policy:
 4. still alive → `killpg(pgid, SIGKILL)`
 5. wait **2s** more → give up, `EXITED`, `exit_code=null`,
    `lost_reason="kill_timeout"`
-6. on reader EOF: flush + fsync log, record `exited_at`, `exit_code`, emit
-   `exit` to subscribers, close them
+6. on the reaper's `wait()` returning: flush + fsync log, record
+   `exited_at`, `exit_code`, emit `exit` to subscribers, close them. Reader
+   EOF only closes subscribers; it records nothing ([02-model.md](02-model.md): EXITED fires off the reaper)
 
 **`portable-pty` 0.9's `kill()` is not a hard kill on Unix.** The
 `ChildKiller` handle sends only `SIGHUP`. A child ignoring HUP and TERM

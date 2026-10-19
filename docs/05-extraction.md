@@ -9,19 +9,20 @@ production bugs, these docs came from reading.
 
 ## What to take
 
-From `teleport/daemon/src`:
+From `teleport/daemon/src`, as of teleport `d7f34e9` (line counts date
+themselves; re-measure before relying on one):
 
 ```text
-pty.rs                 804   take wholesale; the rules in 03-pty.md live here
+pty.rs                 808   take wholesale; the rules in 03-pty.md live here
 session/manager.rs     769   take; widen with labels
 session/replay.rs      630   take; this is catch-up-before-register
 session/mod.rs         566   take
 session/fanout.rs      340   take; the 8 MiB bound lives here
-session/osc.rs         238   take if cheap — OSC title parsing is a nicety
-session/types.rs       230   take; add labels
-session/control.rs     157   take
+session/osc.rs         254   left: a client concern ([06](06-teleport-seam.md))
+session/types.rs       252   take; add labels
+session/control.rs     224   take
 log.rs                 585   take wholesale
-persistence.rs       1,716   take the session half; leave the auth tables
+persistence.rs       1,849   take the session half; leave the auth tables
 ```
 
 ## What to leave
@@ -29,12 +30,12 @@ persistence.rs       1,716   take the session half; leave the auth tables
 ```text
 auth.rs                953   teleport product — passkeys, principals
 auth_routes.rs         779   teleport product
-auth_store.rs          708   teleport product
-web_assets.rs          283   teleport product
+auth_store.rs          709   teleport product
+web_assets.rs          287   teleport product
 embedded_web.rs         46   teleport product
 device.rs               83   teleport product
-api.rs               1,414   HTTP surface — anchor speaks a unix socket
-ws.rs                  665   WebSocket framing — anchor has its own (04)
+api.rs               1,821   HTTP surface — anchor speaks a unix socket
+ws.rs                  748   WebSocket framing — anchor has its own (04)
 presets.rs             343   a UX concept; belongs to clients
 ```
 
@@ -44,8 +45,8 @@ presets and resolves them before calling.
 
 ## What to add
 
-1. **Labels** — the whole reason the boundary moves. `session/types.rs:121-129`
-   and `api.rs:597` show the gap: no arbitrary metadata, so every orchestrator
+1. **Labels** — the whole reason the boundary moves. `session/types.rs:118-129`
+   and `api.rs:739` (as of `d7f34e9`) show the gap: no arbitrary metadata, so every orchestrator
    keeps a side-table.
 2. **Label-filtered list.**
 3. **The socket protocol** ([04-protocol.md](04-protocol.md)) replacing HTTP + WS.
@@ -83,8 +84,9 @@ and packaging change weekly and restart freely.
 
 ## What it does not buy
 
-**Crash survival.** If `anchord` dies, its PTYs die. The master fd has no
-handoff. Teleport documented the fix (a broker process per PTY) and chose not
+**Crash survival.** If `anchord` dies, its PTYs lose their master and are
+hung up; a child that ignores SIGHUP keeps running as an orphan anchor no
+longer tracks, and its row is `lost`. The master fd has no handoff. Teleport documented the fix (a broker process per PTY) and chose not
 to pay for it; anchor inherits that choice. See
 [01-scope.md](01-scope.md#open-questions).
 
