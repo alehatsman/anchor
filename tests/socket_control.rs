@@ -400,3 +400,108 @@ async fn a_store_that_cannot_be_read_is_internal_not_not_found() {
         );
     }
 }
+
+/// A one-shot fake daemon: accepts one connection, runs `behave` on it.
+fn fake_daemon(
+    dir: &tempfile::TempDir,
+    behave: impl FnOnce(UnixStream) + Send + 'static,
+) -> std::path::PathBuf {
+    let socket = dir.path().join("fake.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        behave(stream);
+    });
+    socket
+}
+
+/// The reference client reports the daemon's refusal of an over-long line.
+///
+/// The daemon answers `too_large` with id 0 and closes, so the client's
+/// write fails partway and the reply carries an id that is not the
+/// request's. It used to return "sending a request: Broken pipe" -- or, when
+/// the write got through, "response id 0 does not match request 1" -- and
+/// either way the daemon's actual message was thrown away.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_client_reports_too_large_not_a_broken_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = serve(&dir);
+    let mut client = anchor::client::Client::connect(&socket).unwrap();
+
+    let pad = "x".repeat(2 * 1024 * 1024);
+    let err = client
+        .call("ping", serde_json::json!({ "pad": pad }))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("too_large"), "got: {err}");
+}
+
+/// The same, with the write failing *before* the reply is read, which a real
+/// daemon only does by timing. The fake replies and closes without reading,
+/// so the client's write is certain to fail and the reply is certain to be
+/// waiting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_waiting_behind_a_failed_write_is_still_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = fake_daemon(&dir, |mut stream| {
+        stream
+            .write_all(
+                br#"{"id":0,"ok":false,"error":{"code":"too_large","message":"request line too large"}}"#,
+            )
+            .unwrap();
+        stream.write_all(b"\n").unwrap();
+    });
+    let mut client = anchor::client::Client::connect(&socket).unwrap();
+
+    let pad = "x".repeat(8 * 1024 * 1024);
+    let err = client
+        .call("ping", serde_json::json!({ "pad": pad }))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("too_large: request line too large"),
+        "got: {err}"
+    );
+}
+
+/// Id 0 is accepted only as an error. A success that names the wrong id is
+/// still a desynchronised stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_client_still_refuses_a_success_with_the_wrong_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = fake_daemon(&dir, |mut stream| {
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        stream.write_all(b"{\"id\":0,\"ok\":true}\n").unwrap();
+    });
+    let mut client = anchor::client::Client::connect(&socket).unwrap();
+
+    let err = client
+        .call("ping", serde_json::json!({}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not match request"), "got: {err}");
+}
+
+/// A daemon that dies mid-line closed the connection; it did not send a
+/// malformed response.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_cut_short_is_a_closed_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = fake_daemon(&dir, |mut stream| {
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        stream.write_all(br#"{"id":1,"ok":tr"#).unwrap();
+    });
+    let mut client = anchor::client::Client::connect(&socket).unwrap();
+
+    let err = client
+        .call("ping", serde_json::json!({}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("closed the connection"), "got: {err}");
+}

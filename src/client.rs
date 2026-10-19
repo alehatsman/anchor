@@ -87,21 +87,32 @@ impl Client {
 
         let mut line = serde_json::to_vec(&body)?;
         line.push(b'\n');
-        self.writer.write_all(&line).context("sending a request")?;
-        self.writer.flush()?;
+        let sent = self
+            .writer
+            .write_all(&line)
+            .and_then(|()| self.writer.flush());
 
+        // Read before acting on a failed write. The daemon answers a line it
+        // refuses (`too_large`) and closes mid-send, so the write is the
+        // part that fails and the reply is the part that says why --
+        // docs/04-protocol.md says to read it first.
         let mut response = String::new();
-        if self
-            .reader
-            .read_line(&mut response)
-            .context("reading a response")?
-            == 0
-        {
+        let read = self.reader.read_line(&mut response);
+        // A line cut short by the daemon closing is not a reply: `read_line`
+        // hands back what it got, and parsing half a line reports a
+        // malformed response where the truth is a closed connection.
+        if !matches!(read, Ok(n) if n > 0) || !response.ends_with('\n') {
+            sent.context("sending a request")?;
+            read.context("reading a response")?;
             bail!("the daemon closed the connection");
         }
         let value: Value =
             serde_json::from_str(&response).context("the daemon sent a malformed response")?;
-        if value["id"].as_u64() != Some(self.next_id) {
+        // Id 0 is the daemon's answer to a line it could not attribute to a
+        // request -- too large, not UTF-8, not JSON -- so it can only be an
+        // error, and it is the error the caller most needs to see.
+        let unattributed = value["id"].as_u64() == Some(0) && value["ok"] == json!(false);
+        if value["id"].as_u64() != Some(self.next_id) && !unattributed {
             bail!(
                 "response id {} does not match request {}",
                 value["id"],
@@ -146,7 +157,7 @@ impl Client {
     pub fn into_attached(self) -> Result<(FrameStream, UnixStream)> {
         let buffered = self.reader.buffer().to_vec();
         let reading = self.reader.into_inner();
-        Ok((FrameStream::new(buffered, reading), self.writer))
+        Ok((FrameStream::new(buffered, reading)?, self.writer))
     }
 }
 
@@ -169,17 +180,13 @@ impl std::fmt::Debug for FrameStream {
 }
 
 impl FrameStream {
-    fn new(buffered: Vec<u8>, socket: UnixStream) -> Self {
+    fn new(buffered: Vec<u8>, socket: UnixStream) -> Result<Self> {
         let replay = std::io::Cursor::new(buffered);
-        let reader = BufReader::new(
-            socket
-                .try_clone()
-                .unwrap_or_else(|_| socket.try_clone().expect("cloning the socket")),
-        );
-        Self {
+        let reader = BufReader::new(socket.try_clone().context("cloning the socket")?);
+        Ok(Self {
             inner: Box::new(replay.chain(reader)),
             socket,
-        }
+        })
     }
 
     /// Reads one binary frame.
