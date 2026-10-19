@@ -18,16 +18,6 @@ use std::time::{Duration, Instant};
 use anchor::client::Client;
 use serde_json::json;
 
-fn bin(name: &str) -> PathBuf {
-    // target/debug/deps/<test binary> -> target/debug/<name>
-    let mut path = std::env::current_exe().expect("test binary path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join(name)
-}
-
 /// A short-lived data dir under /tmp, kept short enough for a socket path.
 struct DataDir(PathBuf);
 
@@ -55,7 +45,7 @@ struct Daemon(Child);
 
 impl Daemon {
     fn start(dir: &DataDir) -> Self {
-        let child = Command::new(bin("anchord"))
+        let child = Command::new(env!("CARGO_BIN_EXE_anchord"))
             .env("XDG_DATA_HOME", &dir.0)
             .env("XDG_RUNTIME_DIR", dir.0.join("run"))
             .env("ANCHOR_LOG", "warn")
@@ -96,18 +86,27 @@ impl Drop for Daemon {
     }
 }
 
-/// Connects once the socket is accepting, or panics.
-fn connect(socket: &Path) -> Client {
-    let deadline = Instant::now() + Duration::from_secs(10);
+/// Waits for anchord to bind, on the condition rather than on a clock.
+///
+/// A fixed ten-second budget asserts the box was fast, not that the daemon
+/// came up: a cold anchord on a loaded runner takes longer than that, and a
+/// dead one would be reported only after the whole budget ran out. So check
+/// for death directly, and keep the deadline as a backstop against hanging
+/// the suite (docs/08-testing.md; same shape as tests/cli_attach.rs).
+fn connect(daemon: &mut Daemon, socket: &Path) -> Client {
+    let deadline = Instant::now() + Duration::from_secs(120);
     loop {
+        if let Some(status) = daemon.0.try_wait().expect("polling anchord") {
+            panic!("anchord exited before binding its socket: {status}");
+        }
         if let Ok(client) = Client::connect(socket) {
             return client;
         }
         assert!(
             Instant::now() < deadline,
-            "anchord never accepted connections"
+            "anchord is still running but never bound its socket"
         );
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -119,7 +118,7 @@ fn connect(socket: &Path) -> Client {
 fn sigterm_exits_zero_rather_than_dying_of_the_signal() {
     let dir = DataDir::new("term");
     let mut daemon = Daemon::start(&dir);
-    let _client = connect(&dir.socket());
+    let _client = connect(&mut daemon, &dir.socket());
 
     daemon.signal(libc::SIGTERM);
     let status = daemon.wait_within(Duration::from_secs(10));
@@ -138,7 +137,7 @@ fn sigterm_exits_zero_rather_than_dying_of_the_signal() {
 fn sigint_takes_the_same_path() {
     let dir = DataDir::new("int");
     let mut daemon = Daemon::start(&dir);
-    let _client = connect(&dir.socket());
+    let _client = connect(&mut daemon, &dir.socket());
 
     daemon.signal(libc::SIGINT);
     let status = daemon.wait_within(Duration::from_secs(10));
@@ -158,7 +157,7 @@ fn sigint_takes_the_same_path() {
 fn a_running_session_does_not_delay_shutdown() {
     let dir = DataDir::new("live");
     let mut daemon = Daemon::start(&dir);
-    let mut client = connect(&dir.socket());
+    let mut client = connect(&mut daemon, &dir.socket());
 
     let created = client
         .call(
@@ -166,7 +165,14 @@ fn a_running_session_does_not_delay_shutdown() {
             json!({
                 "spec": {
                     "command": "/bin/sh",
-                    "args": ["-c", "stty raw -echo; echo still-here; sleep 300"],
+                    // Ignores both graceful signals, and the ignore survives
+                    // exec into `sleep`. A daemon that waited on this session
+                    // the way `terminate` does would cost the whole 5 s + 2 s
+                    // policy; a plain `sleep 300` dies on the first SIGHUP and
+                    // would make even a polite shutdown look instant. It
+                    // expires by itself because nothing here can reap it.
+                    "args": ["-c", "trap '' HUP TERM; stty raw -echo; echo still-here; \
+                                    i=0; while [ $i -lt 120 ]; do sleep 1; i=$((i+1)); done"],
                     "cwd": "/tmp",
                 },
             }),
@@ -190,9 +196,20 @@ fn a_running_session_does_not_delay_shutdown() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    // Well under what waiting on that session would take, and well under the
+    // ten seconds an idle daemon is allowed above.
     daemon.signal(libc::SIGTERM);
-    let status = daemon.wait_within(Duration::from_secs(10));
+    let status = daemon.wait_within(Duration::from_secs(3));
     assert_eq!(status.code(), Some(0), "unclean exit: {status:?}");
+
+    // The PTY master closing sends the shell a SIGHUP it ignores: put it
+    // down rather than leave it for its 120 s expiry.
+    if let Some(pid) = created["pid"].as_i64() {
+        // SAFETY: a plain kill(2); a recycled pid is vanishingly unlikely
+        // within the test's lifetime and SIGKILL of a stale one is harmless
+        // to this process.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    }
 
     let bytes = std::fs::read(&log).expect("the log file after shutdown");
     assert!(
