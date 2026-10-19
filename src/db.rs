@@ -54,6 +54,20 @@ pub fn open(path: &Path) -> Result<Connection> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
+    // The database holds every session's command, cwd and environment. Create
+    // it owner-only ourselves: `Connection::open` would use the umask, and
+    // SQLite gives `-wal` and `-shm` the mode of the main file, so this one
+    // call covers all three.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+    }
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
 
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -202,6 +216,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(label, "kept");
+    }
+
+    /// The database, and the `-wal`/`-shm` files WAL mode adds beside it,
+    /// carry session environments; none may be readable beyond the owner,
+    /// whatever the umask or the parent directory's mode.
+    #[cfg(unix)]
+    #[test]
+    fn the_database_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anchor.db");
+        let conn = open(&path).unwrap();
+        // Force the WAL and shared-memory files into existence.
+        conn.execute_batch("CREATE TABLE touch (x); INSERT INTO touch VALUES (1);")
+            .unwrap();
+
+        for suffix in ["", "-wal", "-shm"] {
+            let file = dir.path().join(format!("anchor.db{suffix}"));
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} has mode {mode:o}", file.display());
+        }
     }
 
     /// Migrations are forward-only, so a database from a newer build is
