@@ -227,10 +227,16 @@ mod live {
     use anchor::session::{CreateError, SessionManager};
     use anchor::store::Store;
 
+    /// A child that stays alive well past the test. The only platform
+    /// difference here is which program does the waiting.
     fn spec() -> SpawnSpec {
+        #[cfg(unix)]
+        let (command, args) = ("/bin/sh", ["-c", "sleep 30"]);
+        #[cfg(windows)]
+        let (command, args) = ("cmd.exe", ["/c", "ping -n 31 127.0.0.1 >nul"]);
         SpawnSpec {
-            command: "/bin/sh".to_string(),
-            args: vec!["-c".to_string(), "sleep 30".to_string()],
+            command: command.to_string(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
             cwd: std::env::temp_dir(),
             env: BTreeMap::new(),
             cols: 80,

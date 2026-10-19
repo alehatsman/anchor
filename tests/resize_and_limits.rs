@@ -17,10 +17,16 @@ fn paths(dir: &tempfile::TempDir) -> Paths {
     paths
 }
 
+/// A child that stays alive well past the test; only the program differs by
+/// platform.
 fn spec(cols: u16, rows: u16) -> SpawnSpec {
+    #[cfg(unix)]
+    let (command, args) = ("/bin/sh", ["-c", "sleep 30"]);
+    #[cfg(windows)]
+    let (command, args) = ("cmd.exe", ["/c", "ping -n 31 127.0.0.1 >nul"]);
     SpawnSpec {
-        command: "/bin/sh".to_string(),
-        args: vec!["-c".to_string(), "sleep 30".to_string()],
+        command: command.to_string(),
+        args: args.iter().map(|a| (*a).to_string()).collect(),
         cwd: std::env::temp_dir(),
         env: BTreeMap::new(),
         cols,
