@@ -423,7 +423,8 @@ async fn a_slow_terminate_does_not_stall_other_connections() {
         // wait and then hard-kill.
         let id = create_script(
             &mut control,
-            "trap '' HUP TERM; stty raw -echo; echo stubborn; while :; do sleep 1; done",
+            "trap '' HUP TERM; stty raw -echo; echo stubborn; \
+             i=0; while [ $i -lt 120 ]; do sleep 1; i=$((i+1)); done",
         );
         ids.push(id);
     }
@@ -440,6 +441,26 @@ async fn a_slow_terminate_does_not_stall_other_connections() {
             let mut conn = Client::connect(&socket);
             conn.call("terminate", json!({ "session": id }));
         }));
+    }
+
+    // The premise is that every terminate is inside its graceful wait. A ping
+    // sent before that is answered in microseconds whether or not terminate
+    // blocks workers, so wait for the state the policy publishes first. If a
+    // blocked terminate has already starved the workers this `get` stalls and
+    // times out -- also red, which is the right answer.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for id in &ids {
+        loop {
+            let got = control.ok("get", json!({ "session": id }));
+            if got["session"]["state"] == "closing" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminate never started on {id}: {got}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     // While those are blocked in their graceful waits, an unrelated
