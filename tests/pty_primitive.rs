@@ -138,7 +138,7 @@ fn large_write_arrives_intact_and_in_order() {
     // docs/03-pty.md#spawn-details-that-bite). Raw mode also drops ONLCR, so no
     // \n -> \r\n surprises on the way back either. Same lesson the spike
     // already learned the hard way for S3
-    // (teleport docs/15-open-questions.md#s3).
+    // (teleport docs/15-open-questions.md#s3--a-blocking-write-wedges-terminate).
     let (spawned, out_rx) = spawn_sh("stty raw -echo; printf READY; cat", 24, 80);
 
     // `stty` runs, then the sentinel, then `cat` execs -- all sequential in
@@ -231,7 +231,7 @@ fn nonzero_exit_is_recorded_accurately() {
 // keep the pty's master open past the direct child's exit?" -- with two
 // different, *correct* answers, because Linux and macOS genuinely differ here.
 // Split by `target_os` for that reason, not because macOS is flaky. This
-// resolves S5 (teleport docs/15-open-questions.md#s5),
+// resolves S5 (teleport docs/15-open-questions.md#s5--a-detached-grandchild-cannot-hold-a-pty-past-its-parent-on-macos),
 // which was previously a `#[cfg(target_os = "linux")]` gate with an unverified
 // hypothesis attached.
 //
@@ -284,7 +284,7 @@ fn eof_and_exit_are_independent_signals() {
     // (ignoring SIGHUP) keeps the pty's slave side open for a few seconds
     // after. wait() must not be blocked on that, and EOF must not arrive
     // early just because the child already exited
-    // (teleport docs/15-open-questions.md#s2, S2's verified recipe).
+    // (teleport docs/15-open-questions.md#s2--eof-is-not-exit, S2's verified recipe).
     //
     // SIGHUP ignored *before* the fork races the parent's `exit 0` (S2's own
     // finding) is what the grandchild actually needs: fork inherits signal
@@ -413,7 +413,7 @@ fn eof_follows_the_session_leaders_exit_even_with_a_live_grandchild() {
     assert_eq!(
         rc, 0,
         "the grandchild must still be alive after EOF -- macOS revoked its pty \
-         descriptor, it did not kill the process (teleport docs/15-open-questions.md#s5)"
+         descriptor, it did not kill the process (teleport docs/15-open-questions.md#s5--a-detached-grandchild-cannot-hold-a-pty-past-its-parent-on-macos)"
     );
 }
 

@@ -9,9 +9,11 @@
 //! counts, so a stale release from a connection that already lost the lease
 //! cannot clear whoever holds it now.
 //!
-//! teleport's disconnect-grace window is deliberately not ported — anchor's
-//! docs/04-protocol.md leaves lease handover to an open issue, and a grace
-//! period is policy. Revisit with M3.
+//! teleport's disconnect-grace window is deliberately not ported: a grace
+//! period is policy about which *client* a reconnect belongs to, and anchor's
+//! lease is per-connection. teleport keeps its own lease layer above this one
+//! and that is what shipped through M4 and M5 — see docs/06-teleport-seam.md,
+//! which carries the one question still open here.
 
 use super::Session;
 

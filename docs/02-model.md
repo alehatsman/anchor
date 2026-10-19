@@ -91,7 +91,7 @@ continues; only persistence stopped.
 **EXITED fires off the reaper's `wait()`, not off reader EOF.** A descendant
 that inherited the PTY can hold the master open long after the child is gone.
 These are two independent signals and conflating them is a known bug — see
-teleport `docs/15-open-questions.md#s2`.
+teleport `docs/15-open-questions.md#s2--eof-is-not-exit`.
 
 ## Storage
 

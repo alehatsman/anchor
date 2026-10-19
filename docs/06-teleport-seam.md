@@ -59,9 +59,13 @@ a UI wants to show, and a second client would want different ones.
 This is the part of M4 that is new teleport code rather than moved teleport
 code. Plan for it.
 
-## The lease gap, which blocks part of M4
+## The lease gap
 
-anchor's lease is deliberately smaller than teleport's:
+M4 and M5 both shipped without this being settled, so it did not block them
+— teleport kept its own lease layer above anchor's. One of the two gaps has
+since closed.
+
+anchor's lease is still deliberately smaller than teleport's:
 
 | behaviour | teleport | anchor |
 |---|---|---|
@@ -70,24 +74,29 @@ anchor's lease is deliberately smaller than teleport's:
 | explicit claim preempts | yes | yes |
 | check-and-write atomically | yes | yes |
 | **disconnect grace** | `control_grace_ms`, a window where the same `client_id` reclaims | **absent** |
-| **`control_revoked` events** | broadcast to every other connection | **absent** |
+| `control_revoked` events | broadcast to every other connection | broadcast to every attached connection |
 
+**Lease-change notification is no longer a gap.** Every attached connection
+is told when the lease moves, not only the two involved
+([04-protocol.md](04-protocol.md)): `Session::watch_lease` hands each stream
+a `broadcast::Receiver` and `src/stream.rs` subscribes before announcing the
+attach's own lease decision, so a bystander learns control is taken rather
+than discovering it when its keystrokes stop working.
+
+**Disconnect grace remains absent, and is the one that needs an answer.**
 The grace window exists because a browser's WebSocket drops on a phone
 backgrounding or a network blip, and the user's own reconnect must not have
 to fight for its own lease. Per-connection identity cannot express that:
 the reconnect *is* a different connection.
 
-Two of these must be settled before `ws.rs` can be a faithful proxy:
+So one thing is left to settle before `ws.rs` could be a thin proxy rather
+than a lease layer in its own right:
 
 - **Lease identity on the wire.** Either `attach` grows a caller-supplied
   holder id (so a reconnect is the same client), or teleport keeps its own
-  lease layer above anchor and anchor's lease governs only "which teleport".
-- **Lease-change notification.** `control_revoked` tells a bystander who
-  controls now. anchor sends a `lease` frame to the connection that lost it,
-  but nothing to the others.
-
-docs/04-protocol.md already defers lease handover to an open issue. M4 is
-the consumer that forces the answer.
+  lease layer above anchor permanently and anchor's lease governs only
+  "which teleport". The second is what shipped; it is a live arrangement
+  rather than a decision anyone made.
 
 ## Sequencing that does not endanger teleport
 

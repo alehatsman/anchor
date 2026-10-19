@@ -74,8 +74,8 @@ anchor's security model is one sentence, at `src/server.rs:4`:
 > 0600: filesystem permissions are the security boundary, so there is no auth
 > and no TCP.
 
-It is enforced at `src/server.rs:111-117` — a `umask(0o077)` around the bind,
-then an explicit `set_permissions(0o600)`. The data directory is `0700`
+It is enforced in `bind()` at `src/server.rs:139-145` — a `umask(0o077)`
+around the bind, then an explicit `set_permissions(0o600)`. The data directory is `0700`
 (`src/paths.rs:102`) because it holds verbatim terminal transcripts,
 credentials included (`src/paths.rs:77`).
 
@@ -92,7 +92,8 @@ Everything else in this spec is contingent on that answer.
 ### 3.1 The transport seam
 
 There is **no prior art in either repo**. teleport's daemon is TCP
-(`daemon/src/main.rs:353`), which is portable for free, and its anchor client
+(`TcpListener::bind` in `bind_with_fallback`, `daemon/src/main.rs:370`),
+which is portable for free, and its anchor client
 is `UnixStream` (`daemon/src/anchor_client.rs:29`) — that *is* teleport#107.
 Searched both repos including `spike/`: no `NamedPipe`, no `\\.\pipe`. This
 is net-new design, and teleport needs the client half of it too.
@@ -149,8 +150,8 @@ currently works.
 ### 4.2 Stale-socket replacement is dangerous on Windows
 
 On Unix, anchord probes an existing socket and replaces it when nothing
-answers (`src/server.rs:77`) — correct, because a stale socket file is not a
-conflict.
+answers (`bind()` at `src/server.rs:90`, the probe at `:105-117`) — correct,
+because a stale socket file is not a conflict.
 
 **Do not port this behaviour.** On Windows the equivalent is pipe squatting:
 a malicious local process can create `\\.\pipe\<name>` before anchord starts
@@ -199,14 +200,15 @@ the transport work, and required before `anchor attach` works at all.
 ### 4.6 Directory permissions
 
 `0700` via `PermissionsExt` appears at `src/paths.rs:102`, `src/log.rs:454`
-(already `#[cfg(unix)]`-gated) and `src/session/manager.rs:598`. The claim at
+(already `#[cfg(unix)]`-gated) and `src/session/manager.rs:607`. The claim at
 `src/paths.rs:77` — that transcripts are not readable by other users — must
 hold on Windows via an ACL, or the claim has to be narrowed in the doc. It
 may not silently become false.
 
 ### 4.7 Autostart is unsolved, including upstream
 
-`src/service.rs` is macOS + Linux only (`src/service.rs:103`). teleport has a
+`src/service.rs` is macOS + Linux only (`src/service.rs:107` and `:257`).
+teleport has a
 40-line Task Scheduler scaffold (`desktop/src-tauri/src/autostart/windows.rs`)
 that **does not work yet**: attempted 2026-09-06 on real Windows 11 build
 26200, every task-creation attempt returned `Access is denied`
@@ -290,7 +292,8 @@ path while anchord is Unix-only. Possible, not working: `teleportd` does not
 currently compile on Windows at all.
 
 Checked rather than assumed, 2026-10-16. teleport's CI builds
-`windows-latest` (`.github/workflows/ci.yml:39`) and the `daemon
+`windows-latest` (the `daemon` job's matrix,
+`.github/workflows/ci.yml:56-62`) and the `daemon
 (windows-latest)` job is red with `error[E0432]: unresolved import
 tokio::net::UnixStream` at `daemon/src/anchor_client.rs:29`. That is
 teleport#107, and it is a build break rather than a missing feature.
@@ -299,7 +302,7 @@ The sequence matters: teleport's Windows PTY work is **proven** — W1 and S4
 were both verified on real Windows 11 build 26200, and
 `pty_primitive_windows.rs` ran there. The anchor client is what broke the
 build, by declaring four ungated `anchor_*` modules in
-`daemon/src/lib.rs:7-10`. anchor's integration took teleport's Windows build
+`daemon/src/lib.rs:28-33`. anchor's integration took teleport's Windows build
 down, and this deferral leaves it down.
 
 **This also reverses the argument against the obvious fix.** `#[cfg(unix)]`

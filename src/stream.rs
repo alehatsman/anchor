@@ -81,8 +81,10 @@ fn write_timeout() -> Duration {
 /// Serves one attached connection until it ends.
 ///
 /// `holder` identifies this connection for the control lease. One connection
-/// is one client: docs/04-protocol.md leaves lease identity to an open
-/// issue, and per-connection is the honest reading of "exactly one writer".
+/// is one client, which is the honest reading of "exactly one writer" when
+/// nothing on the wire carries a caller-supplied identity. A client that
+/// needs a reconnect to count as the same holder layers that above anchor —
+/// see docs/06-teleport-seam.md.
 pub async fn serve_attached(
     mut out: OwnedWriteHalf,
     input: OwnedReadHalf,

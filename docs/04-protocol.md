@@ -178,8 +178,10 @@ payload stays little-endian because it is an `i32` as the host writes it.
 A `u32` caps one frame at 4 GiB, which no PTY read approaches: the reader
 chunks at 64 KiB.
 
-**An inbound frame is capped at 64 KiB, and the connection is dropped on
-the header alone if it claims more.** Downstream the length is the daemon's
+**An inbound frame is capped at one PTY chunk — 64 KiB — and the connection
+is dropped on the header alone if it claims more.** The cap is
+`MAX_INPUT_FRAME_BYTES`, defined from the reader's `READ_BUFFER_SIZE` rather
+than restated, so the two cannot drift apart (#18). Downstream the length is the daemon's
 own; upstream it is an unverified claim the daemon would allocate on, so
 `len = 0xFFFFFFFF` would be a 4 GiB allocation for free. One chunk is the
 largest thing a real client has to say — a keystroke is a few bytes and a
