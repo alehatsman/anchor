@@ -36,6 +36,18 @@ fn state(paths: anchor::paths::Paths) -> anchor::server::State {
     anchor::server::State::new(manager, store)
 }
 
+/// As [`serve`], but hands back the state so a test can reach the store.
+fn serve_with_state(dir: &tempfile::TempDir) -> (std::path::PathBuf, anchor::server::State) {
+    let socket = dir.path().join("anchor.sock");
+    let listener = anchor::server::bind(&socket).unwrap();
+    let state = state(dir_paths(&socket));
+    let served = state.clone();
+    tokio::spawn(async move {
+        let _ = anchor::server::serve(listener, served).await;
+    });
+    (socket, state)
+}
+
 struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
@@ -344,4 +356,47 @@ async fn a_short_socket_path_still_binds() {
         "the fixture itself is too long"
     );
     anchor::server::bind(&socket).expect("a short path must bind");
+}
+
+/// A store that cannot be read is `internal`, never `not_found`.
+///
+/// `not_found` means "no such session, do not retry". Answering it for a
+/// failing database told a client its record was gone when nothing had been
+/// checked -- worst for `purge`, whose caller then stops caring. The table
+/// is renamed away under the running daemon, so every read of it errors.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_that_cannot_be_read_is_internal_not_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, state) = serve_with_state(&dir);
+    let mut client = Client::connect(&socket);
+
+    // Control: with a healthy store an unknown id really is not_found, so
+    // the assertions below cannot pass by `internal` being the blanket answer.
+    let reply = client.send_raw(r#"{"id":1,"op":"get","session":"nope"}"#);
+    assert_eq!(reply["error"]["code"], "not_found", "{reply}");
+
+    state
+        .store
+        .lock()
+        .unwrap()
+        .conn()
+        .execute_batch("ALTER TABLE sessions RENAME TO sessions_gone;")
+        .unwrap();
+
+    for line in [
+        r#"{"id":2,"op":"get","session":"nope"}"#,
+        r#"{"id":3,"op":"log","session":"nope"}"#,
+        r#"{"id":4,"op":"purge","session":"nope"}"#,
+        r#"{"id":5,"op":"label","session":"nope","set":{"a":"b"}}"#,
+        r#"{"id":6,"op":"terminate","session":"nope"}"#,
+        r#"{"id":7,"op":"resize","session":"nope","cols":80,"rows":24}"#,
+        r#"{"id":8,"op":"attach","session":"nope"}"#,
+    ] {
+        let reply = client.send_raw(line);
+        assert_eq!(reply["ok"], false, "{line}: {reply}");
+        assert_eq!(
+            reply["error"]["code"], "internal",
+            "{line}: a failing store must not read as an absent record: {reply}"
+        );
+    }
 }

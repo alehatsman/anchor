@@ -520,8 +520,9 @@ fn op_get(id: u64, line: &str, state: &State) -> Value {
         Err(e) => return e,
     };
     match lookup(&req.session, state) {
-        Some(session) => proto::ok(id, json!({ "session": proto::session_json(&session) })),
-        None => proto::error(id, ErrorCode::NotFound, "no such session"),
+        Ok(Some(session)) => proto::ok(id, json!({ "session": proto::session_json(&session) })),
+        Ok(None) => proto::error(id, ErrorCode::NotFound, "no such session"),
+        Err(e) => store_failed(id, &e),
     }
 }
 
@@ -553,8 +554,10 @@ fn op_label(id: u64, line: &str, state: &State) -> Value {
 
 fn label_stored(id: u64, req: &LabelReq, state: &State) -> Value {
     let mut store = state.store();
-    let Ok(Some(row)) = store.get(&req.session) else {
-        return proto::error(id, ErrorCode::NotFound, "no such session");
+    let row = match store.get(&req.session) {
+        Ok(Some(row)) => row,
+        Ok(None) => return proto::error(id, ErrorCode::NotFound, "no such session"),
+        Err(e) => return store_failed(id, &e),
     };
     let mut labels = row.labels;
     for key in &req.remove {
@@ -706,8 +709,10 @@ fn op_log(id: u64, line: &str, state: &State) -> Value {
 
     // Reads the file, not the live session: a log outlives its PTY, so an
     // exited or lost session still replays.
-    let Some(row) = lookup(&req.session, state) else {
-        return proto::error(id, ErrorCode::NotFound, "no such session");
+    let row = match lookup(&req.session, state) {
+        Ok(Some(row)) => row,
+        Ok(None) => return proto::error(id, ErrorCode::NotFound, "no such session"),
+        Err(e) => return store_failed(id, &e),
     };
     let path = state
         .manager
@@ -759,8 +764,12 @@ async fn op_purge(id: u64, line: &str, state: &State) -> Value {
     };
     // Nothing to forget is not a failure to forget it, but an id that was
     // never known is still a 404 — a client purging a typo should hear so.
-    if lookup(&req.session, state).is_none() {
-        return proto::error(id, ErrorCode::NotFound, "no such session");
+    match lookup(&req.session, state) {
+        Ok(Some(_)) => {}
+        Ok(None) => return proto::error(id, ErrorCode::NotFound, "no such session"),
+        // A failing store is not an absent record: answering `not_found`
+        // would tell the client the purge is moot when nothing was checked.
+        Err(e) => return store_failed(id, &e),
     }
     // Off the worker too: forgetting a session deletes its directory, and
     // a large log on a slow disk is not something other connections should
@@ -778,11 +787,20 @@ async fn op_purge(id: u64, line: &str, state: &State) -> Value {
 }
 
 /// A session by id: the live one if there is one, otherwise its stored row.
-fn lookup(id: &str, state: &State) -> Option<crate::model::Session> {
+///
+/// `Err` is the store failing to read, which is not the same answer as `None`
+/// (no such session): `not_found` means "do not retry", and a client told
+/// that by a broken database believes a record is gone that is still there.
+fn lookup(id: &str, state: &State) -> anyhow::Result<Option<crate::model::Session>> {
     if let Some(session) = state.manager.get(id) {
-        return Some(session.snapshot());
+        return Ok(Some(session.snapshot()));
     }
-    state.stored_row(id).ok().flatten()
+    state.stored_row(id)
+}
+
+/// The store failing to read: the daemon's problem, never the request's.
+fn store_failed(id: u64, e: &anyhow::Error) -> Value {
+    proto::error(id, ErrorCode::Internal, format!("{e:#}"))
 }
 
 /// Folds live state over a stored row, so a list never reports a running
@@ -798,6 +816,7 @@ fn merge_live(row: &crate::model::Session, state: &State) -> crate::model::Sessi
 fn not_live(id: u64, session: &str, state: &State) -> Value {
     match state.stored_row(session) {
         Ok(Some(_)) => proto::error(id, ErrorCode::AlreadyExited, "session is not running"),
-        _ => proto::error(id, ErrorCode::NotFound, "no such session"),
+        Ok(None) => proto::error(id, ErrorCode::NotFound, "no such session"),
+        Err(e) => store_failed(id, &e),
     }
 }
