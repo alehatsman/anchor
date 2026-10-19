@@ -36,6 +36,18 @@ fn state(paths: anchor::paths::Paths) -> anchor::server::State {
     anchor::server::State::new(manager, store)
 }
 
+/// As [`serve`], but hands back the state so a test can reach the store.
+fn serve_with_state(dir: &tempfile::TempDir) -> (std::path::PathBuf, anchor::server::State) {
+    let socket = dir.path().join("anchor.sock");
+    let listener = anchor::server::bind(&socket).unwrap();
+    let state = state(dir_paths(&socket));
+    let served = state.clone();
+    tokio::spawn(async move {
+        let _ = anchor::server::serve(listener, served).await;
+    });
+    (socket, state)
+}
+
 struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
@@ -344,4 +356,199 @@ async fn a_short_socket_path_still_binds() {
         "the fixture itself is too long"
     );
     anchor::server::bind(&socket).expect("a short path must bind");
+}
+
+/// A store that cannot be read is `internal`, never `not_found`.
+///
+/// `not_found` means "no such session, do not retry". Answering it for a
+/// failing database told a client its record was gone when nothing had been
+/// checked -- worst for `purge`, whose caller then stops caring. The table
+/// is renamed away under the running daemon, so every read of it errors.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_that_cannot_be_read_is_internal_not_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, state) = serve_with_state(&dir);
+    let mut client = Client::connect(&socket);
+
+    // Control: with a healthy store an unknown id really is not_found, so
+    // the assertions below cannot pass by `internal` being the blanket answer.
+    let reply = client.send_raw(r#"{"id":1,"op":"get","session":"nope"}"#);
+    assert_eq!(reply["error"]["code"], "not_found", "{reply}");
+
+    state
+        .store
+        .lock()
+        .unwrap()
+        .conn()
+        .execute_batch("ALTER TABLE sessions RENAME TO sessions_gone;")
+        .unwrap();
+
+    for line in [
+        r#"{"id":2,"op":"get","session":"nope"}"#,
+        r#"{"id":3,"op":"log","session":"nope"}"#,
+        r#"{"id":4,"op":"purge","session":"nope"}"#,
+        r#"{"id":5,"op":"label","session":"nope","set":{"a":"b"}}"#,
+        r#"{"id":6,"op":"terminate","session":"nope"}"#,
+        r#"{"id":7,"op":"resize","session":"nope","cols":80,"rows":24}"#,
+        r#"{"id":8,"op":"attach","session":"nope"}"#,
+    ] {
+        let reply = client.send_raw(line);
+        assert_eq!(reply["ok"], false, "{line}: {reply}");
+        assert_eq!(
+            reply["error"]["code"], "internal",
+            "{line}: a failing store must not read as an absent record: {reply}"
+        );
+    }
+}
+
+/// A one-shot fake daemon: accepts one connection, runs `behave` on it.
+fn fake_daemon(
+    dir: &tempfile::TempDir,
+    behave: impl FnOnce(UnixStream) + Send + 'static,
+) -> std::path::PathBuf {
+    let socket = dir.path().join("fake.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        behave(stream);
+    });
+    socket
+}
+
+/// The reference client reports the daemon's refusal of an over-long line.
+///
+/// The daemon answers `too_large` with id 0 and closes, so the client's
+/// write fails partway and the reply carries an id that is not the
+/// request's. It used to return "sending a request: Broken pipe" -- or, when
+/// the write got through, "response id 0 does not match request 1" -- and
+/// either way the daemon's actual message was thrown away.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_client_reports_too_large_not_a_broken_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = serve(&dir);
+    let mut client = anchor::client::Client::connect(&socket).unwrap();
+
+    let pad = "x".repeat(2 * 1024 * 1024);
+    let err = client
+        .call("ping", serde_json::json!({ "pad": pad }))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("too_large"), "got: {err}");
+}
+
+/// The same, with the write failing *before* the reply is read, which a real
+/// daemon only does by timing. The fake replies and closes without reading,
+/// so the client's write is certain to fail and the reply is certain to be
+/// waiting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_waiting_behind_a_failed_write_is_still_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = fake_daemon(&dir, |mut stream| {
+        stream
+            .write_all(
+                br#"{"id":0,"ok":false,"error":{"code":"too_large","message":"request line too large"}}"#,
+            )
+            .unwrap();
+        stream.write_all(b"\n").unwrap();
+    });
+    let mut client = anchor::client::Client::connect(&socket).unwrap();
+
+    let pad = "x".repeat(8 * 1024 * 1024);
+    let err = client
+        .call("ping", serde_json::json!({ "pad": pad }))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("too_large: request line too large"),
+        "got: {err}"
+    );
+}
+
+/// Id 0 is accepted only as an error. A success that names the wrong id is
+/// still a desynchronised stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_client_still_refuses_a_success_with_the_wrong_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = fake_daemon(&dir, |mut stream| {
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        stream.write_all(b"{\"id\":0,\"ok\":true}\n").unwrap();
+    });
+    let mut client = anchor::client::Client::connect(&socket).unwrap();
+
+    let err = client
+        .call("ping", serde_json::json!({}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not match request"), "got: {err}");
+}
+
+/// A daemon that dies mid-line closed the connection; it did not send a
+/// malformed response.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_cut_short_is_a_closed_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = fake_daemon(&dir, |mut stream| {
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        stream.write_all(br#"{"id":1,"ok":tr"#).unwrap();
+    });
+    let mut client = anchor::client::Client::connect(&socket).unwrap();
+
+    let err = client
+        .call("ping", serde_json::json!({}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("closed the connection"), "got: {err}");
+}
+
+/// The too-long message is one readable line. Its `\` continuations were once
+/// lost, leaving two runs of ~14 spaces in the middle of the sentence.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_socket_path_message_has_no_runs_of_spaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut path = dir.path().to_path_buf();
+    while path.as_os_str().len() <= 103 {
+        path.push("nested-directory-name");
+    }
+    let err = anchor::server::bind(&path.join("anchor.sock"))
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("  "), "stray spaces in: {err}");
+}
+
+/// Every route keeps the request's id when the line is refused: a malformed
+/// attach (missing `session`) and a malformed op body are `invalid_spec`
+/// carrying the id, and a line that is not a request is `bad_request` with
+/// the id salvaged from it when it has one. The request is parsed once now,
+/// so this pins what the single parse must still hand every route.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_refusal_keeps_the_requests_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = serve(&dir);
+    let mut client = Client::connect(&socket);
+
+    let attach = client.send_raw(r#"{"id":42,"op":"attach"}"#);
+    assert_eq!(attach["id"], 42, "{attach}");
+    assert_eq!(attach["error"]["code"], "invalid_spec", "{attach}");
+
+    let get = client.send_raw(r#"{"id":43,"op":"get"}"#);
+    assert_eq!(get["id"], 43, "{get}");
+    assert_eq!(get["error"]["code"], "invalid_spec", "{get}");
+
+    let log = client.send_raw(r#"{"id":45,"op":"log"}"#);
+    assert_eq!(log["id"], 45, "{log}");
+    assert_eq!(log["error"]["code"], "invalid_spec", "{log}");
+
+    let salvaged = client.send_raw(r#"{"id":44,"op":7}"#);
+    assert_eq!(salvaged["id"], 44, "{salvaged}");
+    assert_eq!(salvaged["error"]["code"], "bad_request", "{salvaged}");
+
+    let hopeless = client.send_raw("not json");
+    assert_eq!(hopeless["id"], 0, "{hopeless}");
+    assert_eq!(hopeless["error"]["code"], "bad_request", "{hopeless}");
 }

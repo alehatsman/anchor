@@ -221,8 +221,7 @@ pub mod frame {
 
     /// Decodes a resize payload. `None` if it is not four bytes.
     pub fn decode_size(payload: &[u8]) -> Option<(u16, u16)> {
-        let cols = u16::from_be_bytes(payload.get(0..2)?.try_into().ok()?);
-        let rows = u16::from_be_bytes(payload.get(2..4)?.try_into().ok()?);
-        Some((cols, rows))
+        let [c0, c1, r0, r1] = <[u8; 4]>::try_from(payload).ok()?;
+        Some((u16::from_be_bytes([c0, c1]), u16::from_be_bytes([r0, r1])))
     }
 }

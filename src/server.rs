@@ -4,6 +4,12 @@
 //! 0600: filesystem permissions are the security boundary, so there is no
 //! auth and no TCP.
 //!
+//! **Anything that can wait on disk, a child process or a blocked pty goes
+//! through `spawn_blocking`.** A worker held by one connection stalls every
+//! other connection scheduled on it. `create` (it may run the login shell),
+//! `terminate`, `purge` and `log` follow the rule; the attached connection's
+//! input path is in `stream.rs`.
+//!
 //! [`bind`] is deliberately synchronous and returns a `std` listener, so a
 //! caller can claim the socket — and fail loudly if another daemon already
 //! holds it — before any runtime exists. [`serve`] adopts it.
@@ -15,7 +21,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -76,10 +82,6 @@ impl State {
 /// `too_large` rather than buffered.
 const MAX_LINE_BYTES: u64 = 1024 * 1024;
 
-/// Binds the socket, refusing to displace a daemon that is already running.
-///
-/// A socket file left behind by a dead daemon is stale: nothing accepts on
-/// it, so it is removed and rebound.
 /// The usable length of `sockaddr_un.sun_path`, minus the NUL.
 ///
 /// 104 on macOS and the BSDs, 108 on Linux; the smaller is used on both
@@ -87,6 +89,10 @@ const MAX_LINE_BYTES: u64 = 1024 * 1024;
 /// gives the same answer everywhere.
 const MAX_SOCKET_PATH: usize = 103;
 
+/// Binds the socket, refusing to displace a daemon that is already running.
+///
+/// A socket file left behind by a dead daemon is stale: nothing accepts on
+/// it, so it is removed and rebound.
 pub fn bind(socket_path: &Path) -> Result<StdUnixListener> {
     // Checked before anything else, because the kernel's own answer is
     // `EINVAL` with no mention of length -- which reads as "the path is
@@ -96,7 +102,9 @@ pub fn bind(socket_path: &Path) -> Result<StdUnixListener> {
     let len = socket_path.as_os_str().as_encoded_bytes().len();
     if len > MAX_SOCKET_PATH {
         bail!(
-            "socket path is {len} bytes, past the {MAX_SOCKET_PATH}-byte limit              a unix socket address can hold: {}. Use a shorter directory              (XDG_RUNTIME_DIR, or --socket).",
+            "socket path is {len} bytes, past the {MAX_SOCKET_PATH}-byte limit \
+             a unix socket address can hold: {}. Use a shorter directory \
+             (XDG_RUNTIME_DIR, or `anchor daemon --socket`).",
             socket_path.display()
         );
     }
@@ -171,7 +179,10 @@ pub fn bind(socket_path: &Path) -> Result<StdUnixListener> {
     Ok(listener)
 }
 
-/// Accepts connections until the listener fails. One task per client.
+/// Accepts connections, one task per client, and never returns once setup
+/// succeeds: a failed `accept` is logged and retried, because the ones that
+/// matter (`EMFILE`) are transient and ending the daemon over one would end
+/// every session with it. Errors only if the listener cannot be adopted.
 ///
 /// Takes the `std` listener from [`bind`] and adopts it onto the runtime this
 /// is polled on.
@@ -234,7 +245,7 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
         if read as u64 > MAX_LINE_BYTES {
             respond(
                 &mut write_half,
-                proto::error(0, ErrorCode::TooLarge, "request line too large"),
+                &proto::error(0, ErrorCode::TooLarge, "request line too large"),
             )
             .await?;
             // The rest of that line is unread; the client reconnects rather
@@ -246,11 +257,11 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
         // closing here would make a stray byte indistinguishable from the
         // daemon dying.
         let line = match std::str::from_utf8(&raw) {
-            Ok(line) => line.to_string(),
+            Ok(line) => line,
             Err(_) => {
                 respond(
                     &mut write_half,
-                    proto::error(0, ErrorCode::BadRequest, "request line is not valid UTF-8"),
+                    &proto::error(0, ErrorCode::BadRequest, "request line is not valid UTF-8"),
                 )
                 .await?;
                 continue;
@@ -261,14 +272,34 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
             continue;
         }
 
+        // Parsed once, here: the op decides the route, and a line that is
+        // not a request object is answered `bad_request` for every op alike.
+        let request: Request = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(e) => {
+                // Salvage the id if the line was an object carrying one, so
+                // the client can still correlate the failure.
+                let id = serde_json::from_str::<Value>(line)
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(Value::as_u64))
+                    .unwrap_or(0);
+                respond(
+                    &mut write_half,
+                    &proto::error(id, ErrorCode::BadRequest, format!("malformed request: {e}")),
+                )
+                .await?;
+                continue;
+            }
+        };
+
         // `attach` is the one op that can stop returning to this loop: on
         // success the connection carries binary frames from here on. A
         // refused attach is an ordinary error response and the connection
         // stays a control connection.
-        if is_attach(&line) {
-            match attach_check(&line, &state) {
+        if request.op == "attach" {
+            match attach_check(request.id, line, &state) {
                 Err(err) => {
-                    respond(&mut write_half, err).await?;
+                    respond(&mut write_half, &err).await?;
                     continue;
                 }
                 Ok((session, req)) => {
@@ -280,7 +311,7 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
                     let handshake = crate::stream::Handshake::begin(&session, &holder, req.control);
                     respond(
                         &mut write_half,
-                        proto::ok(
+                        &proto::ok(
                             req.id,
                             json!({
                                 "offset": req.from,
@@ -313,16 +344,17 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
             }
         }
 
-        respond(&mut write_half, dispatch(&line, &state).await).await?;
+        // `log` answers with a typed reply that is serialised straight to
+        // the wire, so it cannot ride `dispatch`'s `Value`.
+        if request.op == "log" {
+            match op_log(request.id, line, &state).await {
+                Ok(reply) => respond(&mut write_half, &reply).await?,
+                Err(err) => respond(&mut write_half, &err).await?,
+            }
+        } else {
+            respond(&mut write_half, &dispatch(&request, line, &state).await).await?;
+        }
     }
-}
-
-/// Whether this line is an `attach`, decided before the op-specific parse so
-/// a malformed attach still gets a normal error response.
-fn is_attach(line: &str) -> bool {
-    serde_json::from_str::<Request>(line)
-        .map(|r| r.op == "attach")
-        .unwrap_or(false)
 }
 
 #[derive(Deserialize)]
@@ -338,15 +370,12 @@ struct AttachReq {
 /// Validates an `attach` without touching the connection, so a refusal can
 /// be answered like any other error and the connection carries on.
 fn attach_check(
+    id: u64,
     line: &str,
     state: &State,
 ) -> Result<(Arc<crate::session::Session>, AttachReq), Value> {
-    let req: AttachReq = serde_json::from_str(line).map_err(|e| {
-        let id = serde_json::from_str::<Request>(line)
-            .map(|r| r.id)
-            .unwrap_or(0);
-        proto::error(id, ErrorCode::InvalidSpec, e.to_string())
-    })?;
+    let req: AttachReq = serde_json::from_str(line)
+        .map_err(|e| proto::error(id, ErrorCode::InvalidSpec, e.to_string()))?;
 
     let Some(session) = state.manager.get(&req.session) else {
         return Err(not_live(req.id, &req.session, state));
@@ -374,29 +403,15 @@ fn attach_check(
 /// connection that worker is responsible for — the daemon's own version of
 /// the rule it enforces for PTY output: nothing slow runs where something
 /// fast has to wait behind it.
-async fn dispatch(line: &str, state: &State) -> Value {
-    let request: Request = match serde_json::from_str(line) {
-        Ok(r) => r,
-        Err(e) => {
-            // Salvage the id if the line was an object carrying one, so the
-            // client can still correlate the failure.
-            let id = serde_json::from_str::<Value>(line)
-                .ok()
-                .and_then(|v| v.get("id").and_then(Value::as_u64))
-                .unwrap_or(0);
-            return proto::error(id, ErrorCode::BadRequest, format!("malformed request: {e}"));
-        }
-    };
-
+async fn dispatch(request: &Request, line: &str, state: &State) -> Value {
     match request.op.as_str() {
         "ping" => proto::ok(request.id, json!({ "pong": true })),
-        "create" => op_create(request.id, line, state),
+        "create" => op_create(request.id, line, state).await,
         "list" => op_list(request.id, line, state),
         "get" => op_get(request.id, line, state),
         "label" => op_label(request.id, line, state),
         "resize" => op_resize(request.id, line, state),
         "terminate" => op_terminate(request.id, line, state).await,
-        "log" => op_log(request.id, line, state),
         "purge" => op_purge(request.id, line, state).await,
         other => proto::error(
             request.id,
@@ -406,8 +421,8 @@ async fn dispatch(line: &str, state: &State) -> Value {
     }
 }
 
-async fn respond(out: &mut (impl AsyncWriteExt + Unpin), value: Value) -> Result<()> {
-    let mut buf = serde_json::to_vec(&value)?;
+async fn respond(out: &mut (impl AsyncWriteExt + Unpin), value: &impl Serialize) -> Result<()> {
+    let mut buf = serde_json::to_vec(value)?;
     buf.push(b'\n');
     out.write_all(&buf).await.context("writing response")?;
     out.flush().await.context("flushing response")?;
@@ -427,7 +442,7 @@ struct CreateReq {
     labels: BTreeMap<String, String>,
 }
 
-fn op_create(id: u64, line: &str, state: &State) -> Value {
+async fn op_create(id: u64, line: &str, state: &State) -> Value {
     let req: CreateReq = match parse(id, line) {
         Ok(r) => r,
         Err(e) => return e,
@@ -437,7 +452,17 @@ fn op_create(id: u64, line: &str, state: &State) -> Value {
         Err(e) => return proto::error(id, ErrorCode::InvalidSpec, format!("resolving cwd: {e}")),
     };
 
-    match state.manager.create(&spec, req.labels) {
+    // Off the worker: `create` may run the user's login shell to completion
+    // to resolve the command, then writes the store and opens the pty. A
+    // slow `.zshrc` would otherwise hold a runtime worker, and every other
+    // connection on it, for as long as the shell takes to start.
+    let manager = Arc::clone(&state.manager);
+    let labels = req.labels;
+    let created = match tokio::task::spawn_blocking(move || manager.create(&spec, labels)).await {
+        Ok(created) => created,
+        Err(e) => return proto::error(id, ErrorCode::Internal, format!("create: {e}")),
+    };
+    match created {
         Ok(session) => proto::ok(
             id,
             json!({
@@ -518,8 +543,9 @@ fn op_get(id: u64, line: &str, state: &State) -> Value {
         Err(e) => return e,
     };
     match lookup(&req.session, state) {
-        Some(session) => proto::ok(id, json!({ "session": proto::session_json(&session) })),
-        None => proto::error(id, ErrorCode::NotFound, "no such session"),
+        Ok(Some(session)) => proto::ok(id, json!({ "session": proto::session_json(&session) })),
+        Ok(None) => proto::error(id, ErrorCode::NotFound, "no such session"),
+        Err(e) => store_failed(id, &e),
     }
 }
 
@@ -551,8 +577,10 @@ fn op_label(id: u64, line: &str, state: &State) -> Value {
 
 fn label_stored(id: u64, req: &LabelReq, state: &State) -> Value {
     let mut store = state.store();
-    let Ok(Some(row)) = store.get(&req.session) else {
-        return proto::error(id, ErrorCode::NotFound, "no such session");
+    let row = match store.get(&req.session) {
+        Ok(Some(row)) => row,
+        Ok(None) => return proto::error(id, ErrorCode::NotFound, "no such session"),
+        Err(e) => return store_failed(id, &e),
     };
     let mut labels = row.labels;
     for key in &req.remove {
@@ -590,7 +618,11 @@ fn op_resize(id: u64, line: &str, state: &State) -> Value {
         return proto::error(
             id,
             ErrorCode::InvalidSpec,
-            "cols and rows must be between 1 and 1000",
+            format!(
+                "cols and rows must be between {} and {}",
+                crate::session::manager::SIZE_RANGE.start(),
+                crate::session::manager::SIZE_RANGE.end()
+            ),
         );
     }
     let Some(session) = state.manager.get(&req.session) else {
@@ -687,11 +719,29 @@ const TERMINATE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 /// a session is what `attach` is for.
 const LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-fn op_log(id: u64, line: &str, state: &State) -> Value {
-    let req: LogReq = match parse(id, line) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
+/// A `log` reply, serialised straight to the wire.
+///
+/// Building this as a `json!` tree turned each of the range's up to 4 MiB
+/// into its own `Value` -- `size_of::<Value>()` bytes apiece -- so the cap
+/// that bounds one read was not the cap on the memory it cost. Fields are in
+/// alphabetical order because `Value`'s map is sorted, and the bytes on the
+/// wire are meant to be exactly what they always were.
+#[derive(Serialize)]
+struct LogReply {
+    /// Raw PTY bytes are not UTF-8 in general -- control sequences, and
+    /// partial multi-byte characters at a chunk boundary. A lossy conversion
+    /// would corrupt the stream, so they go out as an array of numbers.
+    bytes: Vec<u8>,
+    from: u64,
+    id: u64,
+    log_capped_at: Option<u64>,
+    next_offset: u64,
+    ok: bool,
+    to: u64,
+}
+
+async fn op_log(id: u64, line: &str, state: &State) -> Result<LogReply, Value> {
+    let req: LogReq = parse(id, line)?;
     // Clamped, not refused. docs/04-protocol.md has always said one
     // response is "capped at 4 MiB whatever `max` asks for", and refusing
     // instead made that sentence false in the way that matters: a client
@@ -704,50 +754,55 @@ fn op_log(id: u64, line: &str, state: &State) -> Value {
 
     // Reads the file, not the live session: a log outlives its PTY, so an
     // exited or lost session still replays.
-    let Some(row) = lookup(&req.session, state) else {
-        return proto::error(id, ErrorCode::NotFound, "no such session");
+    let row = match lookup(&req.session, state) {
+        Ok(Some(row)) => row,
+        Ok(None) => return Err(proto::error(id, ErrorCode::NotFound, "no such session")),
+        Err(e) => return Err(store_failed(id, &e)),
     };
     let path = state
         .manager
         .root()
         .join(&row.id)
         .join(crate::log::LOG_FILE_NAME);
-    let mut reader = match crate::log::LogReader::open(&path) {
-        Ok(reader) => reader,
+    let from = req.from;
+    // Off the worker: up to 4 MiB from a disk that may be slow.
+    let read = tokio::task::spawn_blocking(move || {
+        crate::log::LogReader::open(&path).map(|mut r| r.read_range(from, from.saturating_add(max)))
+    })
+    .await;
+    let bytes = match read {
+        Ok(Ok(Ok(bytes))) => bytes,
         // Only a missing file is `not_found`. A log that exists and cannot
         // be opened -- permissions, a bad disk -- is the daemon's problem,
         // and answering `not_found` for it claims the session's output is
         // gone when it is sitting right there.
-        Err(e) => {
+        Ok(Err(e)) => {
             let code = if e.kind() == std::io::ErrorKind::NotFound {
                 ErrorCode::NotFound
             } else {
                 ErrorCode::Internal
             };
-            return proto::error(id, code, format!("opening the log: {e}"));
-        }
-    };
-    match reader.read_range(req.from, req.from.saturating_add(max)) {
-        Ok(bytes) => {
-            let len = bytes.len() as u64;
-            proto::ok(
-                id,
-                json!({
-                    "from": req.from,
-                    "to": req.from + len,
-                    "next_offset": row.output_bytes,
-                    "log_capped_at": row.log_capped_at,
-                    // Raw PTY bytes are not UTF-8 in general — control
-                    // sequences, and partial multi-byte characters at a
-                    // chunk boundary. A lossy conversion would corrupt the
-                    // stream, so they go out as a byte array.
-                    "bytes": bytes,
-                }),
-            )
+            return Err(proto::error(id, code, format!("opening the log: {e}")));
         }
         // The range was checked; this is the log file itself failing.
-        Err(e) => proto::error(id, ErrorCode::Internal, format!("reading the log: {e}")),
-    }
+        Ok(Ok(Err(e))) => {
+            return Err(proto::error(
+                id,
+                ErrorCode::Internal,
+                format!("reading the log: {e}"),
+            ))
+        }
+        Err(e) => return Err(proto::error(id, ErrorCode::Internal, format!("log: {e}"))),
+    };
+    Ok(LogReply {
+        from,
+        to: from + bytes.len() as u64,
+        next_offset: row.output_bytes,
+        log_capped_at: row.log_capped_at,
+        id,
+        ok: true,
+        bytes,
+    })
 }
 
 async fn op_purge(id: u64, line: &str, state: &State) -> Value {
@@ -757,8 +812,12 @@ async fn op_purge(id: u64, line: &str, state: &State) -> Value {
     };
     // Nothing to forget is not a failure to forget it, but an id that was
     // never known is still a 404 — a client purging a typo should hear so.
-    if lookup(&req.session, state).is_none() {
-        return proto::error(id, ErrorCode::NotFound, "no such session");
+    match lookup(&req.session, state) {
+        Ok(Some(_)) => {}
+        Ok(None) => return proto::error(id, ErrorCode::NotFound, "no such session"),
+        // A failing store is not an absent record: answering `not_found`
+        // would tell the client the purge is moot when nothing was checked.
+        Err(e) => return store_failed(id, &e),
     }
     // Off the worker too: forgetting a session deletes its directory, and
     // a large log on a slow disk is not something other connections should
@@ -776,11 +835,20 @@ async fn op_purge(id: u64, line: &str, state: &State) -> Value {
 }
 
 /// A session by id: the live one if there is one, otherwise its stored row.
-fn lookup(id: &str, state: &State) -> Option<crate::model::Session> {
+///
+/// `Err` is the store failing to read, which is not the same answer as `None`
+/// (no such session): `not_found` means "do not retry", and a client told
+/// that by a broken database believes a record is gone that is still there.
+fn lookup(id: &str, state: &State) -> anyhow::Result<Option<crate::model::Session>> {
     if let Some(session) = state.manager.get(id) {
-        return Some(session.snapshot());
+        return Ok(Some(session.snapshot()));
     }
-    state.stored_row(id).ok().flatten()
+    state.stored_row(id)
+}
+
+/// The store failing to read: the daemon's problem, never the request's.
+fn store_failed(id: u64, e: &anyhow::Error) -> Value {
+    proto::error(id, ErrorCode::Internal, format!("{e:#}"))
 }
 
 /// Folds live state over a stored row, so a list never reports a running
@@ -796,6 +864,7 @@ fn merge_live(row: &crate::model::Session, state: &State) -> crate::model::Sessi
 fn not_live(id: u64, session: &str, state: &State) -> Value {
     match state.stored_row(session) {
         Ok(Some(_)) => proto::error(id, ErrorCode::AlreadyExited, "session is not running"),
-        _ => proto::error(id, ErrorCode::NotFound, "no such session"),
+        Ok(None) => proto::error(id, ErrorCode::NotFound, "no such session"),
+        Err(e) => store_failed(id, &e),
     }
 }
