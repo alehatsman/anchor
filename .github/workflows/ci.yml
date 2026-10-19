@@ -76,6 +76,32 @@ jobs:
           grep -q "^$want: test$" tests.list || { echo "::error::$want is not listed on $RUNNER_OS"; exit 1; }
       - run: cargo test
 
+  windows:
+    # Its own job rather than a third matrix entry: the Unix job's coverage
+    # step names one fixture per kernel and refuses any other runner, which
+    # is the right answer for it. docs/09-windows.md §5 is the order this
+    # job grows in, and its first obligation is to be able to go red at all.
+    #
+    # Gate 1, 2026-10-19: red, and red the way it should be. `cargo clippy`
+    # fails to compile the library (39 errors: the unix-only `pty` module,
+    # `tokio::net::UnixStream`, termios, `PermissionsExt`), reproduced by
+    # running these exact steps on a real Windows 11 box (build 26200).
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install $env:RUST_VERSION --profile minimal --component clippy
+      - run: rustup default $env:RUST_VERSION
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-latest-cargo-${{ hashFiles('Cargo.lock') }}
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
   citations:
     # Twenty-five doc citations pointed at headings that do not exist before
     # anything read them (#17).
