@@ -279,7 +279,7 @@ fn a_daemon_that_loses_the_bind_never_opens_the_database() {
     let dir = DataDir::new("bind-first");
     let _held = std::os::unix::net::UnixListener::bind(dir.socket()).expect("holding the socket");
 
-    let refused = Command::new(bin("anchord"))
+    let refused = Command::new(env!("CARGO_BIN_EXE_anchord"))
         .env("XDG_DATA_HOME", &dir.0)
         .env("XDG_RUNTIME_DIR", dir.0.join("run"))
         .env("ANCHOR_LOG", "error")
@@ -319,7 +319,7 @@ fn a_signal_during_database_open_is_handled_not_fatal() {
     blocker.execute_batch("BEGIN IMMEDIATE;").expect("lock");
 
     let mut daemon = Daemon::start(&dir);
-    let _client = connect(&dir.socket());
+    let _client = connect(&mut daemon, &dir.socket());
     // Bound and connectable; still stuck behind the lock.
     assert!(
         daemon.0.try_wait().expect("polling anchord").is_none(),
