@@ -21,14 +21,13 @@ pub mod fanout;
 pub mod manager;
 pub mod persist;
 pub mod replay;
-pub mod types;
 
+pub use fanout::Chunk;
 pub use fanout::{Subscription, MAX_QUEUE_BYTES};
 pub use manager::{CreateError, SessionManager};
 pub use replay::{
     Attach, AttachError, HistoryReplay, Replay, ReplayStep, LIVE_GAP_BYTES, REPLAY_ROUND_BYTES,
 };
-pub use types::Chunk;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -308,8 +307,11 @@ impl Session {
         }
         // Announced from here, the one place both the control op and the
         // resize frame reach, and only after the pty accepted it -- so
-        // what goes out is the size that is true, not the size that was
-        // asked for. An error above returns early and announces nothing.
+        // what goes out is the size that was queued to the PTY, not the
+        // size that was asked for. `PtySession::resize` refuses once the
+        // session is closing or exited, and an error above returns early
+        // and announces nothing. (A failed ioctl on the control thread is
+        // still invisible here.)
         //
         // No subscribers is the ordinary case for an unattached session,
         // not a failure.

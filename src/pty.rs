@@ -47,9 +47,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use portable_pty::{
-    native_pty_system, Child, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize,
-};
+use portable_pty::{native_pty_system, Child, CommandBuilder, ExitStatus, MasterPty, PtySize};
 use tracing::warn;
 
 /// Bytes per chunk read from the PTY master.
@@ -298,6 +296,53 @@ fn wrapper_argv(shell: &str, program: &str, args: &[String]) -> Vec<String> {
     argv
 }
 
+/// Asks the user's login shell whether it can find `command`. The daemon's
+/// own `PATH` is not the one the session will get.
+///
+/// Lives beside `wrapper_argv` because it needs the same per-family
+/// knowledge; a POSIX-only probe under fish or tcsh cannot succeed, and
+/// `create` would refuse a program the wrapper would have launched.
+pub fn resolves_in_login_shell(command: &str, cwd: &Path) -> bool {
+    let shell = login_shell_path();
+    std::process::Command::new(&shell)
+        .args(probe_argv(&shell, command))
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// The argv that makes `shell` exit 0 iff it can find `command`. Same rule
+/// as `wrapper_argv`: the script is a fixed literal and the name is a
+/// separate argv entry, never interpolated.
+fn probe_argv(shell: &str, command: &str) -> Vec<String> {
+    let mut argv = match shell_family(shell) {
+        // `--` keeps a name that looks like an option from being parsed as one.
+        ShellFamily::Posix => vec![
+            "-l".to_string(),
+            "-c".to_string(),
+            r#"command -v -- "$1" >/dev/null 2>&1"#.to_string(),
+            "sh".to_string(),
+        ],
+        ShellFamily::Fish => vec![
+            "-l".to_string(),
+            "-c".to_string(),
+            "command -sq -- $argv[1]".to_string(),
+        ],
+        // The builtin `which` exits non-zero when nothing is found. csh has
+        // no `--`, so a name starting with `-` is not protected here.
+        ShellFamily::Csh => vec![
+            "-c".to_string(),
+            "which $argv[1]:q >& /dev/null".to_string(),
+        ],
+    };
+    argv.push(command.to_string());
+    argv
+}
+
 /// Spawns `spec` behind a fresh PTY and starts the four session threads.
 ///
 /// `on_output` runs synchronously on the reader thread for every chunk read.
@@ -352,7 +397,6 @@ pub fn spawn(
     drop(pair.slave);
 
     let pid = child.process_id();
-    let killer = child.clone_killer();
 
     // From here until every thread is running, a failure would leave the
     // child alive with nothing watching it. See `OrphanGuard`.
@@ -371,6 +415,20 @@ pub fn spawn(
     // the kernel again, and signalling it is signalling a stranger.
     let reaped = Arc::new(AtomicBool::new(false));
 
+    // First, so `child` is owned by a thread that will always `wait()`. If
+    // any later spawn fails, `orphan_guard` SIGKILLs the group and this
+    // thread reaps it; spawned last, a failure here (or in the reader or
+    // writer, with `child` still in scope) dropped `child` unreaped, and
+    // `std::process::Child` does not reap on drop -- one zombie per failure.
+    std::thread::Builder::new()
+        .name("pty-reaper".into())
+        .spawn({
+            let control_tx = control_tx.clone();
+            let reaped = Arc::clone(&reaped);
+            move || reaper_thread_main(child, &control_tx, &reaped)
+        })
+        .context("spawning reaper thread")?;
+
     std::thread::Builder::new()
         .name("pty-reader".into())
         .spawn(move || reader_thread_main(reader, on_output, &eof_tx))
@@ -382,29 +440,10 @@ pub fn spawn(
         .context("spawning writer thread")?;
 
     std::thread::Builder::new()
-        .name("pty-reaper".into())
-        .spawn({
-            let control_tx = control_tx.clone();
-            let reaped = Arc::clone(&reaped);
-            move || reaper_thread_main(child, &control_tx, &reaped)
-        })
-        .context("spawning reaper thread")?;
-
-    std::thread::Builder::new()
         .name("pty-control".into())
         .spawn({
             let state = Arc::clone(&state);
-            move || {
-                control_thread_main(
-                    pair.master,
-                    pid,
-                    killer,
-                    &control_rx,
-                    &exit_tx,
-                    &state,
-                    &reaped,
-                )
-            }
+            move || control_thread_main(pair.master, pid, &control_rx, &exit_tx, &state, &reaped)
         })
         .context("spawning control thread")?;
 
@@ -462,6 +501,12 @@ impl TerminalSession for PtySession {
     }
 
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        // The control thread drops a resize that arrives after the state
+        // leaves RUNNING, but `send` would still return Ok -- and the session
+        // layer records, persists and announces whatever this accepts.
+        if self.state.load(Ordering::SeqCst) != STATE_RUNNING {
+            bail!("session is closing or has exited; resize rejected");
+        }
         let cols = cols.clamp(*SIZE_RANGE.start(), *SIZE_RANGE.end());
         let rows = rows.clamp(*SIZE_RANGE.start(), *SIZE_RANGE.end());
         self.control_tx
@@ -556,8 +601,10 @@ fn writer_thread_main(mut writer: Box<dyn Write + Send>, write_rx: &Receiver<Vec
     for chunk in write_rx {
         // `write_all` can block indefinitely if the child never reads. That
         // is contained to this thread by design — it never touches resize or
-        // terminate. A permanently stuck write leaks this thread until the
-        // session is dropped; accepted, not solved here.
+        // terminate. Dropping the session drops `write_tx`, which does not
+        // wake a thread blocked inside `write_all`: a permanently stuck write
+        // holds this thread until the slave side closes; accepted, not
+        // solved here.
         if writer.write_all(&chunk).is_err() {
             break;
         }
@@ -583,7 +630,6 @@ fn reaper_thread_main(
 fn control_thread_main(
     master: Box<dyn MasterPty + Send>,
     pid: Option<u32>,
-    _killer: Box<dyn ChildKiller + Send + Sync>,
     control_rx: &Receiver<ControlEvent>,
     exit_tx: &SyncSender<PtyExit>,
     state: &Arc<AtomicU8>,
@@ -979,6 +1025,48 @@ mod login_shell_tests {
             "no shell to test against; the suite proved nothing"
         );
         eprintln!("login-shell wrapper exercised against {tested} shell(s)");
+    }
+
+    /// The create preflight must agree with the wrapper about every family:
+    /// a command the shell can find is found, one it cannot is not. Run, not
+    /// string-matched, for the same reason as above.
+    #[test]
+    fn the_probe_finds_what_each_installed_shell_can_find() {
+        let mut tested = 0;
+        for shell in [
+            "/bin/sh",
+            "/bin/bash",
+            "/bin/zsh",
+            "/bin/csh",
+            "/bin/tcsh",
+            "/usr/bin/fish",
+            "/usr/local/bin/fish",
+            "/opt/homebrew/bin/fish",
+        ] {
+            if !std::path::Path::new(shell).exists() {
+                continue;
+            }
+            tested += 1;
+            let ran = |command: &str| {
+                std::process::Command::new(shell)
+                    .args(probe_argv(shell, command))
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .unwrap_or_else(|e| panic!("running {shell}: {e}"))
+                    .success()
+            };
+            assert!(ran("ls"), "{shell} did not find ls");
+            assert!(
+                !ran("no-such-command-anchor-xyzzy"),
+                "{shell} claimed to find a command that does not exist"
+            );
+        }
+        assert!(
+            tested > 0,
+            "no shell to test against; the suite proved nothing"
+        );
     }
 
     /// The csh family is the reason this classification exists: `-l` beside
