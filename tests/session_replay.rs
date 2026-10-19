@@ -1,6 +1,6 @@
 //! M3's gate: replay and live output meet exactly once, with no gap and no
-//! duplicate -- ROADMAP.md and the
-//! attach-boundary half of ROADMAP.md
+//! duplicate (docs/04-protocol.md; the fixtures are the M1 port listed in
+//! ROADMAP.md)
 //!
 //! `cfg(unix)`-gated because the fixtures drive a real `/bin/sh`; the
 //! platform-independent offset accounting is in `output_log.rs`.
@@ -10,7 +10,6 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anchor::log::LogLimits;
@@ -18,17 +17,6 @@ use anchor::model::SpawnSpec;
 use anchor::session::{AttachError, Session, SessionManager};
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
-
-fn sessions_root(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "anchor-replay-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before 1970")
-            .as_nanos()
-    ))
-}
 
 /// A session that emits exactly `bytes` bytes of `yes` output as fast as it
 /// can, then blocks forever reading its own stdin. `stty raw -echo` keeps
@@ -116,7 +104,8 @@ fn spawn_emitting_forever(manager: &SessionManager) -> std::sync::Arc<Session> {
 #[tokio::test]
 async fn disconnect_between_chunks_and_reconnect_has_no_gap_or_duplicate() {
     const TOTAL: usize = 2 * 1024 * 1024;
-    let manager = SessionManager::new(sessions_root("gate"));
+    let dir = tempfile::tempdir().expect("a tempdir");
+    let manager = SessionManager::new(dir.path().to_path_buf());
     let session = spawn_emitting(&manager, TOTAL);
 
     // First connection: replay whatever already exists, then go live.
@@ -143,7 +132,7 @@ async fn disconnect_between_chunks_and_reconnect_has_no_gap_or_duplicate() {
     }
 
     // Disconnect *between* chunks, and let the session run on with nobody
-    // attached -- the case ROADMAP.md says must survive.
+    // attached -- the case docs/04-protocol.md requires to survive.
     drop(first.subscription);
 
     // Wait for the condition the assertion below actually depends on --
@@ -212,13 +201,19 @@ async fn disconnect_between_chunks_and_reconnect_has_no_gap_or_duplicate() {
 /// The same boundary, hammered: re-attach over and over against a writer
 /// that never stops, taking one chunk each time. Every attach point lands
 /// somewhere different relative to the reader thread's append, and none of
-/// them may gap or duplicate (ROADMAP.md "attach while the reader is
-/// mid-write -- hammer with a concurrent writer").
+/// them may gap or duplicate (teleport's roadmap asked for exactly this:
+/// "attach while the reader is mid-write -- hammer with a concurrent writer").
+///
+/// The writer really never stops: a bounded emitter (`yes | head -c 4 MiB`)
+/// is finished within a fraction of a second, and of 200 rounds only the first
+/// few would have overlapped a producer at all. Every round is required to
+/// take a live chunk, which a finished producer cannot supply -- so each one
+/// attached mid-write by construction.
 #[tokio::test]
 async fn repeated_attach_against_a_concurrent_writer_never_gaps() {
-    const TOTAL: usize = 4 * 1024 * 1024;
-    let manager = SessionManager::new(sessions_root("fuzz"));
-    let session = spawn_emitting(&manager, TOTAL);
+    let dir = tempfile::tempdir().expect("a tempdir");
+    let manager = SessionManager::new(dir.path().to_path_buf());
+    let session = spawn_emitting_forever(&manager);
 
     let mut acc: Vec<u8> = Vec::new();
     let mut end: u64 = 0;
@@ -241,19 +236,21 @@ async fn repeated_attach_against_a_concurrent_writer_never_gaps() {
         );
 
         // Take one live chunk before dropping, so the subscriber path is
-        // exercised at the boundary too -- not just the file read.
-        if acc.len() < TOTAL {
-            if let Ok(Some(chunk)) =
-                tokio::time::timeout(RECV_TIMEOUT, attach.subscription.recv()).await
-            {
-                assert_eq!(
-                    chunk.offset, end,
-                    "round {round}: first live chunk must start at the boundary"
-                );
-                acc.extend_from_slice(&chunk.bytes);
-                end += chunk.bytes.len() as u64;
-            }
-        }
+        // exercised at the boundary too -- not just the file read. A writer
+        // that never stops always has one coming; not getting it is the
+        // failure, not a reason to skip the check.
+        let chunk = tokio::time::timeout(RECV_TIMEOUT, attach.subscription.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("round {round}: no live chunk from a writer that never stops")
+            })
+            .unwrap_or_else(|| panic!("round {round}: the live subscription ended"));
+        assert_eq!(
+            chunk.offset, end,
+            "round {round}: first live chunk must start at the boundary"
+        );
+        acc.extend_from_slice(&chunk.bytes);
+        end += chunk.bytes.len() as u64;
     }
 
     let on_disk = std::fs::read(session.log_path()).expect("read output.vt");
@@ -274,7 +271,8 @@ async fn repeated_attach_against_a_concurrent_writer_never_gaps() {
 async fn attaching_past_next_offset_is_offset_ahead() {
     const BURST: u64 = 1024;
 
-    let manager = SessionManager::new(sessions_root("ahead"));
+    let dir = tempfile::tempdir().expect("a tempdir");
+    let manager = SessionManager::new(dir.path().to_path_buf());
     let session = spawn_emitting(&manager, usize::try_from(BURST).expect("BURST is 1024"));
 
     // Let the whole burst land before attaching to anything. `spawn_emitting`
@@ -337,7 +335,8 @@ async fn replay_across_a_cap_stops_at_the_cap_and_live_output_continues() {
         warn_bytes: CAP / 2,
         ..LogLimits::default()
     };
-    let manager = SessionManager::with_limits(sessions_root("cap"), limits);
+    let dir = tempfile::tempdir().expect("a tempdir");
+    let manager = SessionManager::with_limits(dir.path().to_path_buf(), limits);
     // Must still be producing when the assertions below run -- the point of
     // the cap is that live streaming outlives persistence.
     let session = spawn_emitting_forever(&manager);
