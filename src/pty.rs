@@ -53,7 +53,12 @@ use portable_pty::{
 use tracing::warn;
 
 /// Bytes per chunk read from the PTY master.
-const READ_BUFFER_SIZE: usize = 64 * 1024;
+///
+/// Public because the protocol's inbound frame cap is defined as exactly one
+/// chunk (`crate::stream`): a client claiming more than the reader could ever
+/// produce in one go is not typing. Keeping that cap derived from this value
+/// is what stops the two drifting apart silently (#18).
+pub const READ_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Capacity of the write-request channel. Writes are caller-paced
 /// (keystrokes, pasted input), so a bounded blocking channel is fine here —
@@ -83,7 +88,13 @@ const KILL_WAIT: Duration = Duration::from_secs(2);
 /// Resize dimensions are clamped to this range. Rejecting an out-of-range
 /// value is a protocol error one layer up; clamping here is the backstop that
 /// keeps a bad number out of `TIOCSWINSZ`.
-const SIZE_RANGE: std::ops::RangeInclusive<u16> = 1..=1000;
+///
+/// This is the single definition. The layer above rejects rather than clamps
+/// — docs/03-pty.md asks for both — but it re-exports this constant instead
+/// of restating the number, so the reject and the clamp cannot disagree
+/// (#18). The bound belongs here because it is a property of the ioctl, not
+/// of the protocol.
+pub const SIZE_RANGE: std::ops::RangeInclusive<u16> = 1..=1000;
 
 const STATE_RUNNING: u8 = 0;
 const STATE_CLOSING: u8 = 1;

@@ -44,6 +44,16 @@ const EXIT_REAP_GRACE: Duration = Duration::from_secs(5);
 /// see the call site.
 const INPUT_END_GRACE: Duration = Duration::from_millis(250);
 
+/// The largest inbound frame payload the daemon will allocate for.
+///
+/// An upstream `len` is an unverified claim (docs/04-protocol.md), so this is
+/// a security bound, not a tuning knob: without it `len = 0xFFFFFFFF` buys a
+/// 4 GiB allocation for free. One PTY read is `READ_BUFFER_SIZE` and a
+/// keystroke is a handful of bytes, so a client claiming more than a single
+/// chunk is not typing. Derived rather than restated, so changing the
+/// reader's buffer cannot leave this cap meaning something else (#18).
+const MAX_INPUT_FRAME_BYTES: usize = crate::pty::READ_BUFFER_SIZE;
+
 /// Default for how long one frame write may take before the connection is
 /// closed.
 ///
@@ -351,9 +361,7 @@ async fn pump_input(
             return; // client went away
         }
         let (tag, _offset, len) = frame::decode_header(&header);
-        // One PTY read is 64 KiB, and a keystroke is a handful of bytes; a
-        // client claiming more than a chunk is not typing.
-        if len > 64 * 1024 {
+        if len > MAX_INPUT_FRAME_BYTES {
             tracing::warn!(len, "oversized input frame; dropping the connection");
             return;
         }

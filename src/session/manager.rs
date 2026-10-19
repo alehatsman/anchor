@@ -26,8 +26,12 @@ use super::{ControlLease, Runtime, Session};
 const OUTPUT_BYTES_PERSIST_INTERVAL_MS: i64 = 1_000;
 
 /// The one effective PTY size a session may have, per docs/02-model.md's
-/// create sequence. `pty.rs` clamps to the same range as a backstop.
-pub const SIZE_RANGE: std::ops::RangeInclusive<u16> = 1..=1000;
+/// create sequence.
+///
+/// Re-exported from `pty.rs`, which owns it and clamps to the same range as a
+/// backstop. This layer rejects what that layer would clamp; both reading the
+/// one constant is what keeps those two answers consistent (#18).
+pub use crate::pty::SIZE_RANGE;
 
 /// Why a create was refused. Each maps onto a protocol error code.
 #[derive(Debug, thiserror::Error)]
