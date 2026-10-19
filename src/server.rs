@@ -502,7 +502,7 @@ fn code_for(e: &CreateError) -> ErrorCode {
         CreateError::StillRunning => ErrorCode::AlreadyExited,
         // A cap refusal and a failed spawn are both "it did not start";
         // the message says which.
-        CreateError::TooManySessions { .. } | CreateError::Spawn(_) => ErrorCode::SpawnFailed,
+        CreateError::Spawn(_) => ErrorCode::SpawnFailed,
         // Opening the log is the daemon's own storage failing, not
         // anything about the request.
         CreateError::Log(_) => ErrorCode::Internal,

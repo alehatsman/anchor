@@ -204,45 +204,6 @@ async fn terminate_leaves_the_session_listed_until_purged() {
     );
 }
 
-/// M4 review: `max_sessions` used to be checked and released under the lock,
-/// then re-acquired to insert -- concurrent creates could all pass the check
-/// before any of them inserted, overshooting the cap. `create()` itself does
-/// real, non-trivial work between check and insert (validating `cwd`,
-/// resolving the executable, forking the child), which is exactly the window
-/// real concurrent callers would race in.
-#[test]
-fn concurrent_creates_never_exceed_max_sessions() {
-    let manager =
-        Arc::new(SessionManager::new(sessions_root("max-sessions-race")).with_max_sessions(3));
-    let cwd = temp_dir();
-
-    let handles: Vec<_> = (0..10)
-        .map(|_| {
-            let manager = Arc::clone(&manager);
-            let cwd = cwd.clone();
-            std::thread::spawn(move || {
-                let args = vec!["-c".to_string(), "sleep 2".to_string()];
-                manager.create(&spec(&args, 80, 24, &cwd), BTreeMap::new())
-            })
-        })
-        .collect();
-
-    let results: Vec<_> = handles
-        .into_iter()
-        .map(|h| h.join().expect("creator thread panicked"))
-        .collect();
-    let succeeded: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
-    assert_eq!(
-        succeeded.len(),
-        3,
-        "at most max_sessions creates may succeed, even racing"
-    );
-
-    for session in succeeded {
-        let _ = session.terminate();
-    }
-}
-
 /// A subscriber that reads gets exactly what the session wrote, in order,
 /// with monotonically increasing, non-overlapping offsets between
 /// consecutive chunks.
@@ -391,4 +352,68 @@ async fn slow_subscriber_is_disconnected_and_never_blocks_the_reader() {
         disconnected.is_ok(),
         "slow subscriber was never disconnected -- unbounded buffering"
     );
+}
+
+/// A resize that arrives while the session is closing is refused, not
+/// recorded: the PTY's control thread drops it, so the size the session
+/// reports, persists and announces would otherwise be one the terminal
+/// never had. The child ignores HUP and TERM, which holds the session in
+/// `closing` for the whole graceful wait instead of racing it.
+#[test]
+fn resize_while_closing_is_refused_and_not_recorded() {
+    let manager = SessionManager::new(sessions_root("resize-closing"));
+    let cwd = temp_dir();
+    let args = vec![
+        "-c".to_string(),
+        "trap '' HUP TERM; echo TRAPPED; while :; do sleep 1; done".to_string(),
+    ];
+    let session = manager
+        .create(&spec(&args, 80, 24, &cwd), BTreeMap::new())
+        .expect("create");
+
+    // Output exists only once the trap is installed; terminating earlier
+    // would let HUP kill the shell and close the window we are testing.
+    wait_until(DEFAULT_TIMEOUT, "the trap to be installed", || {
+        session.next_offset() > 0
+    });
+
+    let mut size_changes = session.watch_size();
+    let terminator = {
+        let session = Arc::clone(&session);
+        std::thread::spawn(move || session.terminate())
+    };
+
+    // `write` is refused as soon as the PTY leaves `running`, which makes
+    // it the observable edge of the closing window.
+    wait_until(
+        DEFAULT_TIMEOUT,
+        "the session to stop accepting input",
+        || session.write(b"x").is_err(),
+    );
+
+    assert!(
+        session.resize(100, 40).is_err(),
+        "a resize during closing must be refused"
+    );
+    assert_eq!(session.size(), (80, 24), "the refused size was recorded");
+    assert!(
+        size_changes.try_recv().is_err(),
+        "a refused size was announced to subscribers"
+    );
+
+    terminator
+        .join()
+        .expect("terminator panicked")
+        .expect("terminate");
+}
+
+/// Polls `cond` until it holds, failing with `what` after `timeout`. A
+/// condition, not a sleep: the backstop is generous because it only ever
+/// bounds a failure.
+fn wait_until(timeout: Duration, what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
