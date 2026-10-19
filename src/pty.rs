@@ -15,25 +15,10 @@
 //! **that closure must never block**, for the same reason the reader loop
 //! must not. This file cannot enforce it; it is a contract on the caller.
 //!
-//! **Unix only, by omission rather than by blocker.** This deferral used to
-//! cite teleport's `#W1` (a gracefully-exiting ConPTY child was never
-//! observed as exited) as unresolved. It was fixed on 2026-09-05 --
-//! teleport#9 -- and this comment went stale for six weeks while reading as
-//! a live obstacle.
-//!
-//! The root cause was never reaping. conhost's ConPTY startup handshake
-//! writes a cursor-position query (`ESC[6n`) to the pty and blocks its
-//! IO thread waiting for a reply; the child had already exited and conhost
-//! was still mid-handshake, so nothing tore down. Answering that one query
-//! returns `wait()` in single-digit milliseconds. teleport's
-//! `ConptyDsrProbe` does exactly that and then stops answering, so a later
-//! `ESC[6n` from the application still gets a real cursor position --
-//! the stopping is the subtle half, since a probe that kept replying would
-//! corrupt every app that asks.
-//!
-//! So what remains for Windows is a port, not a research problem: bring the
-//! probe and its test across, and decide the access-control story, since
-//! `server.rs`'s 0600 boundary has no named-pipe equivalent. When Windows
+//! **Unix only, by omission rather than by blocker.** The ConPTY exit
+//! handshake that made this look hard is solved upstream, so what remains is
+//! a port plus an access-control decision -- `server.rs`'s 0600 boundary has
+//! no named-pipe equivalent. docs/09-windows.md carries both. When Windows
 //! lands, every `#[cfg(windows)]` it needs belongs in this module and
 //! nowhere else.
 

@@ -34,7 +34,7 @@ Port from `teleport/daemon/tests/`: `pty_primitive`, `output_log`,
 Exit:
 - every ported test passes
 - a 10 MiB burst of output past the 8 MiB bound
-  (`tests/session_backpressure.rs:325`) to a deliberately slow subscriber
+  (`tests/session_backpressure.rs`) to a deliberately slow subscriber
   disconnects **that subscriber** and the PTY reader never stalls
 - a child that ignores SIGHUP and SIGTERM is still reaped
 - kill `anchord`, restart: sessions are `LOST`, logs are intact and readable

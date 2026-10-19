@@ -481,7 +481,7 @@ async fn write_frame(
     payload: &[u8],
 ) -> Result<()> {
     let frame = frame::encode(tag, offset, payload);
-    // Bounded: see WRITE_TIMEOUT. A client that is not draining its socket
+    // Bounded: see `write_timeout`. A client that is not draining its socket
     // must not hold a task indefinitely.
     let write = async {
         out.write_all(&frame).await.context("writing a frame")?;

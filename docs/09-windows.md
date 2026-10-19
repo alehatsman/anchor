@@ -62,11 +62,29 @@ structure:
 
 | piece | teleport | anchor insertion point |
 |---|---|---|
-| `ConptyDsrProbe` | `daemon/src/pty.rs:444-520` | `src/pty.rs:350-353`, one `#[cfg(windows)]` line |
+| `ConptyDsrProbe` | `daemon/src/pty.rs:444-520` | `spawn` in `src/pty.rs`, one `#[cfg(windows)]` line |
 | Windows terminate arm | `daemon/src/pty.rs:683-690` | see §3 — **not** a straight copy |
-| `drop(pair.slave)` gate | `daemon/src/pty.rs:284` | `src/pty.rs:341` |
+| `drop(pair.slave)` gate | `daemon/src/pty.rs:284` | the `drop(pair.slave)` in `spawn`, `src/pty.rs` |
 | `login_shell_path` (COMSPEC) | `daemon/src/pty.rs:191` | `src/pty.rs`, alongside the csh arm |
 | `pty_primitive_windows.rs` | `daemon/tests/` | `tests/` |
+
+### Why `ConptyDsrProbe` exists
+
+Worth recording, because the fix does not look like the symptom. A
+gracefully-exiting ConPTY child was once never observed as exited — teleport's
+`#W1`, fixed 2026-09-05 in teleport#9.
+
+The root cause was never reaping. conhost's ConPTY startup handshake writes a
+cursor-position query (`ESC[6n`) to the pty and blocks its IO thread waiting
+for a reply. The child had already exited and conhost was still mid-handshake,
+so nothing tore down. Answering that one query returns `wait()` in single-digit
+milliseconds.
+
+`ConptyDsrProbe` answers it and then **stops** answering, which is the subtle
+half: a probe that kept replying would corrupt every application that asks for
+a cursor position of its own.
+
+So Windows is a port, not a research problem.
 
 **The negative knowledge transfers too, and is the expensive part to
 rediscover.** ConPTY has no raw input mode: every byte crosses conhost's VT
@@ -77,15 +95,15 @@ or it oversubscribes its own runner.
 
 ## 2. The decision that gates everything
 
-anchor's security model is one sentence, at `src/server.rs:4`:
+anchor's security model is one sentence, in `src/server.rs`'s module doc:
 
 > 0600: filesystem permissions are the security boundary, so there is no auth
 > and no TCP.
 
-It is enforced in `bind()` at `src/server.rs:139-145` — a `umask(0o077)`
+It is enforced in `bind()` (`src/server.rs`) — a `umask(0o077)`
 around the bind, then an explicit `set_permissions(0o600)`. The data directory is `0700`
-(`src/paths.rs:102`) because it holds verbatim terminal transcripts,
-credentials included (`src/paths.rs:77`).
+(`create_owner_only`, `src/paths.rs`) because it holds verbatim terminal
+transcripts, credentials included (`Paths::ensure_dirs`).
 
 **A named pipe has no 0600.** Windows access control is a DACL on the pipe
 object, and anchor would be acquiring an access-control model for the first
@@ -107,7 +125,7 @@ Searched both repos including `spike/`: no `NamedPipe`, no `\\.\pipe`. This
 is net-new design, and teleport needs the client half of it too.
 
 Today the concrete type is spread across the client surface, not hidden
-behind one seam (`src/client.rs:52,53,130,146,162,202`). The seam has to be
+behind one seam (`src/client.rs`). The seam has to be
 introduced before a second arm is possible:
 
 - `src/server.rs` — `bind()` returns a `StdUnixListener` today and callers
@@ -145,7 +163,7 @@ decision, since both depend on the access-control answer.
 
 ### 4.1 `Interrupt::stop()` has no named-pipe equivalent
 
-`src/client.rs:208` ends a blocked read from another thread with
+`Interrupt` (`src/client.rs`) ends a blocked read from another thread with
 `UnixStream::shutdown(Shutdown::Both)`. This is what lets a client detach
 from a quiet session instead of hanging on output that may never come.
 
@@ -158,7 +176,8 @@ currently works.
 ### 4.2 Stale-socket replacement is dangerous on Windows
 
 On Unix, anchord probes an existing socket and replaces it when nothing
-answers (`bind()` at `src/server.rs:90`, the probe at `:105-117`) — correct,
+answers (`MAX_SOCKET_PATH` and the staleness probe in `bind()`,
+`src/server.rs`) — correct,
 because a stale socket file is not a conflict.
 
 **Do not port this behaviour.** On Windows the equivalent is pipe squatting:
@@ -179,7 +198,7 @@ squatted server cannot act as the user who connected to it.
 
 ### 4.4 The terminate arm conflicts with anchor's existing comment
 
-anchor's step-2 comment (`src/pty.rs:615`) states:
+anchor's step-2 comment (in `control_thread_main`, `src/pty.rs`) states:
 
 > Not dropping the master — the reader and writer hold their own dups of the
 > same open file description, so dropping it closes nothing and raises no
@@ -190,7 +209,7 @@ True on Unix and **exactly backwards on Windows**, where dropping the master
 The comment must be split by platform, not extended.
 
 Mechanically, anchor moves `master` into `control_thread_main`
-(`src/pty.rs:573`); teleport wraps it `let mut master = Some(master)` so
+(`src/pty.rs`); teleport wraps it `let mut master = Some(master)` so
 `.take()` works, with a note on why that needs `#[allow]` rather than
 `#[expect]` (whether `unused_mut` fires is itself platform-dependent).
 
@@ -201,21 +220,21 @@ Windows implementations of those three, keeping the loop platform-free.
 
 ### 4.5 The CLI blocks on `libc::poll`
 
-`src/bin/anchor.rs:461` polls `STDIN_FILENO` directly. Windows needs a
+`stdin_readable` (`src/bin/anchor.rs`) polls `STDIN_FILENO` directly. Windows needs a
 console-input path (`ReadConsoleInput` or a reader thread). Independent of
 the transport work, and required before `anchor attach` works at all.
 
 ### 4.6 Directory permissions
 
-`0700` via `PermissionsExt` appears at `src/paths.rs:102`, `src/log.rs:454`
-(already `#[cfg(unix)]`-gated) and `src/session/manager.rs:607`. The claim at
-`src/paths.rs:77` — that transcripts are not readable by other users — must
+`0700` via `PermissionsExt` appears in `create_owner_only` (`src/paths.rs`)
+and `create_dir_owner_only` (`src/log.rs`, already `#[cfg(unix)]`-gated).
+The claim on `Paths::ensure_dirs` — that transcripts are not readable by other users — must
 hold on Windows via an ACL, or the claim has to be narrowed in the doc. It
 may not silently become false.
 
 ### 4.7 Autostart is unsolved, including upstream
 
-`src/service.rs` is macOS + Linux only (`src/service.rs:107` and `:257`).
+`src/service.rs` is macOS + Linux only (its two `platform` modules).
 teleport has a
 40-line Task Scheduler scaffold (`desktop/src-tauri/src/autostart/windows.rs`)
 that **does not work yet**: attempted 2026-09-06 on real Windows 11 build
@@ -264,7 +283,7 @@ the ones a future reader will be tempted to re-propose.
 
 **Q1. Does anchor acquire an access-control model? → Yes, (a).**
 
-Today `src/server.rs:4` can say "there is no auth" and mean it, because the
+Today `src/server.rs`'s module doc can say "there is no auth" and mean it, because the
 filesystem says it instead. On Windows that sentence needs a DACL behind it.
 Three options:
 

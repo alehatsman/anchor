@@ -177,9 +177,9 @@ pub struct Attach {
     pub log_capped_at: Option<u64>,
     /// False when the catch-up loop gave up: the client kept losing ground,
     /// so `replay_from` was moved forward and the bytes behind it were
-    /// dropped. M4 has nothing extra to send -- the hole is visible as a jump
-    /// in the offset prefix, which clients must already handle for the
-    /// log-cap case (docs/04-protocol.md).
+    /// dropped. Nothing extra is sent -- the hole is visible as a jump in the
+    /// offset prefix, which clients must already handle for the log-cap case
+    /// (docs/04-protocol.md).
     pub caught_up: bool,
     /// The live handle: every chunk from here starts at or after
     /// `next_offset`.
@@ -292,8 +292,8 @@ impl Replay {
 #[derive(Debug, thiserror::Error)]
 pub enum AttachError {
     /// The client holds an offset the daemon never handed out -- a purged
-    /// log, or a stale client after a `lost` session. M4 renders this as the
-    /// `offset_ahead` error frame (docs/04-protocol.md).
+    /// log, or a stale client after a `lost` session. Rendered on the wire as
+    /// the `offset_ahead` error (docs/04-protocol.md).
     #[error("requested offset {requested} is ahead of next_offset {next_offset}")]
     OffsetAhead {
         /// The offset the client asked to resume from.
@@ -558,11 +558,10 @@ mod tests {
     }
 
     /// Issue #1 finding 4: `Open` (the initial `fanout.log.reader()` call)
-    /// and `Read` (any `read_range` during catch-up) used to be one `Io`
-    /// variant with a message hardcoded to the open case, so a read failure
-    /// several rounds into a large backlog read as though the daemon had
-    /// never managed to open the log at all. Guards against the two
-    /// collapsing back into one variant, or trading messages.
+    /// and `Read` (any `read_range` during catch-up) must stay distinct. As
+    /// one variant with the open case's message, a read failure several
+    /// rounds into a large backlog read as though the log had never opened
+    /// at all. Guards against them collapsing back, or trading messages.
     #[test]
     fn open_and_read_failures_report_distinct_messages() {
         let boom = || std::io::Error::other("boom");
@@ -580,18 +579,11 @@ mod tests {
         assert_ne!(open, read);
     }
 
-    /// Issue #1 finding 6: a `read_range` failure mid-catch-up used to drop
-    /// the whole `Replay` -- cursor, stall counters and open `LogReader`
-    /// alike -- along with the error, leaving no way to resume through the
-    /// session API except the caller reconstructing the offset from its own
-    /// bookkeeping (impossible on the very first round, which has no prior
-    /// successful round to derive it from). `AttachError::Read` now carries
-    /// that offset itself: `Session::attach(offset)` picks the walk back up
-    /// exactly there, so recovery doesn't depend on the caller having kept
-    /// count. Both `next_round` call sites (the per-round history read and
-    /// the final post-registration read) feed their own resume point in --
-    /// `self.cursor` and `replay_from` respectively -- this pins the
-    /// message shape so a future edit can't drop the offset again.
+    /// Issue #1 finding 6: `AttachError::Read` carries the offset to resume
+    /// at, so recovery does not depend on the caller having kept count --
+    /// which it cannot have done on the very first round, where there is no
+    /// prior successful round to derive an offset from. Pins the message
+    /// shape so a future edit cannot drop the offset again.
     #[test]
     fn read_failure_carries_the_offset_to_resume_at() {
         let err = AttachError::Read {

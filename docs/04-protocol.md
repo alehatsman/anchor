@@ -6,7 +6,7 @@ auth. Filesystem permissions (0600) are the security boundary — see
 [01-scope.md](01-scope.md): remote access is a client's job.
 
 **A variable that is set but empty does not count as set.** Both lookups
-treat `""` as absent and fall through (`non_empty_env`, `src/paths.rs:91`).
+treat `""` as absent and fall through (`non_empty_env`, `src/paths.rs`).
 A client that skips this resolves `$XDG_RUNTIME_DIR/anchor.sock` to the
 *relative* path `anchor.sock` when the variable is empty, then reports
 anchord unreachable while naming no cause — the daemon is fine and the
@@ -207,14 +207,15 @@ the same discipline the log file uses, deliberately: **recover by offset,
 never by guessing.**
 
 **The first frame on an attach is always a `LEASE` frame, with offset 0**
-(`src/stream.rs:112`), announcing whether this connection holds control. It
+(`serve_attached`, `src/stream.rs`), announcing whether this connection
+holds control. It
 comes before any `OUTPUT`, and a client must not read its `off` as a byte
 position.
 
 **The first `OUTPUT` frame need not start at `from`.** If the log is capped,
 or catch-up gives up on a client that keeps losing ground, the daemon moves
 the replay start forward and the bytes behind it are dropped
-(`src/session/replay.rs:174-177`). The hole is visible as a **jump in the
+(`Attach::caught_up`, `src/session/replay.rs`). The hole is visible as a **jump in the
 offset prefix**: the first frame's `off` is greater than `from`. A client
 must treat `off` as authoritative, never assume `off == from`, and never
 assume the stream it holds is contiguous from `from`.
@@ -331,7 +332,7 @@ recorded: the reported `state` is normally terminal, and a `purge` sent
 immediately after it will not be refused as still-running. The two are
 written by different threads, so the reply waits for the second — without
 it the obvious terminate-then-purge sequence races against itself. The wait
-is bounded (2 s, `TERMINATE_SETTLE`, `src/server.rs:685`): if the exit is
+is bounded (2 s, `TERMINATE_SETTLE`, `src/server.rs`): if the exit is
 not recorded by then the reply goes out anyway, so a client must check
 `state` rather than assume it, and a `purge` right after may still see
 `already_exited`.

@@ -296,14 +296,12 @@ impl SessionManager {
         //
         // Nesting labels -> store is one-way by rule, and the rule is the
         // other side's to keep: **nothing may hold the store lock while it
-        // touches a `Session`**. This comment used to claim the cycle could
-        // not exist because `snapshot` clones labels and releases before the
-        // store is touched. That was true of `snapshot` and false of its
-        // caller: `op_list` held the store guard across the whole `match`
-        // arm that called it, which is store -> labels, and the daemon
-        // deadlocked (#19). An audit of the callee cannot see the nesting a
-        // caller creates, so the invariant now lives on `server::State`'s
-        // accessors, where a read that only needs rows cannot keep the guard.
+        // touches a `Session`**. Auditing the callee is not enough to
+        // establish that -- `Session::snapshot` releases every lock it takes,
+        // and `op_list` still deadlocked the daemon by holding the store
+        // guard across the `match` arm that called it (#19). So the invariant
+        // lives on `server::State`'s accessors, where a read that only needs
+        // rows cannot leak the guard into its caller's scope.
         let mut guard = session.labels.lock();
 
         let mut labels = guard.clone();

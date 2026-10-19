@@ -1,9 +1,9 @@
 //! N4 -- reconnect-storm load test
 //! (listed under M1 in ROADMAP.md).
 //!
-//! Catch-up ([04](../../docs/04-protocol.md))
-//! reads history off the same `Mutex<Fanout>` the PTY reader thread locks on every
-//! `publish()`. N4's own text is explicit about what this file is and isn't:
+//! Catch-up (docs/04-protocol.md) reads history off the same `Mutex<Fanout>`
+//! the PTY reader thread locks on every `publish()`. N4's own text is
+//! explicit about what this file is and isn't:
 //! bounding *one* client's catch-up (stalled-round / total-round ceilings) was
 //! already closed by D1; what was never measured is many clients catching up
 //! *at once* -- the shape of a reconnect storm after a network blip drops every

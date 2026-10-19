@@ -1,7 +1,7 @@
-//! Session ownership and backpressure --
-//! ROADMAP.md the M2 subset
-//! of ROADMAP.md (the rest of that section
-//! needs `log.rs`/M3 and is not in scope here).
+//! Session ownership and backpressure: a subscriber that stops reading must
+//! be disconnected rather than allowed to slow the PTY drain
+//! (docs/03-pty.md#backpressure). Replay and the output log are
+//! `session_replay.rs` and `output_log.rs`.
 
 #![cfg(unix)]
 
@@ -155,13 +155,10 @@ async fn terminate_is_not_wedged_by_a_stuck_write() {
     );
 }
 
-/// **Changed in M4** (docs/04-protocol.md):
 /// `terminate()` alone must leave the session resolvable and listed as
-/// `exited` -- only an explicit `?purge=true` (`SessionManager::purge`)
-/// removes it. The M2-era version of this test asserted the opposite
-/// (`terminate()` self-removing); that broke the "stays in the list as
-/// exited" contract M4's API needs, so the behavior and this test both
-/// changed together.
+/// `exited`; only an explicit purge (`SessionManager::purge`) removes it
+/// (docs/04-protocol.md). A `terminate` that self-removed would make a
+/// client's own exit code unreadable the moment it asked for it.
 #[tokio::test]
 async fn terminate_leaves_the_session_listed_until_purged() {
     let manager = SessionManager::new(sessions_root("terminate-leaves"));
@@ -210,13 +207,12 @@ async fn terminate_leaves_the_session_listed_until_purged() {
 ///
 /// Uses an interactive shell and subscribes *before* writing the command
 /// that produces the output under test -- with a `-c "printf ..."` spec the
-/// child can run and exit before `subscribe()` gets scheduled, and a
-/// subscriber that registers after the fact sees nothing (no replay exists
-/// yet; that's M3/M4, not this module's job). Even so, the shell's own
-/// spawn-time chatter can land before `subscribe()`'s lock is acquired, so
-/// this checks contiguity chunk-to-chunk, not that the first one starts at
-/// offset 0 -- what happened before you subscribed is exactly the boundary
-/// M2 doesn't promise anything about.
+/// child can run and exit before `subscribe()` gets scheduled, and a bare
+/// `subscribe()` has no replay behind it -- that is `attach`'s job, covered
+/// in `session_replay.rs`. Even so, the shell's own spawn-time chatter can
+/// land before `subscribe()`'s lock is acquired, so this checks contiguity
+/// chunk-to-chunk, not that the first one starts at offset 0: what happened
+/// before you subscribed is exactly what `subscribe` promises nothing about.
 #[tokio::test]
 async fn subscriber_receives_output_in_order() {
     let manager = SessionManager::new(sessions_root("in-order"));
@@ -260,7 +256,7 @@ fn contains(acc: &[u8], needle: &str) -> bool {
     acc.windows(needle.len()).any(|w| w == needle.as_bytes())
 }
 
-/// The M2 gate itself: a subscriber that never reads must not slow the PTY
+/// The gate this file exists for: a subscriber that never reads must not slow the PTY
 /// drain. A second, actively-draining subscriber on the same session proves
 /// the reader thread kept moving; the never-reading one must eventually be
 /// disconnected (bounded queue, docs/03-pty.md#backpressure) instead

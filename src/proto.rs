@@ -162,15 +162,14 @@ pub fn session_json(session: &Session) -> Value {
 /// The binary framing an attached connection carries.
 ///
 /// ```text
-/// ┌────────┬──────────┬──────────────┐
-/// │ u8 tag │ u64 off  │ payload      │
-/// └────────┴──────────┴──────────────┘
+/// ┌────────┬─────────┬─────────┬─────────┐
+/// │ u8 tag │ u64 off │ u32 len │ payload │
+/// └────────┴─────────┴─────────┴─────────┘
 /// ```
 ///
-/// The offset is big-endian: a frame header is read byte by byte off a
-/// socket, and network order is the convention for that. Payload length is
-/// framed by a u32 that follows the offset, so a reader never has to guess
-/// where a frame ends.
+/// Both numbers are big-endian: a frame header is read byte by byte off a
+/// socket, and network order is the convention for that. The length is in
+/// the header so a reader never has to guess where a frame ends.
 pub mod frame {
     /// Output from the PTY. `off` is the offset of the first byte.
     pub const OUTPUT: u8 = 0x01;

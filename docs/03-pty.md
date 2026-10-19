@@ -19,8 +19,9 @@ Anything else is a deadlock waiting for a bad network.
 ## Thread model — four dedicated OS threads per session
 
 These four are the PTY layer's. `create` also starts a `session-exit` and a
-`session-eof` listener thread per session (`src/session/manager.rs:290`,
-`:292`), so a session is six OS threads in all.
+`session-eof` listener thread per session (`spawn_exit_listener` and
+`spawn_eof_listener`, `src/session/manager.rs`), so a session is six OS
+threads in all.
 
 ```text
                   ┌── reader   read() → append log → advance offset → fanout

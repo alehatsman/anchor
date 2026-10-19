@@ -14,7 +14,7 @@ use anchor::session::{Attach, Replay, ReplayStep};
 /// regression here hangs a test loudly and boundedly instead of forever.
 const MAX_TEST_ROUNDS: u32 = 1024;
 
-/// Drives a `Replay` to the live boundary the way M4's WS loop will: write
+/// Drives a `Replay` to the live boundary the way `stream.rs` does: write
 /// each catch-up round out before asking for the next
 /// (docs/04-protocol.md). `round_delay`
 /// paces each round -- `Duration::ZERO` for "as fast as possible" (most

@@ -1,9 +1,8 @@
 //! Append-only output log -- `<data_dir>/sessions/<id>/output.vt`.
 //!
-//! See docs/02-model.md#storage for the durability rules and
-//! ROADMAP.md for the milestone this
-//! implements. Raw PTY bytes, appended, never rewritten: no framing, no
-//! headers, no escaping. The file's length *is* the replay index.
+//! See docs/02-model.md#storage for the durability rules. Raw PTY bytes,
+//! appended, never rewritten: no framing, no headers, no escaping. The
+//! file's length *is* the replay index.
 //!
 //! The invariant every other module may rely on:
 //!
@@ -418,13 +417,11 @@ impl LogReader {
         }
         let len = end - from;
         self.file.seek(SeekFrom::Start(from))?;
-        // `len` is now bounded by the file size, so this cannot truncate on a
-        // 32-bit target the way the requested range could.
-        // `with_capacity` allocates eagerly, so the fallback on truncation
-        // is 0, not `usize::MAX` -- an under-sized capacity just costs a
-        // reallocation later; an oversized one is an instant abort. `len` is
-        // bounded by the file size in practice (see above), so this never
-        // actually fires.
+        // `len` is bounded by the file size by here, so on a 32-bit target
+        // this cannot truncate the way the requested range could. The
+        // fallback is 0 rather than `usize::MAX` because `with_capacity`
+        // allocates eagerly: an under-sized capacity costs a reallocation,
+        // an oversized one is an instant abort.
         let mut buf = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
         Read::by_ref(&mut self.file)
             .take(len)
