@@ -1,0 +1,11 @@
+---
+description: copy rust-quality's config into this repo and print the lint block
+
+# rq/sync-config. It writes clippy.toml, rustfmt.toml, deny.toml and
+# .cargo/config.toml into the directory provision was invoked from, so run it
+# from the repo root. The lint block cannot be copied -- cargo has no include
+# mechanism for manifests -- so the preset prints it and `tasks/lints-check.yml`
+# reports drift instead.
+steps:
+  - name: shared config
+    use: ~/.cache/provision/tools/rust-quality/sync-config.yml

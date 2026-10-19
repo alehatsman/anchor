@@ -1,0 +1,10 @@
+---
+description: full pre-push gate — fmt, clippy, test, rustdoc, deny, machete, lint drift
+
+# rq/ci. The checkout is `tasks/tools.yml`'s job and the pin lives there; if
+# that path is not on disk, that is the task to run. Every prop rq/ci declares
+# already defaults to what a single-workspace repo wants, so there is nothing
+# to pass — in particular no `dir`, because this is one workspace.
+steps:
+  - name: full gate
+    use: ~/.cache/provision/tools/rust-quality/ci.yml

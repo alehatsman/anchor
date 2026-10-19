@@ -1,0 +1,10 @@
+---
+description: assert Cargo.toml carries rust-quality's canonical lint block
+
+# rq/lints-check. Cargo has no include mechanism for manifests, so the lint
+# block is the one piece of shared config that cannot be a file copy: this
+# reports drift against rust-quality's lints.toml and never mutates.
+# `tasks/ci.yml` runs it as a step of the full gate — this task runs it alone.
+steps:
+  - name: lint block drift
+    use: ~/.cache/provision/tools/rust-quality/lints-check.yml

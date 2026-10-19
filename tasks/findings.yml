@@ -1,0 +1,10 @@
+---
+description: write every gate finding to .gate/findings.jsonl for an agent to read
+
+# rq/findings. A pure producer: it never re-gates and never aborts, so a red
+# repo still yields a complete file. Enforcement stays with `tasks/ci.yml`.
+# Its `out` prop already defaults to `.gate/findings.jsonl`, the path this repo
+# gitignores. An agent working here reads that file, not scraped terminal text.
+steps:
+  - name: collect findings
+    use: ~/.cache/provision/tools/rust-quality/findings.yml

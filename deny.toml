@@ -1,0 +1,64 @@
+# rust-quality — shared cargo-deny policy.
+#
+# One tool, four policies. `advisories` is the RustSec feed; `bans`,
+# `licenses` and `sources` matter because any dependency's build.rs runs on
+# your machine at compile time.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# Add entries as `"RUSTSEC-0000-0000"` with a comment naming the ticket that
+# tracks removal. An ignore without an expiry plan is a permanent hole.
+ignore = []
+
+[bans]
+multiple-versions = "warn"   # informational; the fix is often upstream
+wildcards = "deny"           # `version = "*"` defeats the lockfile
+# Deny anything that pulls a second copy of a heavyweight tree.
+# deny = [{ name = "openssl-sys", reason = "use rustls" }]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+
+# A workspace's own crates are not third-party dependencies, and an internal
+# one has no reason to carry a license field. Without this, every unpublished
+# member is `error[unlicensed]` and the whole check fails on a repo that has
+# added no dependency at all. Keyed on `publish = false`, not on being a path
+# member — a crate that is publishable is treated as one.
+private = { ignore = true }
+
+# This list is fleet-wide, so most consumers meet only some of it. Each unmet
+# entry is a `license-not-encountered` warning, which is a dozen lines of noise
+# per run saying the policy is broader than this repo's dependency tree — which
+# is the point of a shared policy.
+unused-allowed-license = "allow"
+
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "MPL-2.0",
+  "CC0-1.0",
+  "Unlicense",
+  "BSL-1.0",
+  # The Mozilla CA bundle (`webpki-roots`, `webpki-root-certs`) ships under a
+  # permissive *data* licence, not a code one. Every Rust TLS stack that
+  # verifies a public certificate pulls it in, so the real choice here is this
+  # entry or no TLS roots -- and CDLA-Permissive-2.0 grants use and
+  # redistribution without conditions on the using work.
+  "CDLA-Permissive-2.0",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
