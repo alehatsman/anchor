@@ -613,3 +613,52 @@ async fn terminate_then_purge_never_races() {
         );
     }
 }
+
+/// The `log` reply is serialised from a typed struct now, to stop a 4 MiB
+/// read costing `size_of::<Value>()` per byte. The wire must not notice.
+///
+/// Compared byte for byte against what the old `json!` construction emits
+/// for the same values, including bytes that are not ASCII.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_log_reply_is_byte_identical_to_the_value_tree_it_replaced() {
+    let h = harness();
+    let mut client = Client::connect(&h.socket);
+    let id = create_echo(&mut client, r"a\377\000b", json!({}));
+    wait_for_output(&mut client, &id, "b");
+
+    let mut stream = UnixStream::connect(&h.socket).unwrap();
+    let request = format!(r#"{{"id":9,"op":"log","session":"{id}","from":0,"max":65536}}"#);
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.write_all(b"\n").unwrap();
+    let mut raw = Vec::new();
+    BufReader::new(stream).read_until(b'\n', &mut raw).unwrap();
+
+    let got: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(got["ok"], true, "{got}");
+    assert!(
+        got["bytes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b.as_u64().unwrap() > 127),
+        "the fixture must carry a non-ASCII byte: {got}"
+    );
+
+    let old = anchor::proto::ok(
+        9,
+        json!({
+            "from": got["from"],
+            "to": got["to"],
+            "next_offset": got["next_offset"],
+            "log_capped_at": got["log_capped_at"],
+            "bytes": got["bytes"],
+        }),
+    );
+    let mut expected = serde_json::to_vec(&old).unwrap();
+    expected.push(b'\n');
+    assert_eq!(
+        String::from_utf8_lossy(&raw),
+        String::from_utf8_lossy(&expected)
+    );
+    assert_eq!(raw, expected);
+}

@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -234,7 +234,7 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
         if read as u64 > MAX_LINE_BYTES {
             respond(
                 &mut write_half,
-                proto::error(0, ErrorCode::TooLarge, "request line too large"),
+                &proto::error(0, ErrorCode::TooLarge, "request line too large"),
             )
             .await?;
             // The rest of that line is unread; the client reconnects rather
@@ -250,7 +250,7 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
             Err(_) => {
                 respond(
                     &mut write_half,
-                    proto::error(0, ErrorCode::BadRequest, "request line is not valid UTF-8"),
+                    &proto::error(0, ErrorCode::BadRequest, "request line is not valid UTF-8"),
                 )
                 .await?;
                 continue;
@@ -268,7 +268,7 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
         if is_attach(&line) {
             match attach_check(&line, &state) {
                 Err(err) => {
-                    respond(&mut write_half, err).await?;
+                    respond(&mut write_half, &err).await?;
                     continue;
                 }
                 Ok((session, req)) => {
@@ -281,7 +281,7 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
                     };
                     respond(
                         &mut write_half,
-                        proto::ok(
+                        &proto::ok(
                             req.id,
                             json!({
                                 "offset": req.from,
@@ -315,15 +315,28 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
             }
         }
 
-        respond(&mut write_half, dispatch(&line, &state).await).await?;
+        // `log` answers with a typed reply that is serialised straight to
+        // the wire, so it cannot ride `dispatch`'s `Value`.
+        if is_op(&line, "log") {
+            match op_log(&line, &state).await {
+                Ok(reply) => respond(&mut write_half, &reply).await?,
+                Err(err) => respond(&mut write_half, &err).await?,
+            }
+        } else {
+            respond(&mut write_half, &dispatch(&line, &state).await).await?;
+        }
     }
 }
 
 /// Whether this line is an `attach`, decided before the op-specific parse so
 /// a malformed attach still gets a normal error response.
 fn is_attach(line: &str) -> bool {
+    is_op(line, "attach")
+}
+
+fn is_op(line: &str, op: &str) -> bool {
     serde_json::from_str::<Request>(line)
-        .map(|r| r.op == "attach")
+        .map(|r| r.op == op)
         .unwrap_or(false)
 }
 
@@ -398,7 +411,6 @@ async fn dispatch(line: &str, state: &State) -> Value {
         "label" => op_label(request.id, line, state),
         "resize" => op_resize(request.id, line, state),
         "terminate" => op_terminate(request.id, line, state).await,
-        "log" => op_log(request.id, line, state),
         "purge" => op_purge(request.id, line, state).await,
         other => proto::error(
             request.id,
@@ -408,8 +420,8 @@ async fn dispatch(line: &str, state: &State) -> Value {
     }
 }
 
-async fn respond(out: &mut (impl AsyncWriteExt + Unpin), value: Value) -> Result<()> {
-    let mut buf = serde_json::to_vec(&value)?;
+async fn respond(out: &mut (impl AsyncWriteExt + Unpin), value: &impl Serialize) -> Result<()> {
+    let mut buf = serde_json::to_vec(value)?;
     buf.push(b'\n');
     out.write_all(&buf).await.context("writing response")?;
     out.flush().await.context("flushing response")?;
@@ -692,11 +704,30 @@ const TERMINATE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 /// a session is what `attach` is for.
 const LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-fn op_log(id: u64, line: &str, state: &State) -> Value {
-    let req: LogReq = match parse(id, line) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
+/// A `log` reply, serialised straight to the wire.
+///
+/// Building this as a `json!` tree turned each of the range's up to 4 MiB
+/// into its own `Value` -- `size_of::<Value>()` bytes apiece -- so the cap
+/// that bounds one read was not the cap on the memory it cost. Fields are in
+/// alphabetical order because `Value`'s map is sorted, and the bytes on the
+/// wire are meant to be exactly what they always were.
+#[derive(Serialize)]
+struct LogReply {
+    /// Raw PTY bytes are not UTF-8 in general -- control sequences, and
+    /// partial multi-byte characters at a chunk boundary. A lossy conversion
+    /// would corrupt the stream, so they go out as an array of numbers.
+    bytes: Vec<u8>,
+    from: u64,
+    id: u64,
+    log_capped_at: Option<u64>,
+    next_offset: u64,
+    ok: bool,
+    to: u64,
+}
+
+async fn op_log(line: &str, state: &State) -> Result<LogReply, Value> {
+    let id = parse::<Request>(0, line)?.id;
+    let req: LogReq = parse(id, line)?;
     // Clamped, not refused. docs/04-protocol.md has always said one
     // response is "capped at 4 MiB whatever `max` asks for", and refusing
     // instead made that sentence false in the way that matters: a client
@@ -711,50 +742,53 @@ fn op_log(id: u64, line: &str, state: &State) -> Value {
     // exited or lost session still replays.
     let row = match lookup(&req.session, state) {
         Ok(Some(row)) => row,
-        Ok(None) => return proto::error(id, ErrorCode::NotFound, "no such session"),
-        Err(e) => return store_failed(id, &e),
+        Ok(None) => return Err(proto::error(id, ErrorCode::NotFound, "no such session")),
+        Err(e) => return Err(store_failed(id, &e)),
     };
     let path = state
         .manager
         .root()
         .join(&row.id)
         .join(crate::log::LOG_FILE_NAME);
-    let mut reader = match crate::log::LogReader::open(&path) {
-        Ok(reader) => reader,
+    let from = req.from;
+    // Off the worker: up to 4 MiB from a disk that may be slow.
+    let read = tokio::task::spawn_blocking(move || {
+        crate::log::LogReader::open(&path).map(|mut r| r.read_range(from, from.saturating_add(max)))
+    })
+    .await;
+    let bytes = match read {
+        Ok(Ok(Ok(bytes))) => bytes,
         // Only a missing file is `not_found`. A log that exists and cannot
         // be opened -- permissions, a bad disk -- is the daemon's problem,
         // and answering `not_found` for it claims the session's output is
         // gone when it is sitting right there.
-        Err(e) => {
+        Ok(Err(e)) => {
             let code = if e.kind() == std::io::ErrorKind::NotFound {
                 ErrorCode::NotFound
             } else {
                 ErrorCode::Internal
             };
-            return proto::error(id, code, format!("opening the log: {e}"));
-        }
-    };
-    match reader.read_range(req.from, req.from.saturating_add(max)) {
-        Ok(bytes) => {
-            let len = bytes.len() as u64;
-            proto::ok(
-                id,
-                json!({
-                    "from": req.from,
-                    "to": req.from + len,
-                    "next_offset": row.output_bytes,
-                    "log_capped_at": row.log_capped_at,
-                    // Raw PTY bytes are not UTF-8 in general — control
-                    // sequences, and partial multi-byte characters at a
-                    // chunk boundary. A lossy conversion would corrupt the
-                    // stream, so they go out as a byte array.
-                    "bytes": bytes,
-                }),
-            )
+            return Err(proto::error(id, code, format!("opening the log: {e}")));
         }
         // The range was checked; this is the log file itself failing.
-        Err(e) => proto::error(id, ErrorCode::Internal, format!("reading the log: {e}")),
-    }
+        Ok(Ok(Err(e))) => {
+            return Err(proto::error(
+                id,
+                ErrorCode::Internal,
+                format!("reading the log: {e}"),
+            ))
+        }
+        Err(e) => return Err(proto::error(id, ErrorCode::Internal, format!("log: {e}"))),
+    };
+    Ok(LogReply {
+        from,
+        to: from + bytes.len() as u64,
+        next_offset: row.output_bytes,
+        log_capped_at: row.log_capped_at,
+        id,
+        ok: true,
+        bytes,
+    })
 }
 
 async fn op_purge(id: u64, line: &str, state: &State) -> Value {
