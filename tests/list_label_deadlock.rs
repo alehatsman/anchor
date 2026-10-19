@@ -195,9 +195,8 @@ fn list_and_label_do_not_deadlock_the_daemon() {
     let mut seen = 0;
     let mut stall_deadline = Instant::now() + STALL;
     while finished < expected {
-        match done_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(_) => finished += 1,
-            Err(_) => {}
+        if done_rx.recv_timeout(Duration::from_millis(250)).is_ok() {
+            finished += 1;
         }
         let now_seen = ops.load(Ordering::Relaxed);
         if now_seen > seen {
