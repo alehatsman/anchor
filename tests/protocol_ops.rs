@@ -662,3 +662,27 @@ async fn the_log_reply_is_byte_identical_to_the_value_tree_it_replaced() {
     );
     assert_eq!(raw, expected);
 }
+
+/// `decode_size` is documented `None` unless the payload is four bytes; it
+/// accepted four *or more*.
+#[test]
+fn decode_size_wants_exactly_four_bytes() {
+    use anchor::proto::frame::decode_size;
+    assert_eq!(decode_size(&[0, 80, 0, 24]), Some((80, 24)));
+    assert_eq!(decode_size(&[0, 80, 0]), None);
+    assert_eq!(decode_size(&[0, 80, 0, 24, 9]), None);
+}
+
+/// The resize range error states the range the check actually uses.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_resize_range_message_comes_from_the_range() {
+    let h = harness();
+    let mut client = Client::connect(&h.socket);
+    let reply = client.call("resize", json!({ "session": "x", "cols": 0, "rows": 24 }));
+    let range = anchor::pty::SIZE_RANGE;
+    let want = format!("between {} and {}", range.start(), range.end());
+    assert!(
+        reply["error"]["message"].as_str().unwrap().contains(&want),
+        "{reply}"
+    );
+}

@@ -505,3 +505,18 @@ async fn a_reply_cut_short_is_a_closed_connection() {
         .to_string();
     assert!(err.contains("closed the connection"), "got: {err}");
 }
+
+/// The too-long message is one readable line. Its `\` continuations were once
+/// lost, leaving two runs of ~14 spaces in the middle of the sentence.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_socket_path_message_has_no_runs_of_spaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut path = dir.path().to_path_buf();
+    while path.as_os_str().len() <= 103 {
+        path.push("nested-directory-name");
+    }
+    let err = anchor::server::bind(&path.join("anchor.sock"))
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("  "), "stray spaces in: {err}");
+}

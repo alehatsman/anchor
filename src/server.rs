@@ -82,10 +82,6 @@ impl State {
 /// `too_large` rather than buffered.
 const MAX_LINE_BYTES: u64 = 1024 * 1024;
 
-/// Binds the socket, refusing to displace a daemon that is already running.
-///
-/// A socket file left behind by a dead daemon is stale: nothing accepts on
-/// it, so it is removed and rebound.
 /// The usable length of `sockaddr_un.sun_path`, minus the NUL.
 ///
 /// 104 on macOS and the BSDs, 108 on Linux; the smaller is used on both
@@ -93,6 +89,10 @@ const MAX_LINE_BYTES: u64 = 1024 * 1024;
 /// gives the same answer everywhere.
 const MAX_SOCKET_PATH: usize = 103;
 
+/// Binds the socket, refusing to displace a daemon that is already running.
+///
+/// A socket file left behind by a dead daemon is stale: nothing accepts on
+/// it, so it is removed and rebound.
 pub fn bind(socket_path: &Path) -> Result<StdUnixListener> {
     // Checked before anything else, because the kernel's own answer is
     // `EINVAL` with no mention of length -- which reads as "the path is
@@ -102,7 +102,9 @@ pub fn bind(socket_path: &Path) -> Result<StdUnixListener> {
     let len = socket_path.as_os_str().as_encoded_bytes().len();
     if len > MAX_SOCKET_PATH {
         bail!(
-            "socket path is {len} bytes, past the {MAX_SOCKET_PATH}-byte limit              a unix socket address can hold: {}. Use a shorter directory              (XDG_RUNTIME_DIR, or --socket).",
+            "socket path is {len} bytes, past the {MAX_SOCKET_PATH}-byte limit \
+             a unix socket address can hold: {}. Use a shorter directory \
+             (XDG_RUNTIME_DIR, or `anchor daemon --socket`).",
             socket_path.display()
         );
     }
@@ -177,7 +179,10 @@ pub fn bind(socket_path: &Path) -> Result<StdUnixListener> {
     Ok(listener)
 }
 
-/// Accepts connections until the listener fails. One task per client.
+/// Accepts connections, one task per client, and never returns once setup
+/// succeeds: a failed `accept` is logged and retried, because the ones that
+/// matter (`EMFILE`) are transient and ending the daemon over one would end
+/// every session with it. Errors only if the listener cannot be adopted.
 ///
 /// Takes the `std` listener from [`bind`] and adopts it onto the runtime this
 /// is polled on.
@@ -623,7 +628,11 @@ fn op_resize(id: u64, line: &str, state: &State) -> Value {
         return proto::error(
             id,
             ErrorCode::InvalidSpec,
-            "cols and rows must be between 1 and 1000",
+            format!(
+                "cols and rows must be between {} and {}",
+                crate::session::manager::SIZE_RANGE.start(),
+                crate::session::manager::SIZE_RANGE.end()
+            ),
         );
     }
     let Some(session) = state.manager.get(&req.session) else {
