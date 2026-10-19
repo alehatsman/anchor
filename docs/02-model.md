@@ -78,15 +78,10 @@ reason belongs to:
 |---|---|---|
 | `spawn_failed` | `EXITED` | it never started. That is a complete account. |
 | `kill_timeout` | `LOST` | it was killed and never observed exiting. The daemon does not know what happened to it. |
-| `daemon_restart` | `LOST` | the PTY died with the daemon; whatever the child did last was never seen. |
-| `io_error` | — | not terminal: persistence stopped while the session kept running (see the size cap). |
+| `daemon_restart` | `LOST` | the PTY lost its master with the daemon; whatever the child did last was never seen. |
 
 An earlier version of this doc listed `spawn_failed` under `LOST` in one
 place and `EXITED` in another. The rule above is what resolves it.
-
-`io_error` is the odd one out: it records that writing `output.vt` failed,
-and it can be set **while the child is still running**. The session
-continues; only persistence stopped.
 
 **EXITED fires off the reaper's `wait()`, not off reader EOF.** A descendant
 that inherited the PTY can hold the master open long after the child is gone.
@@ -122,9 +117,12 @@ Output logs live outside the DB, one file per session:
 $XDG_DATA_HOME/anchor/sessions/<id>/output.vt
 ```
 
-Append-only, never rewritten. The **file is authoritative** for content;
+Append-only, never rewritten. The **file is authoritative** for content, and
 `sessions.output_bytes` is a cached stream length reconciled against the real
-file size at startup.
+file size at startup. For an uncapped log a dropped update costs only
+precision. For a **capped** log the stream length beyond the cap lives only in
+the row, so it is a cache with no file behind it: a crash can lose up to the
+unsent tail of it.
 
 ### The size cap
 
@@ -146,9 +144,9 @@ found ahead of its file is itself a cap, recorded if no row said so.
 ```text
 resolve data dir
     ↓
-open SQLite (WAL), migrate
+bind unix socket            ← before any write, migration included: see below
     ↓
-bind unix socket            ← before any write: see below
+open SQLite (WAL), migrate
     ↓
 mark sessions still "running"/"closing" as LOST (reason=daemon_restart)
     ↓
@@ -158,7 +156,7 @@ reconcile each output_bytes against actual output.vt length
 serve
 ```
 
-**The bind comes before the recovery writes.** Recovery rewrites every live
+**The bind comes before every write, migration and recovery both.** Recovery rewrites every live
 session to `lost`, which is correct after a crash and catastrophic
 otherwise. A second `anchord` started by accident — a stray one in a shell,
 a supervisor racing itself — would otherwise mark the *running* daemon's

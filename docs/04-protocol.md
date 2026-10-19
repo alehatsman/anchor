@@ -37,7 +37,11 @@ Request:
 {"id":7,"op":"log","session":"01J...","from":0,"max":65536}
 {"id":8,"op":"attach","session":"01J...","from":12345,"control":true}
 {"id":9,"op":"purge","session":"01J..."}
+{"id":10,"op":"ping"}
 ```
+
+`ping` replies `{"pong":true}` and touches no session; it is a liveness
+probe, and a live op like the rest.
 
 `terminate` ends a session; `purge` forgets it — its row, its labels and
 its `output.vt`. They are separate because an exited session is still worth
@@ -95,7 +99,8 @@ reasonable and reporting it to the user as a malformed request is not.
 Reporting a disk failure as `invalid_spec` is worse than reporting nothing
 at all: it sends whoever is debugging it to look at the request.
 
-An unknown `op` returns an error; it never drops the connection.
+An unknown `op` (anything not in the list above) returns `unknown_op`; it
+never drops the connection.
 
 `bad_request` is for a line that is not a request object at all — malformed
 JSON, no `op`, or bytes that are not valid UTF-8. The last one is answered
@@ -196,17 +201,30 @@ all but the first byte of a frame already delivered, and a client that
 did it would see duplicated output on every reconnect.
 
 `from` is inclusive: it is the first byte the client wants, and the first
-frame after an attach starts exactly there. `from == next_offset` is
-therefore legal and means "nothing yet, only what happens next". This is
+`OUTPUT` frame normally starts there — but see below, it need not.
+`from == next_offset` is therefore legal and means "nothing yet, only what happens next". This is
 the same discipline the log file uses, deliberately: **recover by offset,
 never by guessing.**
+
+**The first frame on an attach is always a `LEASE` frame, with offset 0**
+(`src/stream.rs:112`), announcing whether this connection holds control. It
+comes before any `OUTPUT`, and a client must not read its `off` as a byte
+position.
+
+**The first `OUTPUT` frame need not start at `from`.** If the log is capped,
+or catch-up gives up on a client that keeps losing ground, the daemon moves
+the replay start forward and the bytes behind it are dropped
+(`src/session/replay.rs:174-177`). The hole is visible as a **jump in the
+offset prefix**: the first frame's `off` is greater than `from`. A client
+must treat `off` as authoritative, never assume `off == from`, and never
+assume the stream it holds is contiguous from `from`.
 
 The attach response carries `next_offset`, the live head at the moment of
 the attach. A client that wants only what happens from now on attaches
 with `from` set to it; a client catching up compares it to its own last
 offset to know how far behind it is. It is a snapshot, not a promise —
 the head moves on as soon as the session writes again. Attaching past it
-is refused rather than silently clamped, because a `from` beyond the head
+is refused with `invalid_spec` rather than silently clamped, because a `from` beyond the head
 means the client and the daemon disagree about what exists.
 
 `control: true` requests the lease. If held, the attach still succeeds as an
@@ -238,6 +256,12 @@ connection that can prove nothing about a lease held on another.
 - **While the lease is free**, the control op is accepted. That is the
   case where a client sizes a session to its terminal *before* attaching,
   and with no holder there is nobody to protect.
+
+**The two paths treat an out-of-range size differently.** Both bounds are
+`1..=1000` for each of `cols` and `rows`. The **control op** refuses a size
+outside it with `invalid_spec`. The **`resize` frame** clamps it and the
+applied size is reported back (the size frame above). Do not branch on one
+behaviour for both.
 
 **The lease is per-connection.** One connection is one client: the daemon
 identifies a holder by the connection itself, so there is no client id on
@@ -302,11 +326,15 @@ anchor service install|uninstall|status
                                   service manager (07-lifecycle.md)
 ```
 
-A successful `terminate` reply means the child is dead **and** the exit is
-recorded: the reported `state` is always terminal, and a `purge` sent
+A `terminate` reply normally means the child is dead **and** the exit is
+recorded: the reported `state` is normally terminal, and a `purge` sent
 immediately after it will not be refused as still-running. The two are
 written by different threads, so the reply waits for the second — without
-it the obvious terminate-then-purge sequence races against itself.
+it the obvious terminate-then-purge sequence races against itself. The wait
+is bounded (2 s, `TERMINATE_SETTLE`, `src/server.rs:685`): if the exit is
+not recorded by then the reply goes out anyway, so a client must check
+`state` rather than assume it, and a `purge` right after may still see
+`already_exited`.
 
 `attach` restores the terminal on the way out, including when it is
 **signalled** rather than exited — `SIGTERM` and `SIGHUP` restore the saved

@@ -4,8 +4,10 @@ What M4 actually requires, from reading teleport rather than assuming. Read
 with [05-extraction.md](05-extraction.md), which covers what moves; this
 covers **where the switch goes and what is missing on the anchor side**.
 
-Written before any teleport code changes. If it disagrees with teleport,
-teleport is right — file an issue and fix this.
+Status, 2026-10-19: written before any teleport code changed; M4 and M5
+have since shipped, so read the analysis below as the reasoning that led to
+them, not a forecast. If it disagrees with teleport, teleport is right —
+file an issue and fix this.
 
 ## The seam is not where the roadmap implies
 
@@ -117,10 +119,10 @@ behaviour, which is what makes M4 safe to do incrementally.
 
 ## Open questions this raises
 
-1. **Does teleport depend on the `anchor` crate, or write its own client?**
-   The crate already exposes a blocking `client::Client`; teleport is
-   async. Either anchor ships an async client, or teleport writes one over
-   the documented protocol. A dependency couples their release cycles —
-   which is the thing the split was meant to end.
-2. **Lease identity**, above.
-3. **Lease-change notification**, above.
+1. **Lease identity**, above. Still live: teleport keeps its own lease
+   layer on top of anchor's.
+
+Decided and shipped, no longer open: teleport writes its own client over the
+documented protocol (`daemon/src/anchor_client.rs`) and has no `anchor`
+dependency, so the two release cycles stay uncoupled; and lease-change
+notification is no longer a gap (see the lease table above).
