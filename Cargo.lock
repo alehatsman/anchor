@@ -29,6 +29,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "windows-sys",
 ]
 
 [[package]]

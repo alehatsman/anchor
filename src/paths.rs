@@ -97,9 +97,22 @@ fn non_empty_env(key: &str) -> Option<String> {
 /// The permissions are applied whether or not this call created it: a data
 /// dir from an older build, or one a careless `mkdir` left at `0755`, is
 /// exactly the case worth correcting.
+#[cfg(unix)]
 fn create_owner_only(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("setting owner-only permissions on {}", dir.display()))
+}
+
+/// Not yet: Windows needs an owner-only ACL here (docs/09-windows.md §4.6),
+/// and until it has one the claim on [`Paths::ensure_dirs`] would be false.
+/// Refusing keeps it true.
+#[cfg(windows)]
+fn create_owner_only(dir: &Path) -> Result<()> {
+    anyhow::bail!(
+        "refusing to create {}: an owner-only data directory is not implemented on \
+         Windows yet (docs/09-windows.md §4.6)",
+        dir.display()
+    )
 }

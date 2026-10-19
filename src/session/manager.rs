@@ -457,12 +457,9 @@ fn spawn_exit_listener(
             let Ok(exit) = exit_rx.recv() else { return };
 
             let (exit_code, reason) = match exit.status {
-                // The `-1` arm is effectively unreachable: it needs a u32
-                // above i32::MAX. portable-pty reports a signalled child as
-                // exit code 1 (`status.code().unwrap_or(1)`), so a session
-                // killed by SIGHUP/SIGTERM/SIGKILL is recorded as `exit_code:
-                // 1`, indistinguishable from `exit 1`.
-                Some(status) => (Some(i32::try_from(status.exit_code()).unwrap_or(-1)), None),
+                // Converted by the PTY layer, which is the one place that
+                // knows a Windows exit code is a full DWORD.
+                Some(status) => (Some(pty::exit_code(&status)), None),
                 // No status means the child was never observed exiting: a kill
                 // timeout, or a `wait()` that errored. Neither leaves an exit
                 // code, and both are recorded as `kill_timeout`.
@@ -534,23 +531,19 @@ fn spawn_eof_listener(
 /// session's own cwd rather than the daemon's. A bare name is looked up on
 /// `PATH` — and under a login shell, on the `PATH` that shell builds, which
 /// is the whole reason `login_shell` exists.
+///
+/// What "executable" means is the PTY layer's to say, since it is the thing
+/// that will spawn it: `pty::is_spawnable`.
 fn resolve_executable(command: &str, cwd: &Path, login_shell: bool) -> bool {
-    if command.contains('/') {
-        return is_executable_file(&cwd.join(command));
+    if command.contains('/') || (cfg!(windows) && command.contains('\\')) {
+        return pty::is_spawnable(&cwd.join(command));
     }
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
-            if is_executable_file(&dir.join(command)) {
+            if pty::is_spawnable(&dir.join(command)) {
                 return true;
             }
         }
     }
     login_shell && pty::resolves_in_login_shell(command, cwd)
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
 }

@@ -11,7 +11,12 @@
 //! property the whole thing exists for; it does **not** extend to anchord
 //! crashing, which takes its PTYs with it.
 
+// Unix-only until docs/09-windows.md §5 step 4 lands the named-pipe
+// transport and the console input path. Gated out rather than stubbed, so a
+// Windows build cannot boot a daemon that reports healthy and hosts nothing.
+#[cfg(unix)]
 pub mod client;
+#[cfg(unix)]
 pub mod daemon;
 pub mod db;
 pub mod log;
@@ -19,11 +24,14 @@ pub mod model;
 pub mod paths;
 pub mod proto;
 pub mod pty;
+#[cfg(unix)]
 pub mod server;
 pub mod service;
 pub mod session;
 pub mod store;
+#[cfg(unix)]
 pub mod stream;
+#[cfg(unix)]
 pub mod tty;
 
 /// Milliseconds since the unix epoch.

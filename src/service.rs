@@ -35,6 +35,7 @@ pub enum Outcome {
 
 /// The user's home directory, resolved the same way `paths.rs` resolves
 /// `$HOME` — an empty `HOME` is treated as unset rather than as `/`.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn home_dir() -> Result<PathBuf> {
     std::env::var("HOME")
         .ok()
@@ -50,6 +51,7 @@ fn home_dir() -> Result<PathBuf> {
 /// can remove out from under an installed unit — with no error until the
 /// next login, when the service manager fails to start a binary that is no
 /// longer there.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn warn_if_build_output(exe: &Path) {
     if is_build_output(exe) {
         eprintln!(
@@ -68,6 +70,7 @@ fn warn_if_build_output(exe: &Path) {
 /// fixed one — a workspace, a `CARGO_TARGET_DIR`, and a plain crate all put
 /// it somewhere different, and a check that only fires for one layout warns
 /// nobody.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn is_build_output(exe: &Path) -> bool {
     let parts: Vec<_> = exe
         .components()
@@ -84,6 +87,7 @@ fn is_build_output(exe: &Path) -> bool {
 /// registration names the build the user actually invoked. Absolute, because
 /// a relative path would resolve against the service manager's working
 /// directory rather than the user's.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn anchord_path() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("resolving this binary's own path")?;
     let exe = exe.canonicalize().unwrap_or(exe);
@@ -562,6 +566,7 @@ mod tests {
     /// this wrong is silent: `install` reports success and the service
     /// fails to start later, because the path split into several words.
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn a_path_with_a_space_stays_one_word() {
         let exe = PathBuf::from("/Users/a b/bin/anchord");
         let rendered = platform::render(&exe);
@@ -597,6 +602,7 @@ mod tests {
     /// The registration must not pin a socket path: anchord has to resolve
     /// the same one a client resolves (docs/07-lifecycle.md).
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn no_socket_path_is_baked_in() {
         let rendered = platform::render(&PathBuf::from("/usr/local/bin/anchord"));
         assert!(
@@ -607,6 +613,7 @@ mod tests {
 
     /// Restart-on-exit is the point of being supervised at all.
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn the_service_is_restarted_if_it_exits() {
         let rendered = platform::render(&PathBuf::from("/usr/local/bin/anchord"));
         #[cfg(target_os = "linux")]

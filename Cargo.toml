@@ -28,3 +28,8 @@ ulid = "3.0.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# The Windows arm of the PTY layer, the named-pipe transport and the owner-only
+# ACLs (docs/09-windows.md). Already in the tree through tokio, at this version.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
