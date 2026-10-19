@@ -446,9 +446,7 @@ mod tests {
                 .unwrap();
             let binds = ["k"; 6][..pairs * 2].iter();
             let plan = stmt
-                .query_map(rusqlite::params_from_iter(binds), |r| {
-                    r.get::<_, String>(3)
-                })
+                .query_map(rusqlite::params_from_iter(binds), |r| r.get::<_, String>(3))
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap()
