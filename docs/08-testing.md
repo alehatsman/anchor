@@ -147,6 +147,39 @@ arrived at independently. The pressure points belong to testing a PTY
 multiplexer, not to either codebase — which is the reason this file exists
 rather than living in one commit message.
 
+## A gated-out test is absent, not failing
+
+A fixture behind `#[cfg(windows)]` does not fail on a runner where it does
+not compile in — it does not exist there, and the suite's count is never
+zero, so counting cannot see it go. An early `return` is the same failure
+from the other side: libtest reports `ok`. teleport#108 had the second
+(`ok. 17 passed` in 0.01 s, having executed nothing); anchor's Windows
+fixtures were built against both.
+
+**Record that each fixture reached its end, and check the record against
+the binary's own list.** `tests/pty_primitive_windows.rs` writes each
+fixture's name to a ledger as its *last statement* — not from a drop guard,
+which an early return would still run — and an ungated check lists the
+binary's fixtures with `--list` and fails unless every one is in the
+ledger, or when there are none. Listing from the binary rather than a
+hand-kept array is what stops the expected set drifting from the real one.
+Revert-checked both ways: an early return reported `13 passed` while the
+check named the fixture; the module gated out reported `1 passed` while
+the check said none were compiled in.
+
+A ledger that outlives its run vouches for fixtures that have since
+stopped running, so it goes somewhere fresh every time — CI uses
+`RUNNER_TEMP`.
+
+## A test the donor passed may not test the port
+
+Revert-check a ported fixture against the *port*, not just the original.
+With the Windows graceful step removed, every one of teleport's Windows
+termination fixtures stayed green: the hard kill ended the child inside the
+7 s policy, and teardown dropped the master anyway. The two paths left
+different exit codes, and a fixture asserting on that is the one that goes
+red. A bound on the whole policy cannot see a step inside it doing nothing.
+
 ## A comment is a claim with a date on it
 
 Two of anchor's Windows deferrals cited teleport blockers that had been

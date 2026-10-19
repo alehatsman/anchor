@@ -145,10 +145,18 @@ survives both the graceful step and a naive kill step. Step 4 must send
 `SIGKILL` itself. Teleport issue #49; regression test
 `terminate_hard_kills_a_child_that_ignores_hup_and_term`.
 
-**Do not drop the master as a termination mechanism.** The reader holds a
-cloned fd and the writer holds another — both `dup()`s of the same open file
-description. Dropping the `MasterPty` closes nothing and raises no signal
-(teleport `#S4`).
+**On Unix, do not drop the master as a termination mechanism.** The reader
+holds a cloned fd and the writer holds another — both `dup()`s of the same
+open file description. Dropping the `MasterPty` closes nothing and raises no
+signal (teleport `#S4`).
+
+**On Windows it is exactly the mechanism.** Dropping the last reference to
+the pseudoconsole is ClosePseudoConsole, which tears down every process
+attached to it, grandchildren included; that *is* step 2 there, and step 4
+is `TerminateProcess`. The two paths are told apart by test — a closed
+console leaves an `NTSTATUS` within milliseconds, the hard kill leaves `1`
+after 5 s — because the policy bound alone cannot see a graceful step that
+does nothing.
 
 ## Spawn details that bite
 
@@ -202,15 +210,17 @@ description. Dropping the `MasterPty` closes nothing and raises no signal
   children render monochrome because color detection treats absent `TERM` as
   dumb. Set `TERM=xterm-256color` + `COLORTERM=truecolor` **only when unset**;
   never clobber a real one, and an explicit `env` override always wins.
-- **Drop the slave handle** in the parent after spawn on Unix, so the master
-  sees EOF when the child exits.
+- **Drop the slave handle** in the parent after spawn. On Unix, so the master
+  sees EOF when the child exits; on Windows, because the slave is a second
+  reference to the pseudoconsole, and dropping the master only closes it if
+  the master is the last one.
 - **Do not copy the daemon's full environment into stored metadata.** The
   child inherits it; only explicit overrides are recorded, and they are
   redacted in API responses.
 
 ## Platform
 
-Unix first. **v1 is Unix-only** — but no longer because Windows is blocked.
+Unix and Windows (ConPTY), since M6 ([09-windows.md](09-windows.md)).
 
 This section used to cite teleport's `#W1` (a gracefully-exiting ConPTY child
 never observed as exited) as an unresolved blocker. It was resolved on
@@ -219,19 +229,27 @@ live obstacle and very nearly costing a scope decision on that basis.
 
 The cause was conhost's ConPTY startup handshake, not reaping: it writes a
 cursor-position query (`ESC[6n`) and blocks waiting for a reply, so an
-already-exited child never gets torn down. teleport's `ConptyDsrProbe`
-answers that one query and then stops — a probe that kept answering would
-corrupt any application that legitimately asks where the cursor is.
+already-exited child never gets torn down. `ConptyDsrProbe` (`src/pty.rs`,
+from teleport) answers that one query and then stops — a probe that kept
+answering would corrupt any application that legitimately asks where the
+cursor is. Removing it reproduces `#W1` here: `tests/pty_primitive_windows.rs`'s
+exit fixtures are never published an exit.
 
-Windows is therefore a port, not a research problem. Two pieces of work, one
-of them a real scope question:
+Where the platforms differ, and where each difference lives:
 
-- bring the probe and its test across (transport-independent; nothing to do
-  with how clients reach anchord)
-- decide the access-control story. `server.rs` makes filesystem permissions
-  *the* security boundary — 0600, no auth, no TCP — and a named pipe has no
-  equivalent. anchor would be choosing to have an access-control model for
-  the first time, which is a scope decision and not a port.
+- **termination's graceful step** is a signal on Unix and dropping the
+  master on Windows — opposites, as two `graceful_signal_group`s rather than
+  one function with a comment covering both ([Termination](#termination)).
+- **exit codes** are a full `DWORD` on Windows, and an `NTSTATUS` above
+  `i32::MAX` is the common case for a child torn down with its console; it is
+  recorded bit-exact (`pty::exit_code`), never collapsed to `-1`.
+- **spawnability** is an execute bit on Unix and `PATHEXT` on Windows
+  (`pty::is_spawnable`), mirroring `portable-pty`'s own search.
+- **`login_shell`** is ignored on Windows, which has no such convention.
+- **no raw input mode** on ConPTY: every byte crosses conhost's VT parser,
+  so a byte-exact `0..256` round trip is unreproducible by construction.
 
-Keep every `#[cfg(windows)]` inside the PTY module so the port stays
-possible; a platform conditional anywhere else is a bug.
+Every PTY-layer `#[cfg(windows)]` lives in `src/pty.rs`; a caller never
+learns the platform. The transport's conditionals live in `server.rs` and
+`client.rs`, the console's in `src/tty/`, and the access-control helpers in
+`winsec.rs` — each confined to the layer whose platform difference it is.

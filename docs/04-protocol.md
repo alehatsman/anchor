@@ -3,7 +3,9 @@
 Unix socket, `$XDG_RUNTIME_DIR/anchor.sock`, fallback
 `$XDG_DATA_HOME/anchor/anchor.sock`. Loopback equivalent; no TCP, no TLS, no
 auth. Filesystem permissions (0600) are the security boundary — see
-[01-scope.md](01-scope.md): remote access is a client's job.
+[01-scope.md](01-scope.md): remote access is a client's job. On Windows, a
+named pipe whose DACL is the same boundary: see
+[below](#windows-a-named-pipe).
 
 **A variable that is set but empty does not count as set.** Both lookups
 treat `""` as absent and fall through (`non_empty_env`, `src/paths.rs`).
@@ -391,13 +393,20 @@ not recorded by then the reply goes out anyway, so a client must check
 `already_exited`.
 
 `attach` restores the terminal on the way out, including when it is
-**signalled** rather than exited — `SIGTERM` and `SIGHUP` restore the saved
-attributes and then re-raise, so the process still looks killed to whatever
-was waiting on it. A terminal left raw outlives the process that did it,
-and a client attached to a long-running session is the thing someone kills
-from another window. `SIGINT` and `SIGQUIT` are deliberately not handled:
-in raw mode ^C and ^\ are bytes for the session, not signals to the
-client.
+**signalled** rather than exited — `SIGTERM`, `SIGHUP`, `SIGINT` and
+`SIGQUIT` restore the saved attributes and then re-raise, so the process
+still looks killed to whatever was waiting on it. A terminal left raw
+outlives the process that did it, and a client attached to a long-running
+session is the thing someone kills from another window. The keyboard cannot
+raise `SIGINT` or `SIGQUIT` here — in raw mode ^C and ^\ are bytes for the
+session — but `kill -INT` from another window can (`RESTORE_SIGNALS`,
+`src/tty/unix.rs`).
+
+On Windows the same restore runs from a console control handler on close,
+logoff, shutdown and Ctrl-Break; Ctrl-C is a byte for the session, as on
+Unix. Raw mode there also switches the console to UTF-8 and VT input, and
+output to VT processing — for an observer too, since a Windows console
+interprets escape sequences only when asked (`src/tty/windows.rs`).
 
 `attach` is raw-mode passthrough: local keystrokes go to the PTY as the exact
 bytes the local terminal produced, and output goes to stdout unparsed. **No VT

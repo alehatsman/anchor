@@ -26,9 +26,12 @@ noticed. That is the entire pitch.
 `use_anchor=true`. That flag is opt-in: teleport's default is still its
 in-process PTY layer (`use_anchor: false`, teleport `daemon/src/config.rs:140`,
 as of teleport `d7f34e9`), and flipping it is not yet scheduled. **M6 —
-Windows — is scheduled**, so that teleport can rely on anchor on every
-platform it ships rather than keeping an in-process PTY layer alive for one
-of them.
+Windows — is implemented on `feat/windows-m6`** and every gate of it was
+run on a real Windows 11 box: anchord serves a named pipe with an
+owner-only DACL, and hosts ConPTY sessions whose exit is observed exactly
+once with the code the child exited with. Not yet merged, and the Windows
+CI job has not yet run on GitHub
+([docs/09-windows.md](docs/09-windows.md)).
 
 `anchord` owns real PTY
 sessions: four threads each in the PTY layer, plus two listener threads
@@ -105,7 +108,8 @@ the answer is no.
 **Not a terminal multiplexer.** No windows, no panes, no layouts, no copy
 mode, no config language. tmux already exists and is better at it.
 
-**Not remote.** Binds a unix socket, mode 0600; no TCP. Reaching it across a network is a client's
+**Not remote.** Binds a unix socket, mode 0600 — on Windows a named pipe
+only its user can open; no TCP. Reaching it across a network is a client's
 job — teleport does exactly that, with its own auth and transport.
 
 The closest honest analogy is **containerd**: a runtime extracted from a
@@ -172,12 +176,12 @@ Nothing here should ever be read as more than that.
 | [docs/01-scope.md](docs/01-scope.md) | the closed list, and how to reject a feature |
 | [docs/02-model.md](docs/02-model.md) | sessions, labels, lifecycle, storage |
 | [docs/03-pty.md](docs/03-pty.md) | thread model, backpressure, termination |
-| [docs/04-protocol.md](docs/04-protocol.md) | the unix socket API |
+| [docs/04-protocol.md](docs/04-protocol.md) | the socket API, and the named pipe that carries it on Windows |
 | [docs/05-extraction.md](docs/05-extraction.md) | how this gets carved out of teleport |
 | [docs/06-teleport-seam.md](docs/06-teleport-seam.md) | where the two actually meet |
 | [docs/07-lifecycle.md](docs/07-lifecycle.md) | who starts anchord, and what restart does not save |
 | [docs/08-testing.md](docs/08-testing.md) | why a green suite is not evidence, and what to check instead |
-| [docs/09-windows.md](docs/09-windows.md) | what a Windows port would cost, and why it is deferred |
+| [docs/09-windows.md](docs/09-windows.md) | the Windows port: what it cost, gate by gate, and how each was checked |
 | [ROADMAP.md](ROADMAP.md) | milestones, each retiring one risk |
 
 ## License

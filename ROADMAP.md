@@ -126,6 +126,36 @@ until Windows has an anchord it is a deletion teleport cannot afford.
 
 ## M6 — Windows, so teleport can rely on anchor everywhere
 
+> **Implemented 2026-10-20 on `feat/windows-m6`; not yet merged.** All five
+> steps landed in order, one commit each, every one run on a real Windows
+> 11 Pro box (build 26200) as a standard user before the next began:
+>
+> 1. the `windows` CI job — red before the port (39 compile errors) when
+>    its steps were run on that box; **not yet observed on GitHub**, the
+>    branch being unpushed
+> 2. the ConPTY layer and `tests/pty_primitive_windows.rs`, 12 fixtures;
+>    removing `ConptyDsrProbe` reproduces `#W1`, and a fixture the donor
+>    lacked tells the graceful step from the hard kill
+> 3. a ledger the fixtures write as their last statement, checked by an
+>    ungated test — red on an early return and on a gated-out module
+> 4. the named pipe (owner-only DACL, fail-if-taken, identification-only
+>    clients, owner check, `CancelIoEx` detach), the console input path,
+>    and the owner-only data directory — each revert-checked
+> 5. autostart as a per-user Task Scheduler task. teleport's `Access is
+>    denied` reproduced and explained: an unscoped logon trigger needs
+>    elevation, a user-scoped one does not. The logon trigger has not been
+>    seen to fire; registration, the headless action and the one-minute
+>    watchdog have
+>
+> **Exit criterion, as demonstrated on that box:** a `cmd.exe` or
+> `powershell.exe` session created, typed into, detached with `~.` while
+> quiet, found still running, reattached with its scrollback, and its exit
+> observed exactly once with the code the child exited with — an `NTSTATUS`
+> above `i32::MAX` included. Windows suite green; the Linux suite unchanged
+> and green (WSL). What remains is merge, a green GitHub run, and then
+> teleport's side: lifting its `unix` gate and the in-process deletion.
+> Detail and evidence: [docs/09-windows.md](docs/09-windows.md).
+
 Scheduled 2026-10-19, reversing the deferral of 2026-10-16. The costing is
 [docs/09-windows.md](docs/09-windows.md); both of its §7 questions are now
 answered — anchord acquires an **owner-only DACL** on the named pipe rather
