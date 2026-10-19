@@ -102,18 +102,42 @@ pub fn bind(socket_path: &Path) -> Result<StdUnixListener> {
     }
 
     if socket_path.exists() {
+        // The probe below cannot be the thing that decides, because the two
+        // platforms disagree about what connecting to a path that is *not* a
+        // socket means. macOS reports `ENOTSOCK`, which falls through to the
+        // refusal. Linux reports `ECONNREFUSED` -- indistinguishable from the
+        // socket a dead daemon left behind, which is the one error treated as
+        // safe to delete. So on Linux the probe alone would answer "stale"
+        // for any regular file here and unlink it.
+        //
+        // Checking the file type first is what makes the rule below mean the
+        // same thing on both kernels.
+        use std::os::unix::fs::FileTypeExt;
+        let is_socket = std::fs::metadata(socket_path)
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false);
+        if !is_socket {
+            bail!(
+                "cannot determine whether a daemon owns {}: it exists but is \
+                 not a socket. Refusing to remove it; move it aside if it \
+                 really is stale.",
+                socket_path.display()
+            );
+        }
+
         match std::os::unix::net::UnixStream::connect(socket_path) {
             // Someone is listening. Never remove it.
             Ok(_) => bail!("anchord is already running on {}", socket_path.display()),
             // Nothing is accepting: a socket file a dead daemon left behind.
-            // This is the *only* error that means stale.
+            // This is the *only* error that means stale, and it means it
+            // only because the path is known to be a socket by here.
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
                 tracing::warn!(socket = %socket_path.display(), "removing stale socket");
                 std::fs::remove_file(socket_path)
                     .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
             }
-            // Anything else — a permissions problem, a path that is not a
-            // socket at all — says nothing about whether a daemon is alive.
+            // Anything else — a permissions problem, for instance — says
+            // nothing about whether a daemon is alive.
             // Treating it as stale would delete a running daemon's socket
             // and silently take over its clients.
             Err(e) => bail!(

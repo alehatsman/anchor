@@ -192,10 +192,18 @@ async fn a_socket_that_cannot_be_probed_is_never_removed() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("anchor.sock");
 
-    // Not a socket at all: a plain file where one is expected. Connecting
-    // fails, but not with "nobody is listening" — and anything other than
-    // that says nothing about whether a daemon is alive. Deleting it on a
-    // guess is how a running daemon loses its socket and its clients.
+    // Not a socket at all: a plain file where one is expected. Deleting it
+    // on a guess is how a running daemon loses its socket and its clients.
+    //
+    // This is the fixture that caught the two kernels disagreeing, on the
+    // first CI run that ever put Linux beside macOS. Connecting to a regular
+    // file reports `ENOTSOCK` on macOS but `ECONNREFUSED` on Linux — the
+    // same error a dead daemon's leftover socket gives, and the only one
+    // `bind` treats as safe to unlink. So this passed on a developer's mac
+    // for as long as it existed, while the property it names was false on
+    // the platform anchord actually runs as a systemd unit.
+    //
+    // Keep it running on both. One platform cannot answer this question.
     std::fs::write(&socket, b"not a socket").unwrap();
 
     let err = anchor::server::bind(&socket).unwrap_err().to_string();
