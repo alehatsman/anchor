@@ -4,13 +4,16 @@
 //! Order matters, per docs/02-model.md:
 //!
 //! ```text
-//! resolve data dir -> bind unix socket -> open SQLite (WAL), migrate
-//! -> mark live sessions LOST -> reconcile output_bytes -> serve
+//! resolve data dir -> arm SIGTERM/SIGINT -> bind unix socket
+//! -> open SQLite (WAL), migrate -> mark live sessions LOST
+//! -> reconcile output_bytes -> serve
 //! ```
 //!
-//! The bind comes before the database is opened, not after. See the comment
-//! on it: migration and recovery both write, and only the process that holds
-//! the socket has the right to.
+//! Both of the first two orderings are load-bearing, and the comments at
+//! each step say why: the bind precedes every write because only the process
+//! holding the socket may decide what a live row means, and the handlers
+//! precede the bind because a bound socket is connectable while the database
+//! is still opening.
 
 use std::sync::{Arc, Mutex};
 

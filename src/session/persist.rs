@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::store::Store;
 
-/// Queued offset updates. Each is a whole-value overwrite, so dropping one
-/// costs precision until the next update. Across a crash that precision is
-/// recoverable from the file only while the log is uncapped.
+/// Depth of the queue of pending updates. Across a crash, the precision a
+/// dropped update costs is recoverable from the log file only while that log
+/// is uncapped.
 const QUEUE_CAPACITY: usize = 256;
 
 /// One queued write. Both kinds are whole-value overwrites, so dropping one

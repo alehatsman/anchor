@@ -6,7 +6,13 @@ do not exist, and three at teleport filenames absent from this repo (#17).
 Nothing rejected them, because nothing read them. This does.
 
 It checks two things about every `docs/NN-name.md[#fragment]` reference:
-the file exists, and the fragment matches a heading in it. Cross-repo
+the file exists, and the fragment matches a heading in it.
+
+It also checks every reference to one of this repo's own source files:
+the path exists, and it carries no `:123` line number. Line numbers were
+allowed once and eight of twenty-eight had drifted onto the wrong line --
+including three naming a file or a line that no longer existed. A reference
+that reads as precise and is wrong is worse than none. Cross-repo
 references (teleport's own docs) are reported as skipped rather than
 checked -- teleport is not present in CI, and a checker that silently
 ignored them would be claiming more coverage than it has.
@@ -45,6 +51,42 @@ CROSS_REPO = re.compile(r"(?:teleport\S*|\.\.)[\s/`'\"]*(?:docs/)?$")
 
 HEADING = re.compile(r"^#{1,6}\s+(.*?)\s*$", re.MULTILINE)
 
+# A citation naming one of this repo's own source files, with an optional
+# `:123` or `:12-20` suffix. Twenty-eight of these existed and eight pointed
+# at the wrong line, because nothing read them either.
+#
+# The leading lookbehind is load-bearing: without it `daemon/src/pty.rs` --
+# teleport's file, named all over docs/09-windows.md -- matches as this
+# repo's `src/pty.rs` and is reported missing or line-numbered.
+SOURCE_CITATION = re.compile(
+    r"(?<![\w/-])((?:src|tests|scripts)/[\w./-]+\.(?:rs|py))(:[\d,-]*\d)?"
+)
+
+
+def source_problems(line: str, where: str) -> tuple[int, list[str]]:
+    """Source citations must name a file that exists, and never a line number.
+
+    A line number cannot be kept true: it is correct when written and silently
+    wrong after the next edit above it, which is worse than no reference at
+    all, because it reads as precision. Name the symbol instead -- that
+    survives an edit and is what a reader was going to search for anyway.
+    """
+    checked, found = 0, []
+    for match in SOURCE_CITATION.finditer(line):
+        # teleport has files at the same paths; those are its business.
+        if CROSS_REPO.search(line[: match.start()]):
+            continue
+        checked += 1
+        path, lineno = match.group(1), match.group(2)
+        if not (ROOT / path).exists():
+            found.append(f"{where} -> {path} (no such file)")
+        elif lineno:
+            found.append(
+                f"{where} -> {path}{lineno} "
+                f"(line numbers rot silently; name the symbol instead)"
+            )
+    return checked, found
+
 
 def slugify(heading: str) -> str:
     """GitHub's heading-anchor rules, as far as this repo exercises them."""
@@ -71,8 +113,12 @@ def main() -> int:
         for lineno, line in enumerate(
             source.read_text(encoding="utf-8").splitlines(), start=1
         ):
+            where = f"{source.relative_to(ROOT)}:{lineno}"
+            source_checked, found = source_problems(line, where)
+            checked += source_checked
+            problems.extend(found)
+
             for match in CITATION.finditer(line):
-                where = f"{source.relative_to(ROOT)}:{lineno}"
                 if CROSS_REPO.search(line[: match.start()]):
                     skipped += 1
                     continue

@@ -224,9 +224,8 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
     // docs/04-protocol.md promises a line that is not a request object is
     // answered `bad_request`, and that has to include one that is not text.
     let mut raw: Vec<u8> = Vec::new();
-    // One connection is one client, for the control lease. docs/04-protocol.md
-    // leaves lease identity to an open issue, and per-connection is the
-    // honest reading of "exactly one writer of input and size".
+    // One connection is one client, for the control lease -- see
+    // `stream::serve_attached` for why that is the honest reading.
     let holder = crate::model::new_session_id();
 
     loop {
@@ -510,11 +509,10 @@ fn op_list(id: u64, line: &str, state: &State) -> Value {
 
 /// The code for a `CreateError`, in one place.
 ///
-/// Shared with the label path deliberately. It used to have its own
-/// catch-all that answered `invalid_spec` for everything it did not name,
-/// so the same failure got one code from `create` and a wrong one from
-/// `label`. Matching exhaustively here means a new variant is a compile
-/// error rather than a silent reclassification.
+/// Shared with the label path deliberately: a second mapping with its own
+/// catch-all gave the same failure one code from `create` and a different,
+/// wrong one from `label`. Matching exhaustively here means a new variant is
+/// a compile error rather than a silent reclassification.
 fn code_for(e: &CreateError) -> ErrorCode {
     match e {
         CreateError::InvalidLabel(_) => ErrorCode::InvalidLabel,

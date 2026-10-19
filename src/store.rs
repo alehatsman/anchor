@@ -1,6 +1,4 @@
 //! Session persistence. Single connection, single writer.
-//!
-//! Label *filtering* is M2; this layer stores and returns labels, nothing more.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -419,8 +417,8 @@ fn json_column<T: serde::de::DeserializeOwned>(row: &Row<'_>, name: &str) -> rus
     })
 }
 
-/// Paths are stored as text; a non-UTF-8 path is stored lossily. Rejecting
-/// one outright belongs in create-time validation, which arrives with `create`.
+/// Paths are stored as text; a non-UTF-8 path is stored lossily. Rejecting one
+/// outright belongs in `SessionManager::create`'s validation, not here.
 fn path_to_text(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
