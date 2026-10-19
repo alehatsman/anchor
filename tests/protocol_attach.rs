@@ -826,3 +826,261 @@ fn next_resize(conn: &mut Conn) -> (u16, u16) {
         );
     }
 }
+
+/// `read_until` for a long stream: it keeps only the tail it needs
+/// to match, where `read_until` rescans everything received on every frame.
+fn drain_until(conn: &mut Conn, needle: &[u8]) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut tail: Vec<u8> = Vec::new();
+    loop {
+        let (tag, _, payload) = conn.frame();
+        if tag == frame::OUTPUT {
+            tail.extend_from_slice(&payload);
+            if tail.windows(needle.len()).any(|w| w == needle) {
+                return;
+            }
+            let keep = tail.len().saturating_sub(needle.len());
+            tail.drain(..keep);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {needle:?}"
+        );
+    }
+}
+
+/// A session whose child reads nothing from its stdin, ever.
+fn create_deaf(conn: &mut Conn) -> String {
+    let response = conn.call(
+        "create",
+        json!({
+            "spec": {
+                "command": "/bin/sh",
+                "args": ["-c", "stty raw -echo; exec sleep 600"],
+                "cwd": std::env::temp_dir(),
+            }
+        }),
+    );
+    assert_eq!(response["ok"], true, "create failed: {response}");
+    response["session"].as_str().unwrap().to_string()
+}
+
+/// A connection that dies between the daemon taking the lease for it and the
+/// daemon finishing the handshake must not leave that lease held by a holder
+/// that no longer exists. Before the guard was built at the decision, the
+/// attach reply failing to send returned past it, and every later
+/// `control: true` attach was silently downgraded to observer for the rest
+/// of the session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_that_dies_mid_handshake_does_not_strand_the_lease() {
+    let (_dir, socket) = harness();
+    let mut setup = Conn::connect(&socket);
+    let id = create_shell(&mut setup);
+
+    // Send the attach and close without reading a byte. The daemon still
+    // reads the line (data sent before a close stays readable), takes the
+    // lease, and then finds nobody to answer.
+    for _ in 0..5 {
+        let mut line = serde_json::to_vec(&json!({
+            "id": 1, "op": "attach", "session": &id, "from": 0, "control": true,
+        }))
+        .unwrap();
+        line.push(b'\n');
+        let mut dead = UnixStream::connect(&socket).unwrap();
+        dead.write_all(&line).unwrap();
+        drop(dead);
+    }
+
+    // The lease must come free. Each probe is a real attach, so a probe that
+    // loses to a handler still unwinding is just retried.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut probe = Conn::connect(&socket);
+        let r = probe.call(
+            "attach",
+            json!({ "session": &id, "from": 0, "control": true }),
+        );
+        assert_eq!(r["ok"], true, "attach failed: {r}");
+        if r["control"] == true {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the lease is still held by a connection that is gone"
+        );
+        drop(probe);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    setup.call("terminate", json!({ "session": &id }));
+}
+
+/// A claim is not undone by a broadcast that was already in flight. The
+/// output half used to decide "mine" by name alone, so a stale announcement
+/// that someone else had taken the lease -- read after this connection had
+/// claimed it back -- wiped the new epoch: the client was told it held
+/// control while every keystroke was discarded.
+///
+/// The stale announcement is made deterministic by parking A's output half
+/// in a write nobody is reading: B's claim queues behind it, and so does the
+/// claim A then makes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_survives_a_stale_broadcast_about_someone_else() {
+    let (_dir, socket) = harness();
+    let mut setup = Conn::connect(&socket);
+    // Waits for a line, then emits far more than a socket buffer holds and
+    // far less than a subscriber's queue budget, then echoes input.
+    let created = setup.call(
+        "create",
+        json!({
+            "spec": {
+                "command": "/bin/sh",
+                "args": ["-c", "stty raw -echo; echo ready; read x; yes x | head -c 300000; echo burst-over; exec cat"],
+                "cwd": std::env::temp_dir(),
+            }
+        }),
+    );
+    assert_eq!(created["ok"], true, "create failed: {created}");
+    let id = created["session"].as_str().unwrap().to_string();
+
+    let mut a = Conn::connect(&socket);
+    a.call(
+        "attach",
+        json!({ "session": &id, "from": 0, "control": true }),
+    );
+    assert_eq!(a.frame().2, vec![1], "A starts as the controller");
+    a.read_until("ready");
+
+    let mut b = Conn::connect(&socket);
+    b.call("attach", json!({ "session": &id, "from": 0 }));
+    assert_eq!(b.frame().2, vec![0]);
+
+    // A starts the burst and then stops reading, so its output half parks in
+    // a write. B drains the burst, which is how the test knows it is over.
+    a.send_input(b"go\n");
+    drain_until(&mut b, b"burst-over");
+
+    let claim = frame::encode(frame::LEASE, 0, &[1]);
+    b.writer.write_all(&claim).unwrap();
+    // B's own grant is the proof that its claim has been applied and
+    // announced -- and A's output half, parked, has not read it.
+    loop {
+        let (tag, _, payload) = b.frame();
+        if tag == frame::LEASE && payload == vec![1] {
+            break;
+        }
+    }
+
+    // A claims it back. B being told it lost is the proof A's claim landed.
+    a.writer.write_all(&claim).unwrap();
+    loop {
+        let (tag, _, payload) = b.frame();
+        if tag == frame::LEASE && payload == vec![0] {
+            break;
+        }
+    }
+
+    // A reads again: the stale "B has it" comes first, then "A has it".
+    // Wait until it has been told it holds control, then type.
+    loop {
+        let (tag, _, payload) = a.frame();
+        if tag == frame::LEASE && payload == vec![1] {
+            break;
+        }
+    }
+    a.send_input(b"typed-after-claim\n");
+    drain_until(&mut a, b"typed-after-claim");
+
+    setup.call("terminate", json!({ "session": &id }));
+}
+
+/// A child that has stopped reading its stdin must not take the daemon's
+/// runtime workers with it. Input used to be written from the async task:
+/// once the write channel filled, each frame parked a worker in a retry
+/// sleep, so as many stuck controllers as there are workers stalled `accept`
+/// and every other session.
+///
+/// Two workers and two stuck sessions make that exact: if either flood is
+/// still on a worker, an unrelated control op cannot be answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_that_stops_reading_does_not_stall_the_daemon() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (_dir, socket) = harness();
+    let mut setup = Conn::connect(&socket);
+    let ids = [create_deaf(&mut setup), create_deaf(&mut setup)];
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut jammed = Vec::new();
+    let mut floods = Vec::new();
+    for id in &ids {
+        let mut conn = Conn::connect(&socket);
+        let r = conn.call(
+            "attach",
+            json!({ "session": id, "from": 0, "control": true }),
+        );
+        assert_eq!(r["control"], true);
+        let writer = conn.writer.try_clone().unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let stuck = Arc::new(AtomicBool::new(false));
+        jammed.push(Arc::clone(&stuck));
+        let stop = Arc::clone(&stop);
+        floods.push((
+            conn,
+            std::thread::spawn(move || {
+                let mut writer = writer;
+                let frame = frame::encode(frame::INPUT, 0, &[b'x'; 1024]);
+                while !stop.load(Ordering::SeqCst) {
+                    // Whole frames, resumed after a timeout: a torn frame
+                    // would desynchronise the stream and end the connection.
+                    let mut sent = 0;
+                    while sent < frame.len() && !stop.load(Ordering::SeqCst) {
+                        match writer.write(&frame[sent..]) {
+                            Ok(n) => sent += n,
+                            // A write that times out means the daemon has
+                            // stopped taking input off this socket: the jam
+                            // is established. Keep pushing -- it must have
+                            // input waiting for as long as the test looks.
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                stuck.store(true, Ordering::SeqCst);
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                }
+            }),
+        ));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !jammed.iter().all(|j| j.load(Ordering::SeqCst)) {
+        assert!(Instant::now() < deadline, "the floods never jammed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Unrelated work, answered while both stuck sessions are still stuck.
+    let started = Instant::now();
+    let listed = setup.call("list", json!({}));
+    assert_eq!(listed["ok"], true);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a control op took {:?} with two stuck children",
+        started.elapsed()
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    for (conn, flood) in floods {
+        let _ = conn.writer.shutdown(std::net::Shutdown::Both);
+        flood.join().unwrap();
+    }
+    for id in &ids {
+        setup.call("terminate", json!({ "session": id }));
+    }
+}
