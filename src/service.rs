@@ -7,15 +7,16 @@
 //! Something else has to start it, and on a single-user machine that is the
 //! OS's per-user service manager.
 //!
-//! Login-scoped and root-free on both platforms: a launchd *user agent* on
-//! macOS, a systemd *user unit* on Linux. Boot-scoped supervision
-//! (`LaunchDaemons`, systemd lingering) needs elevation and starts sessions
-//! for a user who is not logged in — a different decision than this one, and
-//! deliberately not taken here.
+//! Login-scoped and root-free on every platform: a launchd *user agent* on
+//! macOS, a systemd *user unit* on Linux, a Task Scheduler task triggered by
+//! this user's logon on Windows. Boot-scoped supervision (`LaunchDaemons`,
+//! systemd lingering, a boot trigger or a stored password) needs elevation
+//! and starts sessions for a user who is not logged in — a different
+//! decision than this one, and deliberately not taken here.
 //!
-//! Neither unit pins a socket path. `anchord` resolves the same path a
-//! client resolves, and a unit that baked one in would diverge from that
-//! resolution the moment either side changed.
+//! No registration pins a socket path or a pipe name. `anchord` resolves the
+//! same endpoint a client resolves, and a unit that baked one in would
+//! diverge from that resolution the moment either side changed.
 
 use std::path::{Path, PathBuf};
 
@@ -51,7 +52,10 @@ fn home_dir() -> Result<PathBuf> {
 /// can remove out from under an installed unit — with no error until the
 /// next login, when the service manager fails to start a binary that is no
 /// longer there.
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", windows)),
+    allow(dead_code)
+)]
 fn warn_if_build_output(exe: &Path) {
     if is_build_output(exe) {
         eprintln!(
@@ -70,7 +74,10 @@ fn warn_if_build_output(exe: &Path) {
 /// fixed one — a workspace, a `CARGO_TARGET_DIR`, and a plain crate all put
 /// it somewhere different, and a check that only fires for one layout warns
 /// nobody.
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", windows)),
+    allow(dead_code)
+)]
 fn is_build_output(exe: &Path) -> bool {
     let parts: Vec<_> = exe
         .components()
@@ -87,7 +94,10 @@ fn is_build_output(exe: &Path) -> bool {
 /// registration names the build the user actually invoked. Absolute, because
 /// a relative path would resolve against the service manager's working
 /// directory rather than the user's.
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", windows)),
+    allow(dead_code)
+)]
 fn anchord_path() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("resolving this binary's own path")?;
     let exe = exe.canonicalize().unwrap_or(exe);
@@ -449,10 +459,285 @@ mod platform {
     }
 }
 
+/// Windows: a Task Scheduler task for the current user (docs/09-windows.md
+/// §4.7, docs/07-lifecycle.md).
+///
+/// Every behaviour below was checked on Windows 11 build 26200, as a
+/// standard (non-elevated) user, before it was written down:
+///
+/// - **`schtasks /SC ONLOGON` is `Access is denied`** for a standard user --
+///   the failure teleport hit on the same build -- because that trigger fires
+///   for *any* user's logon. A `LogonTrigger` scoped to this user's SID,
+///   imported as XML, registers without elevation. That scoping is the whole
+///   difference, and it is also the login-scoped rule this module keeps on
+///   every platform.
+/// - **No console window**: the action is `conhost.exe --headless anchord`.
+///   A console app started by the scheduler otherwise opens a window, and
+///   closing it would end anchord and every session in it.
+/// - **Revival is a repetition, not `RestartOnFailure`.** A killed anchord
+///   was never restarted by `RestartOnFailure` (the task just went back to
+///   Ready). A one-minute repetition with `IgnoreNew` is a no-op while
+///   anchord runs and starts it again within a minute once it does not --
+///   observed: killed, answering again 75s later. It is systemd's
+///   `Restart=always`, at a coarser grain.
+/// - **Re-registering does not touch a running anchord**: `/Create /F` over
+///   a running task left the same process serving. So, as on Linux, a
+///   changed registration applies at the next start.
+/// - **`/End` does not stop anchord**: it ends the headless conhost and the
+///   daemon keeps serving as an orphan. `uninstall` therefore stops anchord
+///   itself, found as the server of this user's own, owner-verified pipe.
+///
+/// What was *not* observed, and cannot be from inside one logon session:
+/// the logon trigger firing at an actual logon. Registration, the action,
+/// the repetition and the principal all were.
+#[cfg(windows)]
+mod platform {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use anyhow::{bail, Context, Result};
+
+    use super::{anchord_path, warn_if_build_output, Outcome};
+
+    /// The task's name, in the root folder: a folder of our own would need
+    /// rights a standard user may not have.
+    pub(super) const TASK: &str = "anchord";
+
+    /// The registration as last written, kept beside the data so `install`
+    /// can compare against it, the way Linux compares the unit file.
+    /// Task Scheduler's own export is normalised and would never compare
+    /// equal to what was imported.
+    fn registration_path() -> Result<PathBuf> {
+        Ok(crate::paths::Paths::resolve()?
+            .data_dir()
+            .join("anchord.task.xml"))
+    }
+
+    fn schtasks(args: &[&str]) -> std::io::Result<std::process::Output> {
+        Command::new("schtasks.exe").args(args).output()
+    }
+
+    fn registered() -> bool {
+        schtasks(&["/Query", "/TN", TASK]).is_ok_and(|o| o.status.success())
+    }
+
+    fn xml_escape(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
+
+    fn conhost() -> PathBuf {
+        let root = std::env::var_os("SystemRoot")
+            .filter(|v| !v.is_empty())
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        root.join("System32").join("conhost.exe")
+    }
+
+    pub(super) fn install() -> Result<Outcome> {
+        let exe = anchord_path()?;
+        warn_if_build_output(&exe);
+        let user = crate::winsec::UserSid::current()?.to_sid_string()?;
+        let xml = render(&exe, &conhost(), &user);
+
+        let path = registration_path()?;
+        // The same rule as the other two platforms: an unchanged
+        // registration is left alone, and says nothing happened.
+        if registered() && std::fs::read_to_string(&path).is_ok_and(|current| current == xml) {
+            return Ok(Outcome::Installed(path));
+        }
+        let paths = crate::paths::Paths::resolve()?;
+        paths.ensure_dirs()?;
+        std::fs::write(&path, &xml).with_context(|| format!("writing {}", path.display()))?;
+
+        // schtasks reads the file as UTF-16, as the declaration says.
+        let wide = path.with_extension("utf16.xml");
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(&wide, bytes).with_context(|| format!("writing {}", wide.display()))?;
+        let created = schtasks(&[
+            "/Create",
+            "/TN",
+            TASK,
+            "/XML",
+            &wide.to_string_lossy(),
+            "/F",
+        ]);
+        let _ = std::fs::remove_file(&wide);
+        let created = created.context("running schtasks")?;
+        if !created.status.success() {
+            let _ = std::fs::remove_file(&path);
+            bail!(
+                "schtasks refused the registration: {}",
+                String::from_utf8_lossy(&created.stderr).trim()
+            );
+        }
+
+        // Start it now rather than at next logon -- systemd's `enable
+        // --now`. With `IgnoreNew` this is a no-op if one is already
+        // running, so a changed registration does not restart anchord: it
+        // applies at the next start, as on Linux.
+        let _ = schtasks(&["/Run", "/TN", TASK]);
+        Ok(Outcome::Installed(path))
+    }
+
+    /// The task definition. A pure function of its inputs, so an unchanged
+    /// reinstall compares equal and does nothing.
+    ///
+    /// The user is a SID, not `DOMAIN\name`: a name can be renamed, and the
+    /// environment variables it would come from can say anything.
+    pub(super) fn render(exe: &Path, conhost: &Path, user: &str) -> String {
+        let exe = xml_escape(&exe.to_string_lossy());
+        let conhost = xml_escape(&conhost.to_string_lossy());
+        let user = xml_escape(user);
+        // The repetition is the watchdog (see the module doc); the time
+        // trigger carries it from the moment of install, since a logon
+        // trigger's repetition only starts at the next logon. Under an
+        // interactive token neither runs while the user is logged off.
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>anchor session daemon. Managed by `anchor service`; see docs/07-lifecycle.md.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user}</UserId>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </LogonTrigger>
+    <TimeTrigger>
+      <Enabled>true</Enabled>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{conhost}</Command>
+      <Arguments>--headless "{exe}"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#
+        )
+    }
+
+    pub(super) fn uninstall() -> Result<Outcome> {
+        let path = registration_path()?;
+        if !registered() {
+            let _ = std::fs::remove_file(&path);
+            return Ok(Outcome::NotInstalled);
+        }
+        let deleted = schtasks(&["/Delete", "/TN", TASK, "/F"]).context("running schtasks")?;
+        if !deleted.status.success() {
+            bail!(
+                "schtasks could not remove the task: {}",
+                String::from_utf8_lossy(&deleted.stderr).trim()
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+        // `/End` would not stop it (see the module doc), so stop it here, as
+        // `disable --now` and `bootout` do on the other platforms. Its
+        // sessions end with it -- the boundary docs/07-lifecycle.md states.
+        if let Some(pid) = running_daemon() {
+            match terminate(pid) {
+                Ok(()) => eprintln!("stopped anchord (pid {pid}); its sessions ended with it"),
+                Err(e) => eprintln!("warning: could not stop anchord (pid {pid}): {e}"),
+            }
+        }
+        Ok(Outcome::Uninstalled(path))
+    }
+
+    pub(super) fn status() -> Result<String> {
+        let path = registration_path()?;
+        if !registered() {
+            return Ok("not installed".into());
+        }
+        // Asked of the pipe rather than of the task: the task's own state
+        // says "Ready" for an anchord whose conhost is gone but which is
+        // still serving, and "Running" says nothing about whether it answers.
+        Ok(format!(
+            "installed as scheduled task {TASK} ({})\n{}",
+            path.display(),
+            match running_daemon() {
+                Some(pid) => format!("running (pid {pid})"),
+                None => "not running — the task starts it within a minute while you are \
+                         logged in, or run `anchor service install` again"
+                    .into(),
+            }
+        ))
+    }
+
+    /// The pid serving this user's pipe, if anything is -- through the
+    /// client's own connect, so a pipe this user does not own is never
+    /// mistaken for anchord.
+    fn running_daemon() -> Option<u32> {
+        use std::os::windows::io::AsRawHandle;
+        let pipe = crate::paths::Paths::resolve()
+            .ok()?
+            .socket_path()
+            .to_path_buf();
+        let stream = crate::client::Stream::connect(&pipe).ok()?;
+        let mut pid = 0u32;
+        // SAFETY: a connected client handle and an out-pointer we own.
+        let ok = unsafe {
+            windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId(
+                stream.as_raw_handle(),
+                &mut pid,
+            )
+        };
+        (ok != 0).then_some(pid)
+    }
+
+    fn terminate(pid: u32) -> std::io::Result<()> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
+        // SAFETY: plain values in, a handle or null out.
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the handle opened above, closed once.
+        let ok = unsafe { TerminateProcess(handle, 0) };
+        let err = std::io::Error::last_os_error();
+        // SAFETY: as above.
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
 /// Platforms with no per-user service manager this maps onto. Saying so is
 /// the point: an `install` that succeeded and registered nothing would be
 /// discovered only when the sessions it was supposed to supervise were gone.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 mod platform {
     use anyhow::{bail, Result};
 
@@ -460,8 +745,9 @@ mod platform {
 
     fn unsupported<T>() -> Result<T> {
         bail!(
-            "`anchor service` supports macOS (launchd user agent) and Linux (systemd user \
-             unit). On this platform, start anchord from whatever supervises your user's \
+            "`anchor service` supports macOS (launchd user agent), Linux (systemd user \
+             unit) and Windows (a scheduled task). On this platform, start anchord from \
+             whatever supervises your user's \
              processes — see docs/07-lifecycle.md for what that has to guarantee."
         )
     }
@@ -562,14 +848,31 @@ mod tests {
         assert_eq!(running, "running");
     }
 
+    /// The registration for `exe`, through whichever renderer this platform
+    /// has. Windows' also takes the conhost it runs under and the user, both
+    /// fixed here so the rendering under test is a pure function of `exe`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn rendered(exe: &std::path::Path) -> String {
+        platform::render(exe)
+    }
+
+    #[cfg(windows)]
+    fn rendered(exe: &std::path::Path) -> String {
+        platform::render(
+            exe,
+            std::path::Path::new("C:/Windows/System32/conhost.exe"),
+            "S-1-5-21-1-2-3-1001",
+        )
+    }
+
     /// A path with a space must survive the unit format's quoting. Getting
     /// this wrong is silent: `install` reports success and the service
     /// fails to start later, because the path split into several words.
     #[test]
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn a_path_with_a_space_stays_one_word() {
         let exe = PathBuf::from("/Users/a b/bin/anchord");
-        let rendered = platform::render(&exe);
+        let rendered = rendered(&exe);
         #[cfg(target_os = "linux")]
         assert!(
             rendered.contains("ExecStart=\"/Users/a b/bin/anchord\""),
@@ -580,18 +883,25 @@ mod tests {
             rendered.contains("<string>/Users/a b/bin/anchord</string>"),
             "the path belongs in one <string>: {rendered}"
         );
+        // conhost re-splits its arguments, so the path is quoted inside them.
+        #[cfg(windows)]
+        assert!(
+            rendered.contains(r#"<Arguments>--headless "/Users/a b/bin/anchord"</Arguments>"#),
+            "unquoted, conhost splits the path on the space: {rendered}"
+        );
     }
 
-    /// XML metacharacters in a path must be escaped, or the plist does not
-    /// parse and launchd rejects it well after `install` said it worked.
-    #[cfg(target_os = "macos")]
+    /// XML metacharacters in a path must be escaped, or the plist (or the
+    /// task) does not parse and is rejected well after `install` said it
+    /// worked.
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn xml_metacharacters_in_a_path_are_escaped() {
         let exe = PathBuf::from("/Users/a&b/<x>/anchord");
-        let rendered = platform::render(&exe);
+        let rendered = rendered(&exe);
         assert!(
             rendered.contains("/Users/a&amp;b/&lt;x&gt;/anchord"),
-            "unescaped path breaks the plist: {rendered}"
+            "unescaped path breaks the XML: {rendered}"
         );
         assert!(
             !rendered.contains("a&b"),
@@ -600,26 +910,48 @@ mod tests {
     }
 
     /// The registration must not pin a socket path: anchord has to resolve
-    /// the same one a client resolves (docs/07-lifecycle.md).
+    /// the same one a client resolves (docs/07-lifecycle.md). On Windows,
+    /// the same for the pipe.
     #[test]
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn no_socket_path_is_baked_in() {
-        let rendered = platform::render(&PathBuf::from("/usr/local/bin/anchord"));
+        let rendered = rendered(&PathBuf::from("/usr/local/bin/anchord"));
         assert!(
-            !rendered.contains("--socket") && !rendered.contains(".sock"),
-            "the unit pins a socket path: {rendered}"
+            !rendered.contains("--socket")
+                && !rendered.contains(".sock")
+                && !rendered.contains("pipe"),
+            "the registration pins an endpoint: {rendered}"
         );
     }
 
-    /// Restart-on-exit is the point of being supervised at all.
+    /// Restart-on-exit is the point of being supervised at all. On Windows
+    /// it is a one-minute repetition that `IgnoreNew` turns into a no-op
+    /// while anchord runs -- `RestartOnFailure` was observed not to revive a
+    /// killed daemon (see the module doc).
     #[test]
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn the_service_is_restarted_if_it_exits() {
-        let rendered = platform::render(&PathBuf::from("/usr/local/bin/anchord"));
+        let rendered = rendered(&PathBuf::from("/usr/local/bin/anchord"));
         #[cfg(target_os = "linux")]
         assert!(rendered.contains("Restart=always"), "{rendered}");
         #[cfg(target_os = "macos")]
         assert!(rendered.contains("<key>KeepAlive</key>"), "{rendered}");
+        #[cfg(windows)]
+        {
+            assert!(
+                rendered.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"),
+                "without IgnoreNew every repetition starts a second anchord: {rendered}"
+            );
+            assert_eq!(
+                rendered.matches("<Interval>PT1M</Interval>").count(),
+                2,
+                "both triggers must repeat, or nothing revives a dead anchord: {rendered}"
+            );
+            assert!(
+                rendered.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"),
+                "the default limit ends a task after 72 hours: {rendered}"
+            );
+        }
     }
 
     /// Login-scoped, never boot-scoped: a boot-scoped registration needs
@@ -627,12 +959,40 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_unit_is_login_scoped() {
-        let rendered = platform::render(&PathBuf::from("/usr/local/bin/anchord"));
+        let rendered = rendered(&PathBuf::from("/usr/local/bin/anchord"));
         assert!(rendered.contains("WantedBy=default.target"), "{rendered}");
         assert!(
             !rendered.contains("multi-user.target"),
             "multi-user.target is boot-scoped: {rendered}"
         );
+    }
+
+    /// The same rule on Windows: this user's logon, this user's interactive
+    /// token, no stored password and no elevation. An unscoped logon trigger
+    /// is also exactly what a standard user is refused (`Access is denied`).
+    #[cfg(windows)]
+    #[test]
+    fn the_task_is_login_scoped() {
+        let rendered = rendered(&PathBuf::from("/usr/local/bin/anchord"));
+        assert!(
+            rendered.contains("<LogonTrigger>")
+                && rendered.contains("<UserId>S-1-5-21-1-2-3-1001</UserId>"),
+            "the logon trigger must be scoped to this user: {rendered}"
+        );
+        assert!(
+            rendered.contains("<LogonType>InteractiveToken</LogonType>"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("<RunLevel>LeastPrivilege</RunLevel>"),
+            "{rendered}"
+        );
+        for boot_scoped in ["BootTrigger", "S4U", "Password", "HighestAvailable"] {
+            assert!(
+                !rendered.contains(boot_scoped),
+                "{boot_scoped} is not login-scoped or needs elevation: {rendered}"
+            );
+        }
     }
 
     /// A build-output path is recognised wherever `target/debug` appears,
@@ -686,25 +1046,25 @@ mod tests {
     /// restoring the exact behaviour this guards against while every other
     /// test stayed green.
     #[test]
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn a_registration_renders_identically_for_the_same_binary() {
         let exe = PathBuf::from("/usr/local/bin/anchord");
         let other = PathBuf::from("/opt/homebrew/bin/anchord");
         let kind = if cfg!(target_os = "macos") {
             "plist"
         } else {
-            "unit"
+            "unit or task"
         };
 
         assert_eq!(
-            platform::render(&exe),
-            platform::render(&exe),
+            rendered(&exe),
+            rendered(&exe),
             "the {kind} must render byte-identically twice, or an unchanged \
              reinstall reads as a changed one and restarts the daemon"
         );
         assert_ne!(
-            platform::render(&exe),
-            platform::render(&other),
+            rendered(&exe),
+            rendered(&other),
             "a different binary must render differently, or a changed \
              reinstall reads as unchanged and never takes effect"
         );

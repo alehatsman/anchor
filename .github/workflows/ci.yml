@@ -86,7 +86,9 @@ jobs:
     # should be -- `cargo clippy` failed to compile the library (39 errors:
     # the unix-only `pty` module, `tokio::net::UnixStream`, termios,
     # `PermissionsExt`). Reproduced by running these steps on a real Windows
-    # 11 box (build 26200); not yet observed here, the branch being unpushed.
+    # 11 box (build 26200). Every later gate was run there the same way
+    # before it was committed; the first run of this job on GitHub is still
+    # to come.
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
