@@ -520,3 +520,35 @@ async fn the_socket_path_message_has_no_runs_of_spaces() {
         .to_string();
     assert!(!err.contains("  "), "stray spaces in: {err}");
 }
+
+/// Every route keeps the request's id when the line is refused: a malformed
+/// attach (missing `session`) and a malformed op body are `invalid_spec`
+/// carrying the id, and a line that is not a request is `bad_request` with
+/// the id salvaged from it when it has one. The request is parsed once now,
+/// so this pins what the single parse must still hand every route.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_refusal_keeps_the_requests_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = serve(&dir);
+    let mut client = Client::connect(&socket);
+
+    let attach = client.send_raw(r#"{"id":42,"op":"attach"}"#);
+    assert_eq!(attach["id"], 42, "{attach}");
+    assert_eq!(attach["error"]["code"], "invalid_spec", "{attach}");
+
+    let get = client.send_raw(r#"{"id":43,"op":"get"}"#);
+    assert_eq!(get["id"], 43, "{get}");
+    assert_eq!(get["error"]["code"], "invalid_spec", "{get}");
+
+    let log = client.send_raw(r#"{"id":45,"op":"log"}"#);
+    assert_eq!(log["id"], 45, "{log}");
+    assert_eq!(log["error"]["code"], "invalid_spec", "{log}");
+
+    let salvaged = client.send_raw(r#"{"id":44,"op":7}"#);
+    assert_eq!(salvaged["id"], 44, "{salvaged}");
+    assert_eq!(salvaged["error"]["code"], "bad_request", "{salvaged}");
+
+    let hopeless = client.send_raw("not json");
+    assert_eq!(hopeless["id"], 0, "{hopeless}");
+    assert_eq!(hopeless["error"]["code"], "bad_request", "{hopeless}");
+}

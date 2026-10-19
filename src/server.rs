@@ -257,7 +257,7 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
         // closing here would make a stray byte indistinguishable from the
         // daemon dying.
         let line = match std::str::from_utf8(&raw) {
-            Ok(line) => line.to_string(),
+            Ok(line) => line,
             Err(_) => {
                 respond(
                     &mut write_half,
@@ -272,12 +272,32 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
             continue;
         }
 
+        // Parsed once, here: the op decides the route, and a line that is
+        // not a request object is answered `bad_request` for every op alike.
+        let request: Request = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(e) => {
+                // Salvage the id if the line was an object carrying one, so
+                // the client can still correlate the failure.
+                let id = serde_json::from_str::<Value>(line)
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(Value::as_u64))
+                    .unwrap_or(0);
+                respond(
+                    &mut write_half,
+                    &proto::error(id, ErrorCode::BadRequest, format!("malformed request: {e}")),
+                )
+                .await?;
+                continue;
+            }
+        };
+
         // `attach` is the one op that can stop returning to this loop: on
         // success the connection carries binary frames from here on. A
         // refused attach is an ordinary error response and the connection
         // stays a control connection.
-        if is_attach(&line) {
-            match attach_check(&line, &state) {
+        if request.op == "attach" {
+            match attach_check(request.id, line, &state) {
                 Err(err) => {
                     respond(&mut write_half, &err).await?;
                     continue;
@@ -328,27 +348,15 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
 
         // `log` answers with a typed reply that is serialised straight to
         // the wire, so it cannot ride `dispatch`'s `Value`.
-        if is_op(&line, "log") {
-            match op_log(&line, &state).await {
+        if request.op == "log" {
+            match op_log(request.id, line, &state).await {
                 Ok(reply) => respond(&mut write_half, &reply).await?,
                 Err(err) => respond(&mut write_half, &err).await?,
             }
         } else {
-            respond(&mut write_half, &dispatch(&line, &state).await).await?;
+            respond(&mut write_half, &dispatch(&request, line, &state).await).await?;
         }
     }
-}
-
-/// Whether this line is an `attach`, decided before the op-specific parse so
-/// a malformed attach still gets a normal error response.
-fn is_attach(line: &str) -> bool {
-    is_op(line, "attach")
-}
-
-fn is_op(line: &str, op: &str) -> bool {
-    serde_json::from_str::<Request>(line)
-        .map(|r| r.op == op)
-        .unwrap_or(false)
 }
 
 #[derive(Deserialize)]
@@ -364,15 +372,12 @@ struct AttachReq {
 /// Validates an `attach` without touching the connection, so a refusal can
 /// be answered like any other error and the connection carries on.
 fn attach_check(
+    id: u64,
     line: &str,
     state: &State,
 ) -> Result<(Arc<crate::session::Session>, AttachReq), Value> {
-    let req: AttachReq = serde_json::from_str(line).map_err(|e| {
-        let id = serde_json::from_str::<Request>(line)
-            .map(|r| r.id)
-            .unwrap_or(0);
-        proto::error(id, ErrorCode::InvalidSpec, e.to_string())
-    })?;
+    let req: AttachReq = serde_json::from_str(line)
+        .map_err(|e| proto::error(id, ErrorCode::InvalidSpec, e.to_string()))?;
 
     let Some(session) = state.manager.get(&req.session) else {
         return Err(not_live(req.id, &req.session, state));
@@ -400,20 +405,7 @@ fn attach_check(
 /// connection that worker is responsible for — the daemon's own version of
 /// the rule it enforces for PTY output: nothing slow runs where something
 /// fast has to wait behind it.
-async fn dispatch(line: &str, state: &State) -> Value {
-    let request: Request = match serde_json::from_str(line) {
-        Ok(r) => r,
-        Err(e) => {
-            // Salvage the id if the line was an object carrying one, so the
-            // client can still correlate the failure.
-            let id = serde_json::from_str::<Value>(line)
-                .ok()
-                .and_then(|v| v.get("id").and_then(Value::as_u64))
-                .unwrap_or(0);
-            return proto::error(id, ErrorCode::BadRequest, format!("malformed request: {e}"));
-        }
-    };
-
+async fn dispatch(request: &Request, line: &str, state: &State) -> Value {
     match request.op.as_str() {
         "ping" => proto::ok(request.id, json!({ "pong": true })),
         "create" => op_create(request.id, line, state).await,
@@ -750,8 +742,7 @@ struct LogReply {
     to: u64,
 }
 
-async fn op_log(line: &str, state: &State) -> Result<LogReply, Value> {
-    let id = parse::<Request>(0, line)?.id;
+async fn op_log(id: u64, line: &str, state: &State) -> Result<LogReply, Value> {
     let req: LogReq = parse(id, line)?;
     // Clamped, not refused. docs/04-protocol.md has always said one
     // response is "capped at 4 MiB whatever `max` asks for", and refusing
