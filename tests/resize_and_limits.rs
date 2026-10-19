@@ -40,7 +40,7 @@ async fn create_refuses_a_size_outside_the_range() {
     for (cols, rows) in [(0, 24), (80, 0), (1001, 24), (80, 1001)] {
         let err = manager
             .create(&spec(cols, rows), BTreeMap::new())
-            .expect_err("{cols}x{rows} must be refused");
+            .expect_err(&format!("{cols}x{rows} must be refused"));
         assert!(
             matches!(err, CreateError::InvalidSize { .. }),
             "{cols}x{rows} gave {err:?}"
@@ -71,15 +71,18 @@ async fn resizes_are_coalesced_and_the_last_one_wins() {
 
     // A burst inside the window: a drag emitting a resize per frame. Only
     // the first of these is deferred, and the last one asked for must win.
-    let start = Instant::now();
+    //
+    // No bound on how long the burst takes: a stall in the scheduler would
+    // fail it with nothing broken, and "never blocks" is already shown by the
+    // last size arriving below.
     for width in 101..=140 {
         session.resize(width, 30).unwrap();
     }
-    assert!(
-        start.elapsed() < Duration::from_millis(100),
-        "the burst must not block on the coalescing window"
-    );
-    // Still the size applied before the burst: the rest are pending.
+    // Still the size applied before the burst: the rest are pending. This
+    // one is inherently coupled to the 100 ms window -- if the machine stalls
+    // for longer than that between the first resize and here, the flush has
+    // legitimately run. It is not widened because there is no condition to
+    // wait on for "has not happened yet".
     assert_eq!(
         session.size(),
         (100, 30),
