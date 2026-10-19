@@ -156,8 +156,33 @@ namespace is machine-global. A single `\\.\pipe\anchor` is wrong on a
 multi-user box: two users' anchords would collide, and whichever bound first
 would serve the other's requests.
 
-Naming and the `--socket` override's Windows meaning are part of the §7
-decision, since both depend on the access-control answer.
+**Decided 2026-10-19: `\\.\pipe\anchor-<SID>`**, the string form of the user
+SID in the process token. The client-facing contract — name, how to open
+it, how to verify it — is [04-protocol.md](04-protocol.md#windows-a-named-pipe),
+written for a client author (teleport's is the first) rather than for this
+codebase.
+
+Why the SID and not the user name: a name is not unique across domains or
+after a rename, and it is the one thing a squatter can predict *and* pick
+freely. The SID is neither. Predictability is not the defence, though —
+§4.2's fail-if-taken and the client's owner check are. The name only has to
+be distinct per user, and the SID is the one identifier Windows itself
+treats as the user.
+
+No environment variable moves it. Unix needs `XDG_RUNTIME_DIR` because a
+socket is a file and has to live somewhere writable; a pipe has no
+directory. `--socket` keeps its meaning on Windows as "the endpoint", takes
+a full `\\.\pipe\…` path, and refuses anything else — a filesystem path
+there would be a mistake, not a choice.
+
+**Server identity is the pipe's owner.** anchord writes its own user SID as
+the owner of the pipe's security descriptor; the client reads the owner off
+the handle it opened and requires it to equal its own SID. Chosen over
+asking for the server's process token (`GetNamedPipeServerProcessId` →
+`OpenProcessToken`), which a non-elevated client cannot do against an
+elevated anchord — the check would refuse a legitimate daemon. Creating a
+pipe owned by another user needs a privilege (`SeRestorePrivilege`) that
+already owns the machine.
 
 ## 4. Edge cases
 
