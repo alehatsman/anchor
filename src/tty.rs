@@ -102,20 +102,24 @@ impl RawMode {
         let mut raw = original;
         // SAFETY: cfmakeraw only rewrites the termios we own.
         unsafe { libc::cfmakeraw(&mut raw) };
-        // SAFETY: tcsetattr with a termios we just built.
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("entering raw mode");
-        }
 
-        // Publish for the signal handler only after raw mode is actually
-        // on: a handler that fired before this point would have nothing to
-        // undo, and restoring attributes the terminal still has is worse
-        // than doing nothing only if the fd is wrong.
+        // Publish the restore state and install the handlers *before* the
+        // terminal goes raw. Restoring attributes the terminal still has is a
+        // no-op, so publishing early costs nothing; publishing late leaves a
+        // window in which a signal finds the terminal raw and nothing
+        // wired up to undo it.
         // SAFETY: single write before `RESTORE_FD` is published; attach is
         // the only caller and enters raw mode once.
         unsafe { (*SAVED.original.get()).write(original) };
         RESTORE_FD.store(fd, std::sync::atomic::Ordering::Release);
         install_restore_handlers();
+
+        // SAFETY: tcsetattr with a termios we just built.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+            // No guard will exist to unpublish the fd.
+            RESTORE_FD.store(-1, std::sync::atomic::Ordering::Release);
+            return Err(std::io::Error::last_os_error()).context("entering raw mode");
+        }
 
         Ok(Some(Self { fd, original }))
     }
@@ -124,17 +128,21 @@ impl RawMode {
 /// Signals that would end the process without unwinding, so `Drop` never
 /// runs: a terminal left raw survives the process that did it.
 ///
-/// `SIGINT` and `SIGQUIT` are deliberately absent — raw mode means ^C and
-/// ^\ are ordinary bytes forwarded to the session, not signals to this
-/// process, and handling them here would swallow them. `SIGHUP` is here
-/// because a closing terminal emulator sends it.
+/// `SIGINT` and `SIGQUIT` are here although the keyboard cannot raise them:
+/// raw mode clears `ISIG`, so ^C and ^\ are ordinary bytes forwarded to the
+/// session. What can raise them is another process -- `kill -INT`, `pkill`, a
+/// script's cleanup -- which is exactly the "killed from another window"
+/// case, and their default disposition ends the process without unwinding.
+/// Nothing is swallowed: the handler re-raises with the default disposition.
+/// `SIGHUP` is here because a closing terminal emulator sends it.
 ///
 /// `SIGPIPE` is absent for a different reason: Rust ignores it at startup,
 /// so a vanished stdout already surfaces as an ordinary `EPIPE` that
 /// unwinds and runs `Drop`. Handling it would *replace* a clean exit with
 /// a fatal signal — the restore would work and everything after it would
 /// not.
-const RESTORE_SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGHUP];
+const RESTORE_SIGNALS: [libc::c_int; 4] =
+    [libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT];
 
 fn install_restore_handlers() {
     for signum in RESTORE_SIGNALS {
@@ -427,8 +435,8 @@ mod raw_mode_tests {
         }
     }
 
-    /// Entering raw mode installs the handlers, and not for the signals
-    /// raw mode turns into ordinary bytes.
+    /// Entering raw mode installs the handlers for every signal that ends
+    /// the process without unwinding.
     #[test]
     fn the_handlers_cover_the_signals_that_skip_drop() {
         let _serialised = TEST_LOCK.lock();
@@ -450,10 +458,10 @@ mod raw_mode_tests {
             );
         }
 
-        // ^C and ^\ are bytes for the session in raw mode, not signals to
-        // this process; handling them here would swallow them.
-        assert!(!RESTORE_SIGNALS.contains(&libc::SIGINT));
-        assert!(!RESTORE_SIGNALS.contains(&libc::SIGQUIT));
+        // A `kill -INT` from another window is as fatal as a SIGTERM; only
+        // the keyboard cannot raise these in raw mode.
+        assert!(RESTORE_SIGNALS.contains(&libc::SIGINT));
+        assert!(RESTORE_SIGNALS.contains(&libc::SIGQUIT));
         // And `SIGPIPE` stays ignored, so a vanished stdout unwinds and
         // runs `Drop` instead of killing the process mid-restore.
         assert!(!RESTORE_SIGNALS.contains(&libc::SIGPIPE));

@@ -19,7 +19,8 @@ use anchor::tty::{self, EscapeScanner, RawMode};
 #[derive(Parser)]
 #[command(name = "anchor", about = "Talk to anchord", version)]
 struct Cli {
-    /// Socket to connect to. Defaults to the usual resolution.
+    /// Control socket: the one to connect to, or for `daemon` the one to
+    /// bind. `service` ignores it. Defaults to the usual resolution.
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
     #[command(subcommand)]
@@ -33,12 +34,14 @@ enum Command {
         /// Filter by label, as k=v. Repeatable; every pair must match.
         #[arg(long = "label", value_name = "K=V")]
         labels: Vec<String>,
-        /// Print the raw JSON response.
+        /// Print the sessions as a JSON array.
         #[arg(long)]
         json: bool,
     },
     /// Spawn a session.
     Create {
+        /// Working directory for the session. Relative paths resolve
+        /// against the current directory. Defaults to the current directory.
         #[arg(long)]
         cwd: Option<PathBuf>,
         /// Set a label, as k=v. Repeatable.
@@ -55,30 +58,44 @@ enum Command {
         argv: Vec<String>,
     },
     /// Print one session as JSON.
-    Get { id: String },
+    Get {
+        /// Session id, as shown by `anchor ls`.
+        id: String,
+    },
     /// Attach to a session: raw-mode passthrough, `~.` to detach.
     Attach {
+        /// Session id, as shown by `anchor ls`.
         id: String,
         /// Attach without taking the control lease.
         #[arg(long)]
         observe: bool,
-        /// Start from this byte offset instead of replaying everything.
+        /// Start from this byte offset of the session's output instead of
+        /// replaying everything.
         #[arg(long)]
         from: Option<u64>,
     },
     /// Dump a session's output.
     Logs {
+        /// Session id, as shown by `anchor ls`.
         id: String,
+        /// Start from this byte offset of the session's output.
         #[arg(long, default_value_t = 0)]
         from: u64,
     },
     /// Terminate a session.
-    Kill { id: String },
+    Kill {
+        /// Session id, as shown by `anchor ls`.
+        id: String,
+    },
     /// Forget a session: its row, its labels and its output. Refuses a
     /// session that is still running — `kill` it first.
-    Purge { id: String },
+    Purge {
+        /// Session id, as shown by `anchor ls`.
+        id: String,
+    },
     /// Set or remove labels. `k=v` sets, `k-` removes.
     Label {
+        /// Session id, as shown by `anchor ls`.
         id: String,
         #[arg(required = true, value_name = "K=V|K-")]
         changes: Vec<String>,
@@ -105,6 +122,18 @@ enum ServiceAction {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Rust ignores SIGPIPE at startup, which turns `anchor ls | head` into a
+    // panic (exit 101) and `anchor logs | head -c 5` into "Broken pipe" and
+    // exit 1. Restoring the default makes a closed pipe end the process
+    // quietly, like `cat`. `attach` must keep it ignored: a vanished stdout
+    // has to surface as an ordinary error so the raw-mode guard unwinds
+    // (src/tty.rs). `daemon` keeps it too: a client hanging up must be an
+    // error on that connection, never the death of the daemon.
+    if !matches!(cli.command, Command::Attach { .. } | Command::Daemon) {
+        // SAFETY: restoring the default disposition, before any thread runs.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
 
     // Service management touches the user's service manager, not the
     // daemon -- it has to work when nothing is running, which is the
@@ -163,14 +192,14 @@ fn main() -> Result<()> {
             &argv,
         ),
         Command::Get { id } => {
-            let response = client.call("get", json!({ "session": id }))?;
+            let response = session_call(&mut client, "get", &id, json!({ "session": id }))?;
             println!("{}", serde_json::to_string_pretty(&response["session"])?);
             Ok(())
         }
         Command::Attach { id, observe, from } => attach(client, &socket, &id, !observe, from),
         Command::Logs { id, from } => logs(&mut client, &id, from),
         Command::Kill { id } => {
-            let response = client.call("terminate", json!({ "session": id }))?;
+            let response = session_call(&mut client, "terminate", &id, json!({ "session": id }))?;
             println!("{}", response["state"].as_str().unwrap_or("exited"));
             Ok(())
         }
@@ -179,7 +208,7 @@ fn main() -> Result<()> {
         // error carrying the code. Adding logic here would only give the two
         // a second opinion.
         Command::Purge { id } => {
-            client.call("purge", json!({ "session": id }))?;
+            session_call(&mut client, "purge", &id, json!({ "session": id }))?;
             println!("purged");
             Ok(())
         }
@@ -187,6 +216,24 @@ fn main() -> Result<()> {
         Command::Daemon => unreachable!("handled above"),
         Command::Service { .. } => unreachable!("handled above"),
     }
+}
+
+/// `client.call` for an op on one session.
+///
+/// The daemon's `not_found` says "no such session" without saying which, so
+/// with several ids in flight the user is left guessing, and nothing points
+/// at `anchor ls`. The caller has the id in hand; this adds it. The error
+/// code stays the leading token -- a script greps for it -- and anything but
+/// `not_found` passes through untouched.
+fn session_call(client: &mut Client, op: &str, id: &str, body: Value) -> Result<Value> {
+    client.call(op, body).map_err(|err| {
+        let text = err.to_string();
+        if text.starts_with("not_found:") && !text.contains(id) {
+            anyhow::anyhow!("{text}: {id} (`anchor ls` lists the sessions)")
+        } else {
+            err
+        }
+    })
 }
 
 /// Parses repeated `k=v` arguments.
@@ -261,7 +308,12 @@ fn create(
             let (cols, rows) = size
                 .split_once(['x', 'X'])
                 .with_context(|| format!("expected COLSxROWS, got {size:?}"))?;
-            (cols.parse::<u16>()?, rows.parse::<u16>()?)
+            (
+                cols.parse::<u16>()
+                    .with_context(|| format!("--size: columns {cols:?} is not a number"))?,
+                rows.parse::<u16>()
+                    .with_context(|| format!("--size: rows {rows:?} is not a number"))?,
+            )
         }
         // The caller's own terminal is the best default for a session it is
         // about to attach to.
@@ -299,8 +351,10 @@ fn create(
 fn logs(client: &mut Client, id: &str, mut from: u64) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     loop {
-        let response = client.call(
+        let response = session_call(
+            client,
             "log",
+            id,
             json!({ "session": id, "from": from, "max": 1024 * 1024 }),
         )?;
         let bytes: Vec<u8> = response["bytes"]
@@ -333,8 +387,10 @@ fn label(client: &mut Client, id: &str, changes: &[String]) -> Result<()> {
             None => bail!("expected k=v to set or k- to remove, got {change:?}"),
         }
     }
-    let response = client.call(
+    let response = session_call(
+        client,
         "label",
+        id,
         json!({ "session": id, "set": set, "remove": remove }),
     )?;
     println!("{}", serde_json::to_string_pretty(&response["labels"])?);
@@ -367,8 +423,10 @@ fn attach(
     }
 
     let from = from.unwrap_or(0);
-    let ready = client.call(
+    let ready = session_call(
+        &mut client,
         "attach",
+        id,
         json!({ "session": id, "from": from, "control": want_control }),
     )?;
     let has_control = ready["control"].as_bool().unwrap_or(false);
@@ -377,7 +435,15 @@ fn attach(
     }
 
     // Raw mode restores itself on every exit path, including an error.
-    let _raw = RawMode::enter()?;
+    //
+    // Only a controller has anything to type, so only a controller goes raw.
+    // An observer never reads stdin: in raw mode ISIG is off, ^C is an unread
+    // byte, and `~.` is scanned only on the controller path -- on a quiet
+    // session the only way out would be closing the window. Left cooked, ^C
+    // kills it. The terminal's output post-processing then turns the
+    // session's `\r\n` into `\r\r\n`, and a carriage return at column 0 is
+    // a no-op, so what the observer sees is unchanged.
+    let _raw = if has_control { RawMode::enter()? } else { None };
 
     // Split rather than re-wrap: the control reader may already hold the
     // first binary frames, and a fresh reader on the socket would drop them
@@ -397,6 +463,11 @@ fn attach(
     // a key -- the session is gone, the output thread has finished, and
     // the terminal still looks attached.
     let ended = Arc::new(AtomicBool::new(false));
+    // Set by this side before it shuts the socket down. A read that fails
+    // because *we* stopped it is the design; one that fails on its own is the
+    // daemon going away or the stream desynchronising, and must not be
+    // reported as a clean detach.
+    let stopped = Arc::new(AtomicBool::new(false));
     let output = {
         let ended = Arc::clone(&ended);
         std::thread::Builder::new()
@@ -450,19 +521,29 @@ fn attach(
             }
         }
     } else {
-        // An observer has nothing to send; it ends when the stream does.
-        let _ = output.join();
-        return Ok(());
+        // An observer has nothing to send; it ends when the stream does, and
+        // nothing stops it from here, so whatever ended it is the result.
+        return output.join().expect("the output thread panicked");
     }
 
     // Shut the socket down explicitly. Dropping the writer leaves the
     // reader's own cloned fd open, so a detach from a quiet session would
     // block here until the session happened to produce output — which for
     // an idle shell is never.
+    //
+    // If the output thread already ended by itself, its result is the
+    // answer: `ended` is set only after its read has returned, so a stop
+    // issued now cannot have caused it.
+    if !ended.load(Ordering::Acquire) {
+        stopped.store(true, Ordering::Release);
+    }
     interrupt.stop();
     drop(writer);
-    let _ = output.join();
-    Ok(())
+    let result = output.join().expect("the output thread panicked");
+    if stopped.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    result
 }
 
 /// How long [`stdin_readable`] waits before returning so the caller can
@@ -542,15 +623,17 @@ fn write_resize(writer: &mut std::os::unix::net::UnixStream, cols: u16, rows: u1
     writer.flush().context("flushing a resize")
 }
 
-/// Writes output frames to stdout, unparsed, until the stream ends.
+/// Writes output frames to stdout, unparsed, until the session exits.
+///
+/// A stream that ends any other way is an error, because from in here a
+/// detach, a daemon that died and a desynchronised stream all look the same:
+/// a failed read. The caller knows which of them it caused.
 fn pump_output(mut frames: anchor::client::FrameStream) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     loop {
-        let (tag, _offset, payload) = match frames.read_frame() {
-            Ok(frame) => frame,
-            // The daemon went away or we detached; either way, done.
-            Err(_) => return Ok(()),
-        };
+        let (tag, _offset, payload) = frames
+            .read_frame()
+            .context("the connection to anchord ended before the session did")?;
         match tag {
             frame::OUTPUT => {
                 stdout.write_all(&payload)?;

@@ -391,6 +391,10 @@ fn attach_returns_when_the_session_exits() {
 /// signalled -- and a client attached to a long-running session is the
 /// thing someone kills from another window.
 ///
+/// Every signal that ends the process by default, not just `SIGTERM`: raw
+/// mode stops the *keyboard* raising `SIGINT` and `SIGQUIT`, but `kill -INT`
+/// and `pkill` are not the keyboard.
+///
 /// Driven through a real pty because that is the only way the behaviour
 /// exists at all: under the pipes every other test here uses, stdin is not
 /// a terminal, `RawMode::enter` returns `None`, and the whole path is
@@ -416,20 +420,107 @@ fn a_signalled_attach_leaves_the_terminal_usable() {
         .expect("a session id")
         .to_string();
 
-    let (master, slave) = open_pty();
-    let echoes = |label: &str| -> bool {
-        // SAFETY: tcgetattr on the master of a pty this test owns; both
-        // ends share one termios.
-        let mut t: libc::termios = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::tcgetattr(master, &mut t) },
-            0,
-            "reading terminal attributes ({label})"
-        );
-        t.c_lflag & libc::ECHO != 0
-    };
-    assert!(echoes("before"), "a fresh pty echoes");
+    for (name, signal) in [
+        ("SIGTERM", libc::SIGTERM),
+        ("SIGHUP", libc::SIGHUP),
+        ("SIGINT", libc::SIGINT),
+        ("SIGQUIT", libc::SIGQUIT),
+    ] {
+        let (master, slave) = open_pty();
+        let echoes = |label: &str| -> bool {
+            // SAFETY: tcgetattr on the master of a pty this test owns; both
+            // ends share one termios.
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::tcgetattr(master, &mut t) },
+                0,
+                "reading terminal attributes ({label})"
+            );
+            t.c_lflag & libc::ECHO != 0
+        };
+        assert!(echoes("before"), "a fresh pty echoes");
 
+        // SAFETY: `slave` is a live fd; each `Stdio` takes its own dup.
+        let (stdin, stdout) = unsafe {
+            use std::os::fd::FromRawFd;
+            (
+                Stdio::from(std::os::fd::OwnedFd::from_raw_fd(libc::dup(slave))),
+                Stdio::from(std::os::fd::OwnedFd::from_raw_fd(libc::dup(slave))),
+            )
+        };
+        let mut attach = Command::new(bin("anchor"))
+            .args(["--socket", daemon.socket().to_str().unwrap(), "attach", &id])
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawning anchor attach");
+
+        // Wait for raw mode to actually be on, rather than for a span of
+        // time: signalling before it engages would restore nothing and pass.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while echoes("waiting") {
+            assert!(
+                Instant::now() < deadline,
+                "attach never entered raw mode, so {name} proves nothing"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // SAFETY: signalling a child this test spawned.
+        assert_eq!(unsafe { libc::kill(attach.id() as i32, signal) }, 0);
+        let status = attach.wait().expect("waiting for attach");
+
+        assert!(
+            echoes("after"),
+            "attach killed by {name} left the terminal with no echo"
+        );
+        // And it still looks killed to whoever was waiting on it: restoring
+        // the terminal must not turn a fatal signal into a clean exit.
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(signal),
+            "attach did not die of {name}: {status:?}"
+        );
+
+        // SAFETY: fds this test opened.
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+    }
+}
+
+/// An observer must be able to leave with ^C.
+///
+/// It never reads stdin and `~.` is scanned only on the controller path, so
+/// if raw mode is on, `ISIG` is off and ^C is an unread byte: on a quiet
+/// session the only way out is closing the window. The pty is the child's
+/// *controlling* terminal here, because that is what makes the line
+/// discipline turn the ^C byte into a SIGINT for it at all.
+#[test]
+fn an_observer_can_be_interrupted_from_the_keyboard() {
+    let mut daemon = Daemon::start("observe-ctrl-c");
+    let mut client = daemon.client();
+    let created = client
+        .call(
+            "create",
+            json!({
+                "spec": {
+                    "command": "/bin/sh",
+                    "args": ["-c", "stty raw -echo; echo banner; cat"],
+                    "cwd": "/tmp",
+                },
+            }),
+        )
+        .expect("create");
+    let id = created["session"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
+
+    let (master, slave) = open_pty();
     // SAFETY: `slave` is a live fd; each `Stdio` takes its own dup.
     let (stdin, stdout) = unsafe {
         use std::os::fd::FromRawFd;
@@ -438,46 +529,276 @@ fn a_signalled_attach_leaves_the_terminal_usable() {
             Stdio::from(std::os::fd::OwnedFd::from_raw_fd(libc::dup(slave))),
         )
     };
-    let mut attach = Command::new(bin("anchor"))
-        .args(["--socket", daemon.socket().to_str().unwrap(), "attach", &id])
+    let mut command = Command::new(bin("anchor"));
+    command
+        .args([
+            "--socket",
+            daemon.socket().to_str().unwrap(),
+            "attach",
+            "--observe",
+            &id,
+        ])
         .stdin(stdin)
         .stdout(stdout)
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawning anchor attach");
+        .stderr(Stdio::null());
+    // SAFETY: only async-signal-safe calls between fork and exec: a new
+    // session, then adopting the pty as its controlling terminal.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut attach = command.spawn().expect("spawning anchor attach");
 
-    // Wait for raw mode to actually be on, rather than for a span of time:
-    // signalling before it engages would restore nothing and pass.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while echoes("waiting") {
+    // The replay arriving on the pty means the observer is attached and
+    // blocked on a quiet session, which is the state ^C has to break.
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !seen.windows(6).any(|w| w == b"banner") {
         assert!(
             Instant::now() < deadline,
-            "attach never entered raw mode, so this proves nothing"
+            "the observer never printed the replay"
         );
-        std::thread::sleep(Duration::from_millis(20));
+        let mut pollfd = libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialised pollfd, count matches.
+        if unsafe { libc::poll(&mut pollfd, 1, 100) } > 0 {
+            let mut buf = [0u8; 256];
+            // SAFETY: reading into a buffer this test owns.
+            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                seen.extend_from_slice(&buf[..n as usize]);
+            }
+        }
     }
 
-    // SAFETY: signalling a child this test spawned.
-    assert_eq!(unsafe { libc::kill(attach.id() as i32, libc::SIGTERM) }, 0);
-    let status = attach.wait().expect("waiting for attach");
-
-    assert!(
-        echoes("after"),
-        "a signalled attach left the terminal with no echo"
-    );
-    // And it still looks killed to whoever was waiting on it: restoring
-    // the terminal must not turn a fatal signal into a clean exit.
+    // SAFETY: writing one byte to a pty master this test owns.
     assert_eq!(
-        status.code(),
-        None,
-        "attach exited normally instead of dying of SIGTERM: {status:?}"
+        unsafe { libc::write(master, b"\x03".as_ptr().cast(), 1) },
+        1
     );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        // Keep draining the master: a session leader's exit waits for its
+        // terminal's output to be read.
+        let mut pollfd = libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialised pollfd, count matches.
+        if unsafe { libc::poll(&mut pollfd, 1, 25) } > 0 {
+            let mut buf = [0u8; 256];
+            // SAFETY: reading into a buffer this test owns.
+            unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+        }
+        match attach.try_wait().expect("try_wait") {
+            Some(_) => break,
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = attach.kill();
+                    panic!(
+                        "an observer ignored ^C -- it holds the terminal raw, so ISIG \
+                         is off and the only way out is closing the window"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
 
     // SAFETY: fds this test opened.
     unsafe {
         libc::close(master);
         libc::close(slave);
     }
+}
+
+/// Starts `anchor attach` on a quiet session with piped stdio and waits for
+/// the replay, so the attach is live when the caller pulls the daemon out
+/// from under it.
+fn attach_to_a_live_session(
+    daemon: &mut Daemon,
+    extra: &[&str],
+) -> (Child, Arc<Mutex<Vec<u8>>>, std::process::ChildStdin) {
+    let mut client = daemon.client();
+    let created = client
+        .call(
+            "create",
+            json!({
+                "spec": {
+                    "command": "/bin/sh",
+                    "args": ["-c", "stty raw -echo; echo banner; cat"],
+                    "cwd": "/tmp",
+                },
+            }),
+        )
+        .expect("create");
+    let id = created["session"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
+
+    let mut child = Command::new(bin("anchor"))
+        .arg("--socket")
+        .arg(daemon.socket())
+        .arg("attach")
+        .args(extra)
+        .arg(&id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning anchor attach");
+    let stdin = child.stdin.take().expect("stdin");
+
+    let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let mut stdout = child.stdout.take().expect("stdout");
+    {
+        let seen = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                seen.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !seen.lock().unwrap().windows(6).any(|w| w == b"banner") {
+        assert!(Instant::now() < deadline, "the attach never replayed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    (child, seen, stdin)
+}
+
+/// A daemon that dies mid-attach is a failure, and says so.
+///
+/// `pump_output` used to discard its read error, so a daemon crash, a
+/// detach and a desynchronised stream all ended the attach with no message
+/// and exit 0: the terminal quietly returned to the shell, and a script
+/// could not tell it from a clean detach.
+///
+/// Both roles, because they end differently: the controller learns of it
+/// from the `ended` flag, the observer from joining the output thread.
+#[test]
+fn a_daemon_that_dies_mid_attach_is_an_error() {
+    for (role, extra) in [("controller", vec![]), ("observer", vec!["--observe"])] {
+        let mut daemon = Daemon::start(&format!("dies-{role}"));
+        let (child, _seen, _stdin) = attach_to_a_live_session(&mut daemon, &extra);
+
+        // Killed, not stopped: no goodbye frame, the way a crash looks.
+        daemon.child.kill().expect("killing the daemon");
+        let _ = daemon.child.wait();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut child = child;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("the {role} outlived the daemon");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("stderr")
+            .read_to_string(&mut stderr)
+            .expect("reading stderr");
+
+        assert!(
+            !status.success(),
+            "the {role} reported a clean exit after its daemon died"
+        );
+        assert!(
+            stderr.contains("connection to anchord ended"),
+            "the {role} said nothing useful about the daemon dying: {stderr:?}"
+        );
+    }
+}
+
+/// `attach` must keep `SIGPIPE` ignored, even though every other command
+/// restores the default.
+///
+/// A stdout that has gone away has to surface as an ordinary error so the
+/// raw-mode guard unwinds and restores the terminal. Under the default
+/// disposition the process would be killed mid-write, with `Drop` unrun. The
+/// read end is closed *before* the attach starts, so the replay's first
+/// write is already into a broken pipe.
+#[test]
+fn attach_survives_a_closed_stdout_as_an_error() {
+    let mut daemon = Daemon::start("sigpipe-attach");
+    let mut client = daemon.client();
+    let created = client
+        .call(
+            "create",
+            json!({
+                "spec": {
+                    "command": "/bin/sh",
+                    "args": ["-c", "stty raw -echo; echo banner; cat"],
+                    "cwd": "/tmp",
+                },
+            }),
+        )
+        .expect("create");
+    let id = created["session"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
+
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe fills two fds we own.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: closing the read end we just made; wrapping the write end,
+    // which the `Stdio` then owns.
+    let stdout = unsafe {
+        use std::os::fd::FromRawFd;
+        libc::close(fds[0]);
+        Stdio::from(std::os::fd::OwnedFd::from_raw_fd(fds[1]))
+    };
+
+    let mut attach = Command::new(bin("anchor"))
+        .args(["--socket", daemon.socket().to_str().unwrap(), "attach", &id])
+        .stdin(Stdio::piped())
+        .stdout(stdout)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning anchor attach");
+    let _stdin = attach.stdin.take();
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = attach.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = attach.kill();
+            panic!("attach never noticed its stdout was gone");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        status.signal(),
+        None,
+        "attach was killed by SIGPIPE instead of failing: {status:?}"
+    );
+    assert_eq!(status.code(), Some(1), "expected an ordinary error exit");
 }
 
 fn open_pty() -> (i32, i32) {
