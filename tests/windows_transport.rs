@@ -40,6 +40,16 @@ fn my_sid() -> String {
     UserSid::current().unwrap().to_sid_string().unwrap()
 }
 
+/// This user as read-back SDDL spells it: the SID string, or its alias
+/// (`LA` for the built-in Administrator, which GitHub's runner is).
+fn my_sddl_name() -> String {
+    let owner = SecurityDescriptor::from_sddl(&format!("O:{}", my_sid()))
+        .unwrap()
+        .owner_sddl()
+        .unwrap();
+    owner.strip_prefix("O:").unwrap().to_string()
+}
+
 struct Harness {
     dir: tempfile::TempDir,
     pipe: PathBuf,
@@ -124,7 +134,7 @@ async fn the_pipe_grants_its_owner_and_nobody_else() {
     let h = harness();
     let stream = Stream::connect(&h.pipe).unwrap();
     let sddl = winsec::handle_sddl(stream.as_handle()).unwrap();
-    let sid = my_sid();
+    let sid = my_sddl_name();
     assert_eq!(
         sddl,
         format!("O:{sid}D:P(A;;FA;;;{sid})"),
@@ -152,7 +162,7 @@ async fn the_data_dir_is_owner_only_on_windows() {
     let id = created["session"].as_str().unwrap().to_string();
     wait_until_ended(&mut client, &id);
 
-    let sid = my_sid();
+    let sid = my_sddl_name();
     let data = h.dir.path().join("data");
     let dir_sddl = winsec::path_sddl(&data).unwrap();
     assert!(

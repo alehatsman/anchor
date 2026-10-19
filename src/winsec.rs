@@ -158,6 +158,15 @@ impl SecurityDescriptor {
         Ok(Self { sd })
     }
 
+    /// This descriptor's owner, as SDDL writes it. For tests: SDDL spells
+    /// some SIDs by alias -- the built-in Administrator (RID 500, which is
+    /// the user GitHub's Windows runner runs as) reads back as `LA`, not
+    /// `S-1-5-21-...-500` -- so an assertion on read-back SDDL has to ask
+    /// how *this* user is spelled rather than assume the string form.
+    pub fn owner_sddl(&self) -> Result<String> {
+        format_sddl(self.sd, OWNER_SECURITY_INFORMATION)
+    }
+
     /// `SECURITY_ATTRIBUTES` pointing at this descriptor, valid while `self`
     /// is. Not inheritable: no child process gets the handle.
     pub fn attributes(&self) -> SECURITY_ATTRIBUTES {
@@ -318,6 +327,14 @@ pub fn path_sddl(path: &Path) -> Result<String> {
 
 /// Formats `sd` and frees it.
 fn descriptor_to_sddl(sd: PSECURITY_DESCRIPTOR, info: u32) -> Result<String> {
+    let result = format_sddl(sd, info);
+    // SAFETY: allocated by GetSecurityInfo / GetNamedSecurityInfoW.
+    unsafe { LocalFree(sd) };
+    result
+}
+
+/// Formats `sd` as SDDL, leaving it allocated.
+fn format_sddl(sd: PSECURITY_DESCRIPTOR, info: u32) -> Result<String> {
     use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
     let mut wide: *mut u16 = std::ptr::null_mut();
     let mut len = 0u32;
@@ -341,7 +358,5 @@ fn descriptor_to_sddl(sd: PSECURITY_DESCRIPTOR, info: u32) -> Result<String> {
         unsafe { LocalFree(wide.cast()) };
         Ok(text.trim_end_matches('\0').to_string())
     };
-    // SAFETY: allocated by GetSecurityInfo / GetNamedSecurityInfoW.
-    unsafe { LocalFree(sd) };
     result
 }
