@@ -8,7 +8,7 @@ can come and go.
    ┌──────────────┐
    │ teleport     │──┐
    ├──────────────┤  │   unix socket   ┌──────────────────────┐
-   │ workmanager  │──┼────────────────▶│ PTY: claude          │
+   │ tally        │──┼────────────────▶│ PTY: claude          │
    ├──────────────┤  │                 │ PTY: codex           │
    │ your tool    │──┘                 │ PTY: shell           │
    └──────────────┘                    │ append-only logs     │
@@ -110,12 +110,19 @@ came from.
 
 Two reasons, and the second is the one that forced it.
 
-**1. More than one tool wants this.** teleport (web/mobile UI, remote access)
-and [workmanager](https://github.com/alehatsman/workmanager) (a work-tracker
-TUI that spawns agents on merge requests and issues) both need
+**1. More than one tool wants this, and now more than one tool has it.**
+teleport (web/mobile UI, remote access) and
+[tally](https://github.com/alehatsman/tally) — a Novation Launchpad Mini as
+the front panel for agent sessions, 64 lit pads telling you from across the
+room which agent is working, done, or waiting on you — both need
 spawn/attach/replay. Only one of them needs passkeys, device identity and an
-embedded web app — which is 2,800 lines of teleport that the other would
+embedded web app, which is 2,800 lines of teleport that the other would
 otherwise pull through its dependency graph.
+
+tally is the argument in its strongest form: it is a control surface for
+anchor sessions *and nothing else*. It owns a grid of LEDs and an opinion
+about colour; anchor owns the PTYs. A second consumer that small is only
+possible because the boundary is where it is.
 
 **2. teleport cannot ship a release while agents are running.** From its own
 architecture doc:

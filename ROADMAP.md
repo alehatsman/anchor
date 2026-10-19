@@ -78,7 +78,7 @@ unchanged and it ships normally throughout.
 
 ---
 
-## M5 — Flip the default, prove the payoff — exit criteria met, 2026-10-16
+## M5 — Flip the default, prove the payoff ✅
 
 > Done: an agent survives teleport restarting under it (demonstrated by
 > `an_agent_survives_teleport_restarting_under_it`), anchord restarts without
@@ -93,19 +93,26 @@ unchanged and it ships normally throughout.
 > under a running teleportd that never noticed. `use_anchor=true` is deployed
 > on `work_mac`. See teleport `docs/20-retiring-the-in-process-pty.md`.
 >
-> Open, and neither is anchor's code: flipping teleport's *compiled*
-> `use_anchor` default (still `false` at `daemon/src/config.rs:140`), and
-> deleting teleport's in-process PTY layer. The delete acquired two new
-> gates once it stopped being reversible — a Windows transport arm for
-> anchor (#16, deferred) and anchord present on the three hosts that do not
-> have it yet.
+> **Closed 2026-10-19.** anchor now has two real consumers driving it —
+> teleport, and [tally](https://github.com/alehatsman/tally), which is a
+> control surface for anchor sessions and nothing else. The boundary this
+> milestone existed to prove is load-bearing in practice, not just
+> demonstrated once.
+>
+> What was still listed as open here was never anchor's code, and only one
+> item of it survives: **deleting teleport's in-process PTY layer.** That is
+> gated on Windows and nothing else now, so it belongs to M6 rather than
+> trailing M5 indefinitely. teleport's Windows build break (its #107) was
+> fixed by gating its `anchor_*` modules on `unix` — the gate holds until
+> anchord can host a session on Windows, which is exactly M6's exit.
 
 Scope: default teleport to anchor; packaging so `anchord` is a separate
 launchd/systemd unit with its own lifecycle.
 
-Exit: **update teleport while agents are running, and they survive.** That is
-the thing anchor exists for. Demonstrate it, write it down, then delete
-teleport's in-process PTY layer.
+Exit, met: **update teleport while agents are running, and they survive.**
+That is the thing anchor exists for. Demonstrated against a live daemon and
+written down. The in-process deletion that followed it is M6's, because
+until Windows has an anchord it is a deletion teleport cannot afford.
 
 ---
 
