@@ -176,11 +176,26 @@ mod platform {
         // argument: anchord resolves the same path a client resolves.
         let plist = render(&exe);
 
-        // Replacing an existing registration: unload first, or launchd keeps
-        // running the old binary until the next login. This is what makes
-        // install idempotent rather than merely harmless.
+        // An unchanged registration is left strictly alone, because the
+        // alternative is not harmless: `bootout` stops the running anchord,
+        // and a dead anchord's ptys go with it (docs/07-lifecycle.md). An
+        // install that is idempotent on paper but kills every live session
+        // in practice is the opposite of what this command promises, and
+        // sessions outliving their clients is the property anchor exists
+        // for. Compare first, act only on a real difference.
+        if fs::read_to_string(&path).is_ok_and(|current| current == plist) {
+            return Ok(Outcome::Installed(path));
+        }
+
+        // The registration really is changing, so the restart is the point
+        // rather than a side effect -- but it still costs the live sessions,
+        // and the user is told so rather than finding out.
         if path.exists() {
             bootout(&path);
+            eprintln!(
+                "note: the registration changed, so anchord was restarted. Any sessions it \
+                 was holding are gone (docs/07-lifecycle.md)."
+            );
         }
         fs::write(&path, plist).with_context(|| format!("writing {}", path.display()))?;
 
@@ -307,16 +322,39 @@ mod platform {
         //
         // No socket argument: anchord resolves the same path a client does.
         let unit = render(&exe);
+
+        // Unchanged registration, nothing to do -- the same rule as macOS,
+        // for a weaker reason: there is no `bootout` here to kill sessions
+        // with, but running `enable --now` to achieve nothing still reports
+        // work that did not happen.
+        if fs::read_to_string(&path).is_ok_and(|current| current == unit) {
+            return Ok(Outcome::Installed(path));
+        }
+        let existed = path.exists();
+
         fs::write(&path, unit).with_context(|| format!("writing {}", path.display()))?;
 
-        // Re-reading the unit is what makes a reinstall replace the old one
-        // rather than keep running it.
+        // `daemon-reload` makes systemd re-read the unit file; it does not
+        // restart anything, and `enable --now` on an already-active unit is
+        // a no-op. So a *changed* `ExecStart` is on disk and enabled, but
+        // the old anchord keeps running until it next stops -- normally at
+        // logout. That is the opposite of macOS, where replacing the
+        // registration restarts immediately.
+        //
+        // The divergence stands deliberately: converging it means restarting
+        // anchord here, and that would kill every live session on Linux to
+        // fix a cosmetic inconsistency. Say what happens instead.
         systemctl(&["daemon-reload"]);
         if !systemctl(&["enable", "--now", UNIT]) {
             eprintln!(
                 "note: wrote {} but `systemctl --user enable --now` did not take — it will \
                  start at next login. Run `anchor service status` to check.",
                 path.display()
+            );
+        } else if existed {
+            eprintln!(
+                "note: the registration changed. A running anchord keeps the old one until \
+                 it next starts; restart it yourself when its sessions can afford it."
             );
         }
         Ok(Outcome::Installed(path))
@@ -525,5 +563,41 @@ mod tests {
                 "{path} is an install location, not a build output"
             );
         }
+    }
+
+    /// `install` decides whether to touch anything by comparing the
+    /// registration it would write against the one already on disk, and on
+    /// macOS the cost of getting that comparison wrong is every live
+    /// session: a difference it reports falsely means `bootout`, and
+    /// `bootout` stops the daemon.
+    ///
+    /// So the rendering has to be a pure function of the path. Anything
+    /// that varied per call — a timestamp, a set iterated in hash order —
+    /// would make an unchanged reinstall read as a changed one, silently
+    /// restoring the exact behaviour this guards against while every other
+    /// test stayed green.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn a_registration_renders_identically_for_the_same_binary() {
+        let exe = PathBuf::from("/usr/local/bin/anchord");
+        let other = PathBuf::from("/opt/homebrew/bin/anchord");
+        let kind = if cfg!(target_os = "macos") {
+            "plist"
+        } else {
+            "unit"
+        };
+
+        assert_eq!(
+            platform::render(&exe),
+            platform::render(&exe),
+            "the {kind} must render byte-identically twice, or an unchanged \
+             reinstall reads as a changed one and restarts the daemon"
+        );
+        assert_ne!(
+            platform::render(&exe),
+            platform::render(&other),
+            "a different binary must render differently, or a changed \
+             reinstall reads as unchanged and never takes effect"
+        );
     }
 }
