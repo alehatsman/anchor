@@ -80,8 +80,10 @@ fn write_timeout() -> Duration {
 
 /// Serves one attached connection until it ends.
 ///
-/// `holder` identifies this connection for the control lease. One connection
-/// is one client, which is the honest reading of "exactly one writer" when
+/// `lease` carries the holder id that identifies this connection for the
+/// control lease, and releases it when this returns -- or when the caller
+/// drops it first, because the connection died before getting here. One
+/// connection is one client, which is the honest reading of "exactly one writer" when
 /// nothing on the wire carries a caller-supplied identity. A client that
 /// needs a reconnect to count as the same holder layers that above anchor —
 /// see docs/06-teleport-seam.md.
@@ -93,38 +95,30 @@ pub async fn serve_attached(
     buffered: Vec<u8>,
     session: Arc<Session>,
     from: u64,
-    holder: String,
-    control_epoch: Option<u64>,
+    handshake: Handshake,
 ) -> Result<()> {
+    let Handshake {
+        lease,
+        lease_changes,
+        size_changes,
+    } = handshake;
+    let timeout = write_timeout();
+    let holder = lease.holder.clone();
+    let epoch = Arc::clone(&lease.epoch);
+
     // Tell the client where it stands on the lease before any output, so it
-    // never has to guess whether its keystrokes will be accepted.
-    // Subscribed before anything is announced. Subscribing after the
-    // attach's own lease decision leaves a gap in which another client's
-    // claim is never seen, and this connection goes on believing it may
-    // type — the one thing the lease exists to prevent.
-    let lease_changes = session.watch_lease();
-    // Subscribed before the first frame goes out, like the lease: a change
-    // landing in the gap between attaching and subscribing is a change
-    // this connection would never hear about.
-    let size_changes = session.watch_size();
-
-    let holds_control = control_epoch.is_some();
-    write_frame(&mut out, frame::LEASE, 0, &[u8::from(holds_control)]).await?;
-
-    // Shared, because either half can change it: the input half when the
-    // client claims the lease, and the output half's view of whether this
-    // connection still holds it after someone else does.
-    let epoch = Arc::new(parking_lot::Mutex::new(control_epoch));
-
-    // The lease is per-connection, so it must not outlive this one. A guard
-    // rather than a line at the end: this returns on a client disconnect, a
-    // write error and a normal exit alike, and a lease stuck on a dead
-    // connection would lock every other client out of typing.
-    let _lease = LeaseGuard {
-        session: Arc::clone(&session),
-        holder: holder.clone(),
-        epoch: Arc::clone(&epoch),
-    };
+    // never has to guess whether its keystrokes will be accepted. Re-read
+    // rather than echoing what attach decided: a claim may have landed since,
+    // and its broadcast is only a second telling.
+    let holds_control = still_mine(&session, &holder, &epoch);
+    write_frame(
+        &mut out,
+        timeout,
+        frame::LEASE,
+        0,
+        &[u8::from(holds_control)],
+    )
+    .await?;
 
     // Input runs independently: a client that only observes never sends a
     // frame, and a controller must not have its keystrokes queued behind
@@ -144,8 +138,8 @@ pub async fn serve_attached(
         &mut out,
         &session,
         from,
-        &holder,
-        &epoch,
+        timeout,
+        &lease,
         lease_changes,
         size_changes
     ));
@@ -182,11 +176,12 @@ async fn pump_output(
     out: &mut OwnedWriteHalf,
     session: &Arc<Session>,
     from: u64,
-    holder: &str,
-    epoch: &Arc<parking_lot::Mutex<Option<u64>>>,
+    timeout: Duration,
+    lease: &LeaseGuard,
     mut lease_changes: tokio::sync::broadcast::Receiver<String>,
     mut size_changes: tokio::sync::broadcast::Receiver<(u16, u16)>,
 ) -> Result<()> {
+    let (holder, epoch) = (lease.holder.as_str(), &lease.epoch);
     let replay = session.attach(from).context("beginning the attach")?;
 
     // Catch up in bounded rounds. Each round is written to the client before
@@ -201,7 +196,7 @@ async fn pump_output(
                 bytes,
                 replay,
             } => {
-                write_frame(out, frame::OUTPUT, offset, &bytes).await?;
+                write_frame(out, timeout, frame::OUTPUT, offset, &bytes).await?;
                 step = next_round_from(replay, bytes).await?;
             }
             ReplayStep::Live(attach) => break attach,
@@ -209,7 +204,14 @@ async fn pump_output(
     };
 
     if !attach.replay.is_empty() {
-        write_frame(out, frame::OUTPUT, attach.replay_from, &attach.replay).await?;
+        write_frame(
+            out,
+            timeout,
+            frame::OUTPUT,
+            attach.replay_from,
+            &attach.replay,
+        )
+        .await?;
     }
 
     let mut subscription = attach.subscription;
@@ -218,7 +220,7 @@ async fn pump_output(
         tokio::select! {
             chunk = subscription.recv() => match chunk {
                 Some(chunk) => {
-                    write_frame(out, frame::OUTPUT, chunk.offset, &chunk.bytes).await?;
+                    write_frame(out, timeout, frame::OUTPUT, chunk.offset, &chunk.bytes).await?;
                 }
                 // The subscription ended. Either the session is over, or
                 // this subscriber fell behind and was dropped — and those
@@ -247,16 +249,28 @@ async fn pump_output(
                 // learns what it really got.
                 match size {
                     Ok((cols, rows)) => {
-                        write_frame(out, frame::RESIZE, 0, &frame::encode_size(cols, rows))
-                            .await?;
+                        write_frame(
+                            out,
+                            timeout,
+                            frame::RESIZE,
+                            0,
+                            &frame::encode_size(cols, rows),
+                        )
+                        .await?;
                     }
                     // Lagged past one or more changes. Only the latest
                     // matters -- a size is a level, not an event -- so
                     // read the current one rather than replaying history.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let (cols, rows) = session.size();
-                        write_frame(out, frame::RESIZE, 0, &frame::encode_size(cols, rows))
-                            .await?;
+                        write_frame(
+                            out,
+                            timeout,
+                            frame::RESIZE,
+                            0,
+                            &frame::encode_size(cols, rows),
+                        )
+                        .await?;
                     }
                     // The session is tearing down; the other arms notice.
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
@@ -266,26 +280,18 @@ async fn pump_output(
                 // The lease moved. Tell this connection where it now
                 // stands, so a preempted client stops typing into a void
                 // and a bystander learns control is taken.
+                //
+                // The authoritative answer is the lease itself, never the
+                // message: broadcasts queue behind a slow write, so by the
+                // time this one is read it may describe a holder that has
+                // since been replaced -- including by this very connection.
+                // Trusting the name wiped a freshly claimed epoch and left
+                // a client told it holds control while every keystroke was
+                // discarded. Lagged is the same case with the message lost.
                 match change {
-                    Ok(new_holder) => {
-                        let mine = new_holder == holder;
-                        if !mine {
-                            *epoch.lock() = None;
-                        }
-                        write_frame(out, frame::LEASE, 0, &[u8::from(mine)]).await?;
-                    }
-                    // Lagged past a change. The authoritative answer is the
-                    // lease itself, so re-read it rather than assume the
-                    // missed message did not matter: assuming is how a
-                    // preempted client keeps typing into a void.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let mine = epoch
-                            .lock()
-                            .is_some_and(|e| session.is_controller(holder, e));
-                        if !mine {
-                            *epoch.lock() = None;
-                        }
-                        write_frame(out, frame::LEASE, 0, &[u8::from(mine)]).await?;
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let mine = still_mine(session, holder, epoch);
+                        write_frame(out, timeout, frame::LEASE, 0, &[u8::from(mine)]).await?;
                     }
                     // The session is tearing down; the other arms notice.
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
@@ -296,7 +302,7 @@ async fn pump_output(
                 // up whatever became ready in the meantime.
                 let _ = tokio::time::timeout(EXIT_DRAIN_GRACE, session.wait_eof()).await;
                 while let Some(chunk) = subscription.try_recv() {
-                    write_frame(out, frame::OUTPUT, chunk.offset, &chunk.bytes).await?;
+                    write_frame(out, timeout, frame::OUTPUT, chunk.offset, &chunk.bytes).await?;
                 }
                 exited = true;
                 break;
@@ -323,7 +329,7 @@ async fn pump_output(
         // that errored.
         None => Vec::new(),
     };
-    write_frame(out, frame::EXIT, snapshot.output_bytes, &payload).await?;
+    write_frame(out, timeout, frame::EXIT, snapshot.output_bytes, &payload).await?;
     out.flush().await.ok();
     Ok(())
 }
@@ -382,7 +388,16 @@ async fn pump_input(
         // opposite — or to a future frame this build does not understand.
         if tag == frame::LEASE {
             if payload.first() == Some(&1) {
-                *epoch.lock() = Some(session.claim_control(&holder));
+                // The epoch mutex is held across the claim, so the output
+                // half cannot read the claim's own broadcast and re-check
+                // the lease before the new epoch is stored -- it would see
+                // the old epoch, call this connection the loser, and tell it
+                // so. Lock order is epoch, then the lease's own mutex, the
+                // same as `still_mine` and the guard's drop. (Not written as
+                // `*epoch.lock() = Some(claim())`: the right-hand side runs
+                // first, which would take the lock only after the claim.)
+                let mut held = epoch.lock();
+                *held = Some(session.claim_control(&holder));
             }
             continue;
         }
@@ -420,9 +435,25 @@ async fn pump_input(
 
         // Checked per frame: a connection preempted mid-stream stops being
         // able to type the moment the lease moves.
-        match session.write_if_controller(&holder, current, &payload) {
-            Ok(()) => {}
-            Err(None) => {
+        //
+        // Off the runtime's worker: the write holds the lease mutex and, when
+        // the child has stopped reading, retries with a sleep for up to
+        // WRITE_ENQUEUE_TIMEOUT. On a worker, a handful of stuck children
+        // park every worker and stall accept and every other session. Frames
+        // stay ordered because each is awaited before the next is read. This
+        // moves the wait off the hot path; it does not remove the mutex hold,
+        // so a claim on this session still waits behind a stuck write.
+        let written = {
+            let session = Arc::clone(&session);
+            let holder = holder.clone();
+            tokio::task::spawn_blocking(move || {
+                session.write_if_controller(&holder, current, &payload)
+            })
+            .await
+        };
+        match written {
+            Ok(Ok(())) => {}
+            Ok(Err(None)) => {
                 tracing::debug!(session = %session.id, "input from a non-controller; ignored");
             }
             // The write failed, which on a session that just exited means
@@ -431,14 +462,24 @@ async fn pump_input(
             // the outer select instead, cancelling that write mid-flight and
             // closing the stream silently. Keep reading: this half exists to
             // notice the client disconnecting, and the client has not.
-            Err(Some(e)) => {
+            Ok(Err(Some(e))) => {
                 tracing::debug!(session = %session.id, error = %e, "input rejected");
+            }
+            Err(e) => {
+                tracing::warn!(session = %session.id, error = %e, "input write panicked");
+                return;
             }
         }
     }
 }
 
-async fn write_frame(out: &mut OwnedWriteHalf, tag: u8, offset: u64, payload: &[u8]) -> Result<()> {
+async fn write_frame(
+    out: &mut OwnedWriteHalf,
+    timeout: Duration,
+    tag: u8,
+    offset: u64,
+    payload: &[u8],
+) -> Result<()> {
     let frame = frame::encode(tag, offset, payload);
     // Bounded: see WRITE_TIMEOUT. A client that is not draining its socket
     // must not hold a task indefinitely.
@@ -446,13 +487,31 @@ async fn write_frame(out: &mut OwnedWriteHalf, tag: u8, offset: u64, payload: &[
         out.write_all(&frame).await.context("writing a frame")?;
         out.flush().await.context("flushing a frame")
     };
-    match tokio::time::timeout(write_timeout(), write).await {
+    match tokio::time::timeout(timeout, write).await {
         Ok(result) => result,
         Err(_) => anyhow::bail!("the client stopped reading; closing the connection"),
     }
 }
 
-/// Releases this connection's control lease when the connection ends.
+/// Whether this connection still holds the lease, read from the lease itself.
+/// Clears the epoch when it does not, so the input half stops typing at once
+/// and the guard does not release a lease that now belongs to someone else.
+fn still_mine(session: &Session, holder: &str, epoch: &parking_lot::Mutex<Option<u64>>) -> bool {
+    let mut held = epoch.lock();
+    let mine = held.is_some_and(|e| session.is_controller(holder, e));
+    if !mine {
+        *held = None;
+    }
+    mine
+}
+
+/// This connection's claim on the control lease, from the moment it is taken.
+///
+/// Built in the same step as `take_control` (see [`Handshake`]), so every way
+/// out -- a failed attach reply, a failed first frame, a client disconnect, a
+/// write error, a normal exit -- releases the lease by dropping it. A lease stuck on
+/// a dead connection locks every other client out of typing, and an observer
+/// downgrade that nobody can undo is how that shows up.
 ///
 /// `release_control` is a no-op unless this holder still owns this epoch, so
 /// a connection that was preempted while streaming cannot clear the lease
@@ -460,7 +519,56 @@ async fn write_frame(out: &mut OwnedWriteHalf, tag: u8, offset: u64, payload: &[
 struct LeaseGuard {
     session: Arc<Session>,
     holder: String,
+    // Shared, because either half can change it: the input half when the
+    // client claims the lease, and the output half's view of whether this
+    // connection still holds it after someone else does.
     epoch: Arc<parking_lot::Mutex<Option<u64>>>,
+}
+
+/// What an `attach` decides before the connection turns binary: the lease,
+/// and the two watchers that hear about changes to it and to the size.
+///
+/// `begin` is the one place that orders them. Both watchers are subscribed
+/// *before* the lease decision and before the caller reads the size for the
+/// attach reply: a claim or resize landing between a decision and a later
+/// subscribe is never heard, and this connection goes on believing it may
+/// type -- the one thing the lease exists to prevent.
+pub struct Handshake {
+    lease: LeaseGuard,
+    lease_changes: tokio::sync::broadcast::Receiver<String>,
+    size_changes: tokio::sync::broadcast::Receiver<(u16, u16)>,
+}
+
+impl Handshake {
+    /// Takes the lease if `control` is asked for and it is free. Attach never
+    /// preempts: asking while someone else holds it is an observer attach.
+    ///
+    /// The caller holds the result across the attach reply, which can fail
+    /// to send: dropping it releases the lease, so a connection that dies
+    /// here does not strand it.
+    pub fn begin(session: &Arc<Session>, holder: &str, control: bool) -> Self {
+        let lease_changes = session.watch_lease();
+        let size_changes = session.watch_size();
+        let epoch = if control {
+            session.take_control(holder)
+        } else {
+            None
+        };
+        Self {
+            lease: LeaseGuard {
+                session: Arc::clone(session),
+                holder: holder.to_string(),
+                epoch: Arc::new(parking_lot::Mutex::new(epoch)),
+            },
+            lease_changes,
+            size_changes,
+        }
+    }
+
+    /// Whether the attach decision granted control.
+    pub fn granted(&self) -> bool {
+        self.lease.epoch.lock().is_some()
+    }
 }
 
 impl Drop for LeaseGuard {

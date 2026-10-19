@@ -272,20 +272,19 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
                     continue;
                 }
                 Ok((session, req)) => {
-                    // Attach never preempts: asking for control while
-                    // someone else holds it still attaches, as an observer.
-                    let epoch = if req.control {
-                        session.take_control(&holder)
-                    } else {
-                        None
-                    };
+                    // The lease decision, the watchers and the guard that
+                    // releases it are one step, taken before the reply: a
+                    // reply that fails to send must release the lease, and
+                    // the awaits between here and `serve_attached` can
+                    // return first. See `Handshake`.
+                    let handshake = crate::stream::Handshake::begin(&session, &holder, req.control);
                     respond(
                         &mut write_half,
                         proto::ok(
                             req.id,
                             json!({
                                 "offset": req.from,
-                                "control": epoch.is_some(),
+                                "control": handshake.granted(),
                                 "next_offset": session.next_offset(),
                                 // So a client starts from the real size
                                 // rather than waiting for a change that
@@ -307,8 +306,7 @@ async fn handle_connection(stream: UnixStream, state: State) -> Result<()> {
                         buffered,
                         session,
                         req.from,
-                        holder,
-                        epoch,
+                        handshake,
                     )
                     .await;
                 }
