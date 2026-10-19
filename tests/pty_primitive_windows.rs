@@ -384,15 +384,29 @@ mod conpty {
             24,
         );
         let (_exit, out) = collect_until_exit(&spawned, &out_rx);
-        let text = String::from_utf8_lossy(&strip_vt_sequences(&out)).to_lowercase();
-        // `canonicalize` adds the `\\?\` verbatim prefix that `cd` never prints.
-        let want = canonical
+        let text = String::from_utf8_lossy(&strip_vt_sequences(&out)).into_owned();
+        // `cd` prints the path as the child's environment spells it, which on
+        // GitHub's runner is the 8.3 short form (`RUNNER~1` for
+        // `runneradmin`) — the same directory under another name. Find the
+        // line by the temp dir's leaf, which is long and unique, and let
+        // `canonicalize` (GetFinalPathNameByHandle) settle whether it is the
+        // same directory.
+        let leaf = dir
+            .path()
+            .file_name()
+            .unwrap()
             .to_string_lossy()
-            .trim_start_matches(r"\\?\")
             .to_lowercase();
-        assert!(
-            text.contains(&want),
-            "the child did not start in {want}: {text:?}"
+        let printed = text
+            .lines()
+            .map(str::trim)
+            .find(|line| line.to_lowercase().ends_with(&leaf))
+            .unwrap_or_else(|| panic!("`cd` printed no path ending in {leaf}: {text:?}"));
+        assert_eq!(
+            std::path::Path::new(printed).canonicalize().unwrap(),
+            canonical,
+            "the child did not start in {}: {text:?}",
+            canonical.display()
         );
         completed("the_child_runs_in_the_requested_directory");
     }
