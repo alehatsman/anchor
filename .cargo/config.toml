@@ -1,0 +1,23 @@
+# rust-quality — cargo config, copied to .cargo/config.toml by rq/sync-config.
+#
+# Cargo has a first-class mechanism for named commands, so the everyday ones
+# live here rather than in a task runner: they work in a terminal, in CI, and in
+# an editor, with no provision, no checkout and no YAML.
+#
+# Presets are reserved for what an alias cannot do: multi-step gates with
+# fail-fast ordering, and copying config into a consumer repo.
+
+[alias]
+lint = "clippy --locked --all-targets --all-features -- -D warnings"
+# nextest never runs doctests. Two aliases rather than one that quietly skips.
+# `--no-tests=warn` because nextest defaults to `fail`, and a crate whose only
+# tests are doctests would otherwise have `cargo t` fail on every run.
+t = "nextest run --no-tests=warn --locked --workspace --all-features"
+doctest = "test --locked --doc --workspace --all-features"
+docs = "doc --locked --no-deps --workspace --all-features"
+
+[env]
+# An alias cannot set an environment variable, so the strictness that makes
+# `cargo docs` meaningful lives here — a broken intra-doc link now fails the
+# command instead of scrolling past. Applies to the workspace only.
+RUSTDOCFLAGS = "-D warnings"

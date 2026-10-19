@@ -1,0 +1,8 @@
+---
+description: fast pre-commit gate — lockfile drift, fmt, clippy, ai-lint, soft caps
+
+# rq/ci-fast, which is `fast.yml` upstream. The checkout is `tasks/tools.yml`'s
+# job and the pin lives there. Needs no network.
+steps:
+  - name: fast gate
+    use: ~/.cache/provision/tools/rust-quality/fast.yml

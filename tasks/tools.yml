@@ -1,0 +1,34 @@
+---
+description: check out rust-quality and install the tools its gate runs
+
+steps:
+  # THE PIN LIVES HERE AND NOWHERE ELSE. Bump it in one place.
+  #
+  # `vars`, not a prop default: a prop's default is taken as written, never
+  # rendered, so `{{ home }}` in one would stay four braces.
+  - vars:
+      rq_ref: v0.6.0
+      rq_dir: "{{ home }}/.cache/provision/tools/rust-quality"
+
+  # The `git` action tells a tag from a branch by asking the repository, so
+  # moving between them is this one line. Nothing fetches at gate time and an
+  # offline machine still converges.
+  - name: "rust-quality at {{ rq_ref }}"
+    git:
+      repo: https://github.com/alehatsman/rust-quality.git
+      dest: "{{ rq_dir }}"
+      ref: "{{ rq_ref }}"
+
+  # rq/tools installs cargo-nextest, cargo-deny and cargo-machete and adds the
+  # clippy and rustfmt rustup components. Not a `use:` of the preset: the
+  # preset's install step is ungated by design, and the `creates` gate below is
+  # this repo's answer to "an interrupted install should be retried, not
+  # skipped". A `use` site cannot reach inside to add it.
+  - name: Install the gate's tools
+    shell: bash "{{ rq_dir }}/scripts/tools.sh" install
+    creates: "{{ home }}/.cargo/bin/cargo-machete"
+    timeout: 30m
+
+  # A check: its exit code is its whole contract, so it needs no modifier.
+  - name: Verify the gate's tools
+    shell: bash "{{ rq_dir }}/scripts/tools.sh" check

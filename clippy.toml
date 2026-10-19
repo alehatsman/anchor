@@ -1,0 +1,42 @@
+# rust-quality — shared clippy configuration.
+#
+# Copied into the consumer repo root by `rq/sync-config`. Pairs with the
+# `[workspace.lints]` block in lints.toml: that file picks the lints, this one
+# tunes them.
+
+# Test code exists to provoke failure. Panicking there is the point, so the
+# panic-surface restriction lints are scoped to production code only.
+#
+# "in tests" means inside a `#[test]` function, and nothing else. A helper in
+# tests/ that is not itself a test -- a fixture builder, a `fn run(..)` wrapper
+# -- is production code as far as these are concerned, and `.unwrap()` there is
+# a finding. Use `.expect("what cannot fail and why")`: the reason is the thing
+# the reader wants at 3am, and `expect_used` is off precisely so you can.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true
+
+# Soft caps, enforced by clippy at lint time — no second tool and no second
+# compile. `too-many-lines-threshold` is the function-scope twin of CAP_LOC in
+# scripts/lib.sh, which is file-scope; both count code lines, not bytes.
+#
+# `too_many_lines` was previously allowed in lints.toml and credited to a
+# `scripts/budget-status.sh` that does not exist and never did, so function
+# length was enforced by nothing at all.
+cognitive-complexity-threshold = 30
+too-many-arguments-threshold = 8
+too-many-lines-threshold = 200
+type-complexity-threshold = 500
+
+# `doc_markdown` (pedantic) is on. `..` extends clippy's default list rather
+# than replacing it — add proper nouns here instead of allowing the lint.
+doc-valid-idents = ["..", "OpenTelemetry", "OpenAPI", "PostgreSQL", "SQLite", "WebAssembly", "gRPC"]
+
+# Hook for fleet-wide bans. Left empty on purpose: a shared ban list only earns
+# its keep once a concrete footgun has bitten twice.
+# disallowed-methods = [
+#   { path = "std::env::set_var", reason = "process-global mutation; thread-unsafe" },
+# ]
