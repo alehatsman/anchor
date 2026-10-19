@@ -57,14 +57,12 @@ impl State {
     }
 }
 
-/// Why a session became `lost`. See docs/02-model.md.
+/// Why a session's row carries a `lost_reason`: it became `lost`, or (for
+/// `SPAWN_FAILED`) `exited` without ever running. See docs/02-model.md.
 pub mod lost_reason {
     pub const DAEMON_RESTART: &str = "daemon_restart";
     pub const SPAWN_FAILED: &str = "spawn_failed";
     pub const KILL_TIMEOUT: &str = "kill_timeout";
-    /// Writing the output log failed. The only reason that can be set while
-    /// the child is still running — the session continues, unpersisted.
-    pub const IO_ERROR: &str = "io_error";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

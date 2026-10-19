@@ -63,7 +63,7 @@ impl Paths {
 
     /// The append-only output log for a session.
     pub fn output_log(&self, id: &str) -> PathBuf {
-        self.session_dir(id).join("output.vt")
+        self.session_dir(id).join(crate::log::LOG_FILE_NAME)
     }
 
     pub fn socket_path(&self) -> &Path {

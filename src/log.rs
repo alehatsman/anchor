@@ -14,16 +14,15 @@
 //! This module owns `next_offset`. That is deliberate: docs/03-pty.md's
 //! reader loop requires **persist, then advance the offset, then fan out**, so
 //! the counter has to live behind the same call that does the write, or the
-//! ordering is an unenforced comment. `the session layer` holds an `OutputLog` inside
-//! its fan-out mutex and reads the start offset back out of `append`.
+//! ordering is an unenforced comment. The session layer holds an `OutputLog`
+//! inside its fan-out mutex and reads the start offset back out of `append`.
 //!
-//! **Not in scope here:** bounded attach (`tail` / `max_replay_bytes`) is M4 --
-//! this module serves whatever byte range it is asked for, clamped only to
-//! what actually exists. Keeping the bound one layer up is what lets a VT
-//! state snapshot replace a byte range later without a protocol change
-//! (docs/04-protocol.md).
-//! Recording [`LogEvent`]s in `session_events` is M7; `append` returns them
-//! rather than writing them anywhere.
+//! **Not in scope here:** bounded attach (`tail` / `max_replay_bytes`) lives
+//! in `session/replay.rs` -- this module serves whatever byte range it is
+//! asked for, clamped only to what actually exists. Keeping the bound one
+//! layer up is what lets a VT state snapshot replace a byte range later
+//! without a protocol change (docs/04-protocol.md). [`LogEvent`]s are
+//! returned by `append`, not recorded anywhere; the caller logs them.
 //!
 //! **Nothing on the append path ever calls `fsync`.** The periodic sync
 //! docs/02-model.md asks for runs on [`LogSyncer`]'s own thread against
@@ -77,20 +76,9 @@ impl Default for LogLimits {
     }
 }
 
-/// What SQLite remembered about this log before the daemon restarted. The
-/// seam for docs/02-model.md#startup-sequence; `persistence.rs` (M7)
-/// fills it in, and until then every open is a fresh one.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct StoredState {
-    /// The `output_bytes` column as SQLite last recorded it.
-    pub output_bytes: u64,
-    /// The `log_capped_at` column as SQLite last recorded it.
-    pub log_capped_at: Option<u64>,
-}
-
-/// Something worth a `session_events` row (M7) or an operator-visible log
-/// line. Returned rather than written, because `append` runs on the PTY
-/// reader thread and nothing on that thread may touch SQLite.
+/// Something worth an operator-visible log line. Returned rather than
+/// written, because `append` runs on the PTY reader thread and nothing on
+/// that thread may touch SQLite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogEvent {
     /// Crossed `log_warn_bytes`. Emitted once per log.
@@ -104,9 +92,9 @@ pub enum LogEvent {
         /// The offset the file was capped at.
         at: u64,
     },
-    /// A write or sync failed. Persistence stops; the session keeps running
-    /// (docs/02-model.md: `lost_reason='io_error'` is the one reason
-    /// that can be set while the child is still alive).
+    /// A write failed. Persistence stops and the log is capped where it
+    /// stopped; the session keeps running. `log_capped_at` is the durable
+    /// signal -- no `lost_reason` records this.
     IoError {
         /// The offset the write/sync was attempted at.
         at: u64,
@@ -126,7 +114,7 @@ pub struct Appended {
 }
 
 /// The append side of one session's log. Single-writer by construction:
-/// `the session layer` keeps it inside the mutex the reader loop takes.
+/// The session layer keeps it inside the mutex the reader loop takes.
 #[derive(Debug)]
 pub struct OutputLog {
     path: PathBuf,
@@ -151,17 +139,24 @@ pub struct OutputLog {
 impl OutputLog {
     /// Opens (creating if needed) `<dir>/output.vt` in append mode.
     ///
-    /// `stored` is the SQLite row for this session, if there is one. Recovery
-    /// takes `max(len(output.vt), stored output_bytes)`: the file cannot lie
-    /// about bytes it holds, but for a *capped* log the file stopped growing
-    /// while the column kept counting, and taking the file length there would
-    /// rewind `next_offset` below offsets live clients already hold.
-    pub fn open(dir: &Path, limits: LogLimits, stored: Option<StoredState>) -> Result<Self> {
+    /// The stream resumes at the file's length, capped if the file already
+    /// holds `max_bytes`. This is only ever a fresh open: a restart marks
+    /// every live session `lost` and never reopens its log for writing, so
+    /// the recovery rule for a stream that ran ahead of a capped file lives
+    /// in one place, `Store::reconcile_output_bytes`.
+    pub fn open(dir: &Path, limits: LogLimits) -> Result<Self> {
         create_dir_owner_only(dir)?;
         let path = dir.join(LOG_FILE_NAME);
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        // The log is a verbatim terminal transcript, credentials included.
+        // Owner-only on the file itself, not just the directory around it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         let file_len = file
@@ -169,26 +164,13 @@ impl OutputLog {
             .with_context(|| format!("stat {}", path.display()))?
             .len();
 
-        let stored = stored.unwrap_or_default();
-        let next_offset = file_len.max(stored.output_bytes);
-
-        // A recorded cap wins. Otherwise: a full file is capped even if no row
-        // said so, and `next_offset` running ahead of the file means
-        // persistence stopped at `file_len` whatever the reason -- say so,
-        // rather than leaving a null cap that claims those bytes are readable.
-        let log_capped_at = match stored.log_capped_at {
-            Some(at) => Some(at),
-            None if file_len >= limits.max_bytes || next_offset > file_len => Some(file_len),
-            None => None,
-        };
-
         Ok(Self {
             path,
             file: Arc::new(file),
             limits,
-            next_offset,
+            next_offset: file_len,
             file_len,
-            log_capped_at,
+            log_capped_at: (file_len >= limits.max_bytes).then_some(file_len),
             io_failed: false,
             warned: file_len >= limits.warn_bytes,
         })
@@ -214,7 +196,7 @@ impl OutputLog {
             let fits = room.min(bytes.len());
 
             if fits > 0 {
-                match (&*self.file).write_all(bytes.get(..fits).unwrap_or(&[])) {
+                match (&*self.file).write_all(&bytes[..fits]) {
                     Ok(()) => self.file_len += fits as u64,
                     Err(e) => self.fail(&mut events, &e),
                 }
@@ -293,6 +275,12 @@ impl OutputLog {
             return;
         }
         self.io_failed = true;
+        // `write_all` loops over `write`, so a full disk can land k bytes and
+        // then fail: the file is longer than `file_len` says. Cap at what is
+        // really there, or the cap understates the file and `file_length ==
+        // min(next_offset, log_capped_at)` is false on exactly the failure
+        // this module exists to handle.
+        self.file_len = self.file.metadata().map_or(self.file_len, |m| m.len());
         self.log_capped_at = Some(self.file_len);
         events.push(LogEvent::IoError {
             at: self.file_len,
@@ -478,16 +466,15 @@ mod tests {
     /// A failed append stops persistence *and* publishes where it stopped.
     /// Without the second half a client is handed a replay range that ends
     /// short of `next_offset` and live chunks that resume past a hole it was
-    /// never told about (docs/02-model.md: `lost_reason='io_error'` is
-    /// the one reason set while the child is still alive).
+    /// never told about.
     ///
-    /// Lives here rather than in `daemon/tests/` because inducing a real
+    /// Lives here rather than in `tests/` because inducing a real
     /// write failure means handing `OutputLog` a read-only handle, which
     /// needs the private field.
     #[test]
     fn a_failed_append_caps_the_log_and_keeps_offsets_advancing() {
         let dir = scratch("io-error");
-        let mut log = OutputLog::open(&dir, LogLimits::default(), None).expect("open");
+        let mut log = OutputLog::open(&dir, LogLimits::default()).expect("open");
         log.append(b"the bytes that made it");
         assert_eq!(log.readable_end(), 22);
 
@@ -545,7 +532,7 @@ mod tests {
         let dir = scratch("syncer");
         let syncer = LogSyncer::new(Duration::from_millis(20));
 
-        let mut log = OutputLog::open(&dir, LogLimits::default(), None).expect("open");
+        let mut log = OutputLog::open(&dir, LogLimits::default()).expect("open");
         syncer.register(&log.sync_handle());
         log.append(b"flush me");
 

@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use anchor::log::{LogEvent, LogLimits, OutputLog, StoredState, LOG_FILE_NAME};
+use anchor::log::{LogEvent, LogLimits, OutputLog, LOG_FILE_NAME};
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -62,7 +62,7 @@ fn assert_invariant(log: &OutputLog, dir: &std::path::Path) {
 #[test]
 fn append_offsets_and_range_reads_agree() {
     let dir = scratch("roundtrip");
-    let mut log = OutputLog::open(&dir, LogLimits::default(), None).expect("open");
+    let mut log = OutputLog::open(&dir, LogLimits::default()).expect("open");
 
     let chunks: [&[u8]; 3] = [b"hello ", b"terminal ", b"world"];
     let mut starts = Vec::new();
@@ -103,7 +103,7 @@ fn append_offsets_and_range_reads_agree() {
 #[test]
 fn hitting_the_cap_stops_the_file_but_not_the_offset() {
     let dir = scratch("cap");
-    let mut log = OutputLog::open(&dir, limits(50, 30), None).expect("open");
+    let mut log = OutputLog::open(&dir, limits(50, 30)).expect("open");
 
     let mut events = Vec::new();
     for _ in 0..10 {
@@ -157,120 +157,93 @@ fn hitting_the_cap_stops_the_file_but_not_the_offset() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The M3 gate's restart clause. A capped log's file stopped growing while
-/// the column kept counting; taking the file length unconditionally on
-/// recovery would rewind `next_offset` below offsets live clients already
-/// hold (docs/02-model.md#startup-sequence).
+/// A file that already holds `max_bytes` opens capped: whatever stopped it
+/// growing, appending more must not push it past the budget. (The rest of
+/// restart recovery -- a stream ahead of its file -- is
+/// `Store::reconcile_output_bytes`'s, tested in `store_roundtrip.rs`.)
 #[test]
-fn reopening_a_capped_log_does_not_rewind_next_offset() {
-    let dir = scratch("no-rewind");
-    let stored = {
-        let mut log = OutputLog::open(&dir, limits(50, 1024), None).expect("open");
-        for _ in 0..10 {
-            log.append(&[b'y'; 20]);
-        }
-        assert_eq!((log.next_offset(), log.readable_end()), (200, 50));
-        StoredState {
-            output_bytes: log.next_offset(),
-            log_capped_at: log.log_capped_at(),
-        }
-    };
-
-    let reopened = OutputLog::open(&dir, limits(50, 1024), Some(stored)).expect("reopen");
-    assert_eq!(
-        reopened.next_offset(),
-        200,
-        "next_offset must not move backwards across a restart"
-    );
-    assert_eq!(reopened.log_capped_at(), Some(50));
-    assert_invariant(&reopened, &dir);
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The other half of `max()`: for a normal log the column lags a crash by
-/// seconds and the file, which cannot lie about bytes it holds, wins.
-#[test]
-fn recovery_takes_the_larger_of_the_file_and_the_column() {
-    let dir = scratch("max-rule");
+fn a_full_file_opens_capped_and_does_not_grow() {
+    let dir = scratch("full-open");
     {
-        let mut log = OutputLog::open(&dir, LogLimits::default(), None).expect("open");
-        log.append(&[b'x'; 4096]);
+        let mut log = OutputLog::open(&dir, limits(40, 1024)).expect("open");
+        log.append(&[b'y'; 40]);
     }
 
-    let stale = StoredState {
-        output_bytes: 1000,
-        log_capped_at: None,
-    };
-    let recovered = OutputLog::open(&dir, LogLimits::default(), Some(stale)).expect("reopen");
-    assert_eq!(
-        recovered.next_offset(),
-        4096,
-        "the file wins when the column lags"
-    );
-    assert_eq!(
-        recovered.log_capped_at(),
-        None,
-        "a full file is not a capped one"
-    );
-    assert_invariant(&recovered, &dir);
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Recovering with a column ahead of the file but no recorded cap: the bytes
-/// between them are gone whatever the reason, so the log says so rather than
-/// leaving a null cap that claims they are readable.
-#[test]
-fn a_column_ahead_of_the_file_is_reported_as_capped() {
-    let dir = scratch("implied-cap");
-    {
-        let mut log = OutputLog::open(&dir, LogLimits::default(), None).expect("open");
-        log.append(b"only these bytes survived");
-    }
-
-    let stored = StoredState {
-        output_bytes: 9_000,
-        log_capped_at: None,
-    };
-    let recovered = OutputLog::open(&dir, LogLimits::default(), Some(stored)).expect("reopen");
-    assert_eq!(recovered.next_offset(), 9_000);
-    assert_eq!(
-        recovered.log_capped_at(),
-        Some(25),
-        "persistence demonstrably stopped at the file length"
-    );
-    assert_invariant(&recovered, &dir);
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Appending to a log that reopened already capped is a no-op on disk and a
-/// normal advance for the offset -- a restart must not restart persistence
-/// at a position whose offsets are already spent.
-#[test]
-fn a_reopened_capped_log_does_not_resume_appending() {
-    let dir = scratch("capped-append");
-    {
-        let mut log = OutputLog::open(&dir, limits(40, 1024), None).expect("open");
-        for _ in 0..4 {
-            log.append(&[b'y'; 20]);
-        }
-    }
-
-    let stored = StoredState {
-        output_bytes: 80,
-        log_capped_at: Some(40),
-    };
-    let mut log = OutputLog::open(&dir, limits(40, 1024), Some(stored)).expect("reopen");
+    let mut log = OutputLog::open(&dir, limits(40, 1024)).expect("reopen");
+    assert_eq!(log.next_offset(), 40);
+    assert_eq!(log.log_capped_at(), Some(40));
     let appended = log.append(b"more output");
-    assert_eq!(appended.start, 80);
-    assert_eq!(log.next_offset(), 91);
-    assert_eq!(
-        log.readable_end(),
-        40,
-        "the file must not grow again after a cap"
+    assert_eq!(appended.start, 40);
+    assert_eq!(log.next_offset(), 51);
+    assert_eq!(log.readable_end(), 40, "the file must not grow after a cap");
+    assert_invariant(&log, &dir);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The log is a verbatim terminal transcript; its protection must not rest on
+/// the parent directory alone.
+#[cfg(unix)]
+#[test]
+fn the_log_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch("mode");
+    let _log = OutputLog::open(&dir, LogLimits::default()).expect("open");
+    let mode = std::fs::metadata(dir.join(LOG_FILE_NAME))
+        .expect("stat")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "output.vt mode was {:o}", mode & 0o777);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A write that lands k bytes and then fails -- a full disk -- must cap the
+/// log at the file's *real* length. Capping at the pre-write length leaves
+/// the file k bytes longer than the log believes, so `file_length ==
+/// min(next_offset, log_capped_at)` is false on exactly the failure the cap
+/// exists for. Induced with `RLIMIT_FSIZE`: the kernel writes up to the limit
+/// and then fails the rest, which is a short write followed by an error.
+///
+/// Every other test in this binary writes well under the limit, so it is safe
+/// to set process-wide.
+#[cfg(unix)]
+#[test]
+fn a_short_write_caps_at_the_real_file_length() {
+    const LIMIT: u64 = 1024 * 1024;
+
+    let dir = scratch("short-write");
+    let mut log = OutputLog::open(&dir, LogLimits::default()).expect("open");
+    log.append(b"before the disk fills");
+
+    // The kernel signals SIGXFSZ past the limit; ignored, the write fails
+    // with EFBIG instead of killing the test.
+    // SAFETY: plain libc calls with valid arguments.
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        let limit = libc::rlimit {
+            rlim_cur: LIMIT as libc::rlim_t,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+    }
+
+    let appended = log.append(&vec![b'z'; 2 * LIMIT as usize]);
+
+    let on_disk = std::fs::metadata(dir.join(LOG_FILE_NAME)).unwrap().len();
+    assert_eq!(on_disk, LIMIT, "the sabotage must produce a short write");
+    assert!(
+        matches!(appended.events.as_slice(), [LogEvent::IoError { .. }]),
+        "expected one IoError, got {:?}",
+        appended.events
     );
+    assert_eq!(
+        log.log_capped_at(),
+        Some(on_disk),
+        "the cap must be where the file really ends"
+    );
+    assert_eq!(log.readable_end(), on_disk);
     assert_invariant(&log, &dir);
 
     let _ = std::fs::remove_dir_all(&dir);

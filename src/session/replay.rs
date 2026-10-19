@@ -336,7 +336,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn scratch_fanout(dir: &std::path::Path) -> Arc<Mutex<Fanout>> {
-        let log = OutputLog::open(dir, LogLimits::default(), None).expect("open log");
+        let log = OutputLog::open(dir, LogLimits::default()).expect("open log");
         Arc::new(Mutex::new(Fanout::new(log)))
     }
 
