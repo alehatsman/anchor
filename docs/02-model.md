@@ -144,6 +144,8 @@ found ahead of its file is itself a cap, recorded if no row said so.
 ```text
 resolve data dir
     ↓
+arm SIGTERM/SIGINT          ← before the bind: see below
+    ↓
 bind unix socket            ← before any write, migration included: see below
     ↓
 open SQLite (WAL), migrate
@@ -164,6 +166,17 @@ sessions lost and then exit, telling its clients their sessions are gone
 while the PTYs are still running. Claiming the socket first makes that
 impossible: whoever holds it is the only process entitled to decide what a
 live row means.
+
+**The signal handlers come before the bind**, and that ordering is
+load-bearing in the same way. A unix socket is connectable the moment it is
+bound — the kernel queues connections in the listen backlog long before
+anything calls `accept` — so from the outside the daemon looks up while it
+is still migrating the database. A `SIGTERM` arriving in that window, from a
+service manager or an impatient operator, would find no handler installed
+and kill the process on the default disposition. Arming first makes the
+window harmless: the signal is queued and consumed once `serve` is running.
+Binding before opening the database is what made this reachable rather than
+theoretical, and `tests/restart_recovery.rs` pins it.
 
 ## Create sequence
 
