@@ -1,0 +1,65 @@
+name: ci
+
+# Every check this repo has used to run only when someone remembered to run
+# it (#17). docs/08-testing.md's thesis is that a claim nothing can falsify
+# is not evidence; a suite that passes on one laptop is the same shape.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  # Pinned rather than floating to stable. teleport's CI drifted to a newer
+  # compiler than any developer was running and went red on clippy lints
+  # nobody could reproduce locally (#16). Bump this deliberately.
+  RUST_VERSION: 1.98.1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install $RUST_VERSION --profile minimal --component rustfmt
+      - run: rustup default $RUST_VERSION
+      # fmt was dirty across ten files before anything checked it, and not
+      # one of them was a judgement call.
+      - run: cargo fmt --check
+
+  test:
+    # Both platforms, deliberately. tests/pty_primitive.rs splits on
+    # target_os for a real kernel difference in disassociate_ctty(), so a
+    # single-platform job silently stops covering half of it.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install $RUST_VERSION --profile minimal --component clippy
+      - run: rustup default $RUST_VERSION
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+      # Clippy on both too: the platform conditionals live in pty.rs, and a
+      # lint that only fires under one cfg is only seen under one runner.
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  citations:
+    # Twenty-five doc citations pointed at headings that do not exist before
+    # anything read them (#17).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/check-citations.py

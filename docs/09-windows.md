@@ -212,7 +212,7 @@ teleport has a
 40-line Task Scheduler scaffold (`desktop/src-tauri/src/autostart/windows.rs`)
 that **does not work yet**: attempted 2026-09-06 on real Windows 11 build
 26200, every task-creation attempt returned `Access is denied`
-(`docs/11-mvp-plan.md:1042`). Assume no donor.
+(teleport `docs/11-mvp-plan.md:1042`). Assume no donor.
 
 ## 5. Validation
 

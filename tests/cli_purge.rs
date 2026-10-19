@@ -51,13 +51,22 @@ impl Daemon {
         self.dir.join("run/anchor.sock")
     }
 
-    fn client(&self) -> Client {
-        let deadline = Instant::now() + Duration::from_secs(10);
+    /// Waits for anchord to bind, on the condition rather than on a clock --
+    /// see the same helper in `cli_attach.rs` for why a fixed budget here is
+    /// an assertion about the box rather than about the daemon.
+    fn client(&mut self) -> Client {
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
+            if let Some(status) = self.child.try_wait().expect("polling anchord") {
+                panic!("anchord exited before binding its socket: {status}");
+            }
             if let Ok(client) = Client::connect(&self.socket()) {
                 return client;
             }
-            assert!(Instant::now() < deadline, "anchord never came up");
+            assert!(
+                Instant::now() < deadline,
+                "anchord is still running but never bound its socket"
+            );
             std::thread::sleep(Duration::from_millis(25));
         }
     }
@@ -128,7 +137,7 @@ fn await_exited(client: &mut Client, id: &str) {
 
 #[test]
 fn purge_forgets_an_exited_session() {
-    let daemon = Daemon::start("forgets");
+    let mut daemon = Daemon::start("forgets");
     let mut client = daemon.client();
 
     let id = create_sleeper(&mut client);
@@ -163,7 +172,7 @@ fn purge_forgets_an_exited_session() {
 
 #[test]
 fn purge_refuses_a_running_session() {
-    let daemon = Daemon::start("refuses");
+    let mut daemon = Daemon::start("refuses");
     let mut client = daemon.client();
 
     let id = create_sleeper(&mut client);
@@ -188,7 +197,7 @@ fn purge_refuses_a_running_session() {
 
 #[test]
 fn purge_reports_an_unknown_id() {
-    let daemon = Daemon::start("unknown");
+    let mut daemon = Daemon::start("unknown");
     let _client = daemon.client();
 
     let missing = daemon.cli(&["purge", "01ZZZZZZZZZZZZZZZZZZZZZZZZ"]);

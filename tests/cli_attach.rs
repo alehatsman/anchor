@@ -49,13 +49,30 @@ impl Daemon {
         self.dir.join("run/anchor.sock")
     }
 
-    fn client(&self) -> Client {
-        let deadline = Instant::now() + Duration::from_secs(10);
+    /// Waits for anchord to bind, on the condition rather than on a clock.
+    ///
+    /// A fixed budget here asserts the box was fast, not that the daemon came
+    /// up: a cold anchord on a loaded runner takes well over ten seconds to
+    /// start, and this fixture went red four ways under deliberate CPU
+    /// contention with nothing broken (docs/08-testing.md).
+    ///
+    /// The failure actually worth catching is a daemon that *died*, and that
+    /// is a different observation rather than a slower one — so check it
+    /// directly instead of inferring it from elapsed time. The remaining
+    /// deadline is a backstop against hanging the suite, not the assertion.
+    fn client(&mut self) -> Client {
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
+            if let Some(status) = self.child.try_wait().expect("polling anchord") {
+                panic!("anchord exited before binding its socket: {status}");
+            }
             if let Ok(client) = Client::connect(&self.socket()) {
                 return client;
             }
-            assert!(Instant::now() < deadline, "anchord never came up");
+            assert!(
+                Instant::now() < deadline,
+                "anchord is still running but never bound its socket"
+            );
             std::thread::sleep(Duration::from_millis(25));
         }
     }
@@ -170,7 +187,7 @@ fn run_attach(
 
 #[test]
 fn tilde_dot_detaches_from_an_idle_session() {
-    let daemon = Daemon::start("detach");
+    let mut daemon = Daemon::start("detach");
     let mut client = daemon.client();
 
     // Deliberately silent after its banner: the session produces nothing
@@ -233,7 +250,7 @@ fn tilde_dot_detaches_from_an_idle_session() {
 
 #[test]
 fn an_attach_replays_history_without_losing_the_first_frames() {
-    let daemon = Daemon::start("replay");
+    let mut daemon = Daemon::start("replay");
     let mut client = daemon.client();
 
     // A burst, so the first frames land in the same read as the attach
@@ -309,7 +326,7 @@ fn an_attach_replays_history_without_losing_the_first_frames() {
 /// would unblock the read by hand and pass either way.
 #[test]
 fn attach_returns_when_the_session_exits() {
-    let daemon = Daemon::start("exit-returns");
+    let mut daemon = Daemon::start("exit-returns");
     let mut client = daemon.client();
 
     // Exits on its own shortly after the attach has settled.
@@ -380,7 +397,7 @@ fn attach_returns_when_the_session_exits() {
 /// skipped. A test that proved this over pipes would be proving nothing.
 #[test]
 fn a_signalled_attach_leaves_the_terminal_usable() {
-    let daemon = Daemon::start("sigterm-raw");
+    let mut daemon = Daemon::start("sigterm-raw");
     let mut client = daemon.client();
     let created = client
         .call(
@@ -490,7 +507,7 @@ fn open_pty() -> (i32, i32) {
 /// right from either end.
 #[test]
 fn a_relative_cwd_is_resolved_before_it_is_sent() {
-    let daemon = Daemon::start("relative-cwd");
+    let mut daemon = Daemon::start("relative-cwd");
     let mut client = daemon.client();
 
     let status = Command::new(bin("anchor"))
@@ -578,7 +595,7 @@ fn await_size(client: &mut Client, id: &str, want: (u16, u16), timeout: Duration
 /// real terminal does differently, and not the thing under test.
 #[test]
 fn a_resize_after_attaching_reaches_the_session() {
-    let daemon = Daemon::start("sigwinch");
+    let mut daemon = Daemon::start("sigwinch");
     let mut client = daemon.client();
     let created = client
         .call(
