@@ -17,6 +17,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -30,17 +31,30 @@ const CLIENTS_PER_SIDE: usize = 3;
 /// Ops per client. The historical failure showed up well inside this.
 const OPS_PER_CLIENT: usize = 300;
 
-/// How long the whole storm gets, start to finish, before it is called a
-/// deadlock. Generous: a loaded machine doing this many round trips over a
-/// unix socket is nowhere near it, and a real deadlock never finishes at
-/// all. One deadline for the run, not one per client -- per-client timeouts
-/// multiply, and the failure this guards is the whole daemon stopping, so
-/// the bound that matters is the wall clock.
-const WATCHDOG: Duration = Duration::from_secs(60);
+/// How long the storm may go without a SINGLE operation completing before it
+/// is called a deadlock. A budget for the whole run would measure how fast
+/// ~1,800 round trips are on this machine; a real deadlock does not slow
+/// down, it stops, and the failure this guards is the whole daemon stopping.
+const STALL: Duration = Duration::from_secs(20);
 
+/// The daemon runs on a runtime of its own, not the test's. In the ABBA
+/// state every worker is parked in `Mutex::lock`, and dropping a multi-thread
+/// runtime joins its workers -- so a panic raised from inside the test's own
+/// runtime would unwind into a drop that never returns, and the failure
+/// message this test exists to deliver would never be seen. Here the
+/// runtime is shut down in the background, which does not wait.
 struct Harness {
     _dir: tempfile::TempDir,
     socket: PathBuf,
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
 }
 
 fn harness() -> Harness {
@@ -53,12 +67,23 @@ fn harness() -> Harness {
     let manager = Arc::new(
         anchor::session::SessionManager::new(paths.sessions_dir()).with_store(Arc::clone(&store)),
     );
-    let listener = anchor::server::bind(&socket).unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = {
+        let _enter = runtime.enter();
+        anchor::server::bind(&socket).unwrap()
+    };
     let state = anchor::server::State::new(manager, store);
-    tokio::spawn(async move {
+    runtime.spawn(async move {
         let _ = anchor::server::serve(listener, state).await;
     });
-    Harness { _dir: dir, socket }
+    Harness {
+        _dir: dir,
+        socket,
+        runtime: Some(runtime),
+    }
 }
 
 struct Client {
@@ -98,8 +123,8 @@ impl Client {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn list_and_label_do_not_deadlock_the_daemon() {
+#[test]
+fn list_and_label_do_not_deadlock_the_daemon() {
     let h = harness();
     let mut client = Client::connect(&h.socket);
 
@@ -124,15 +149,18 @@ async fn list_and_label_do_not_deadlock_the_daemon() {
 
     let (done_tx, done_rx) = mpsc::channel();
     let mut workers = Vec::new();
+    let ops = Arc::new(AtomicU64::new(0));
 
     for n in 0..CLIENTS_PER_SIDE {
         // The lister: holds the store to read rows, then folds live state.
         let socket = h.socket.clone();
         let done = done_tx.clone();
+        let list_ops = Arc::clone(&ops);
         workers.push(std::thread::spawn(move || {
             let mut client = Client::connect(&socket);
             for _ in 0..OPS_PER_CLIENT {
                 client.ok("list", json!({}));
+                list_ops.fetch_add(1, Ordering::Relaxed);
             }
             let _ = done.send(format!("list-{n}"));
         }));
@@ -141,6 +169,7 @@ async fn list_and_label_do_not_deadlock_the_daemon() {
         let socket = h.socket.clone();
         let done = done_tx.clone();
         let session = id.clone();
+        let label_ops = Arc::clone(&ops);
         workers.push(std::thread::spawn(move || {
             let mut client = Client::connect(&socket);
             let key = format!("wm.n{n}");
@@ -151,6 +180,7 @@ async fn list_and_label_do_not_deadlock_the_daemon() {
                     "label",
                     json!({ "session": &session, "set": Value::Object(set) }),
                 );
+                label_ops.fetch_add(1, Ordering::Relaxed);
             }
             let _ = done.send(format!("label-{n}"));
         }));
@@ -161,16 +191,25 @@ async fn list_and_label_do_not_deadlock_the_daemon() {
     // failure this test exists for, which reads as an infra problem rather
     // than as the bug.
     let expected = CLIENTS_PER_SIDE * 2;
-    let deadline = Instant::now() + WATCHDOG;
-    for finished in 0..expected {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if done_rx.recv_timeout(left).is_err() {
-            panic!(
-                "daemon stopped answering after {finished}/{expected} clients finished: \
-                 `list` and `label` are taking the store and a session's locks in \
-                 opposite orders (#19)"
-            );
+    let mut finished = 0;
+    let mut seen = 0;
+    let mut stall_deadline = Instant::now() + STALL;
+    while finished < expected {
+        match done_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(_) => finished += 1,
+            Err(_) => {}
         }
+        let now_seen = ops.load(Ordering::Relaxed);
+        if now_seen > seen {
+            seen = now_seen;
+            stall_deadline = Instant::now() + STALL;
+        }
+        assert!(
+            Instant::now() < stall_deadline,
+            "daemon stopped answering after {seen} ops, {finished}/{expected} clients finished: \
+             `list` and `label` are taking the store and a session's locks in \
+             opposite orders (#19)"
+        );
     }
     for worker in workers {
         worker.join().expect("client thread");
