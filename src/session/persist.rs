@@ -3,9 +3,12 @@
 //! The PTY reader thread must never wait on anything, and a `rusqlite` write
 //! is a wait on a disk. Cached-offset updates therefore go onto a bounded
 //! channel with `try_send` and are applied by this thread; a full channel
-//! drops the update rather than stalling the reader, which is safe because
-//! the value is a cache — startup reconciles it against the log file, and
-//! the file is authoritative.
+//! drops the update rather than stalling the reader. That is safe for an
+//! uncapped log: the value is a cache, and startup reconciles it against the
+//! log file, which is authoritative. For a *capped* log it is not the whole
+//! story -- past the cap the file stops growing, so `output_bytes` and the
+//! cap live only in the row, and a crash can lose the unsent tail (see
+//! `Store::reconcile_output_bytes`).
 //!
 //! Control-path writes (create, exit) are not routed through here. They run
 //! on the caller's thread, where blocking on SQLite is fine.
@@ -16,11 +19,12 @@ use std::sync::{Arc, Mutex};
 use crate::store::Store;
 
 /// Queued offset updates. Each is a whole-value overwrite, so dropping one
-/// only costs precision until the next update or the next restart.
+/// costs precision until the next update. Across a crash that precision is
+/// recoverable from the file only while the log is uncapped.
 const QUEUE_CAPACITY: usize = 256;
 
 /// One queued write. Both kinds are whole-value overwrites, so dropping one
-/// costs precision until the next, never correctness.
+/// costs precision until the next.
 enum Update {
     /// Where a session's output stream has reached.
     Output {

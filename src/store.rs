@@ -106,29 +106,7 @@ impl Store {
             return self.list();
         }
 
-        // One EXISTS per pair: a session matches only if every pair is
-        // present on it. Indexed by labels(key, value).
-        let clauses = (0..filter.len())
-            .map(|i| {
-                let k = i * 2 + 1;
-                format!(
-                    "EXISTS (SELECT 1 FROM labels l WHERE l.session_id = s.id \
-                     AND l.key = ?{} AND l.value = ?{})",
-                    k,
-                    k + 1
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" AND ");
-
-        let sql = format!(
-            "SELECT s.id, s.state, s.pid, s.exit_code, s.lost_reason, s.command, s.args_json,
-                    s.cwd, s.env_json, s.login_shell, s.cols, s.rows, s.spec_cols, s.spec_rows,
-                    s.output_bytes, s.log_capped_at, s.created_at, s.exited_at
-               FROM sessions s
-              WHERE {clauses}
-              ORDER BY s.id DESC"
-        );
+        let sql = filter_sql(filter.len());
 
         let params: Vec<&dyn rusqlite::ToSql> = filter
             .iter()
@@ -303,7 +281,14 @@ impl Store {
     /// stale. For a capped one the file stopped growing while the stream kept
     /// counting, so taking the file length would rewind `output_bytes` below
     /// offsets clients already hold. A stream ahead of its file is itself a
-    /// cap, recorded here if no row said so — same rule as `OutputLog::open`.
+    /// cap, recorded here if no row said so. This is the only copy of that
+    /// rule: a restart never reopens a log for writing, so `OutputLog::open`
+    /// does not need one.
+    ///
+    /// The row is only as fresh as the last throttled `try_send` that reached
+    /// it (`session/persist.rs`), so for a capped log this is a best effort: a
+    /// crash inside that lag can leave the cap unrecorded and the offset
+    /// short of what clients were handed.
     ///
     /// Returns the number of rows corrected.
     pub fn reconcile_output_bytes(&self, paths: &Paths) -> Result<usize> {
@@ -353,6 +338,38 @@ impl Store {
         }
         Ok(corrected)
     }
+}
+
+/// The `list_filtered` statement for `pairs` label pairs; pair `i` binds
+/// `?{2i+1}` (key) and `?{2i+2}` (value).
+///
+/// One `IN (SELECT ...)` per pair, ANDed: a session matches only if every
+/// pair is present on it. Not `EXISTS (... l.session_id = s.id ...)`: that
+/// shape plans as a scan of every session probing the `(session_id, key)`
+/// primary key per row, and `labels_key_value` -- the index this whole query
+/// exists for -- is never touched. `IN` lets the planner drive from the
+/// label index. Pinned by `the_label_filter_is_served_by_the_label_index`.
+fn filter_sql(pairs: usize) -> String {
+    let clauses = (0..pairs)
+        .map(|i| {
+            let k = i * 2 + 1;
+            format!(
+                "s.id IN (SELECT session_id FROM labels WHERE key = ?{} AND value = ?{})",
+                k,
+                k + 1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    format!(
+        "SELECT s.id, s.state, s.pid, s.exit_code, s.lost_reason, s.command, s.args_json,
+                s.cwd, s.env_json, s.login_shell, s.cols, s.rows, s.spec_cols, s.spec_rows,
+                s.output_bytes, s.log_capped_at, s.created_at, s.exited_at
+           FROM sessions s
+          WHERE {clauses}
+          ORDER BY s.id DESC"
+    )
 }
 
 fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
@@ -406,4 +423,47 @@ fn json_column<T: serde::de::DeserializeOwned>(row: &Row<'_>, name: &str) -> rus
 /// one outright belongs in create-time validation, which arrives with `create`.
 fn path_to_text(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The label filter must be answered from `labels_key_value`, not by
+    /// scanning every session. That index is the reason label filtering
+    /// lives in the daemon at all; a query rewrite that quietly falls back to
+    /// a scan returns the same rows, just slower with every session ever
+    /// created, so only the plan can catch it. Planned against rusqlite's
+    /// bundled SQLite, which is the one that ships.
+    #[test]
+    fn the_label_filter_is_served_by_the_label_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("anchor.db")).unwrap();
+
+        for pairs in 1..=3 {
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", filter_sql(pairs)))
+                .unwrap();
+            let binds = ["k"; 6][..pairs * 2].iter();
+            let plan = stmt
+                .query_map(rusqlite::params_from_iter(binds), |r| {
+                    r.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("\n");
+
+            assert_eq!(
+                plan.matches("USING INDEX labels_key_value (key=? AND value=?)")
+                    .count(),
+                pairs,
+                "every pair must search labels_key_value; plan for {pairs} pair(s):\n{plan}"
+            );
+            assert!(
+                !plan.contains("SCAN s"),
+                "the filter scans every session; plan for {pairs} pair(s):\n{plan}"
+            );
+        }
+    }
 }
