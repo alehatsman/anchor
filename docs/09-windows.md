@@ -1,20 +1,28 @@
 # 09 — Windows
 
-Status: **deferred, 2026-10-16.** Windows is not being built. The owner
-answered §7's Q2: not now.
+Status: **scheduled as M6, 2026-10-19.** This reverses the deferral of
+2026-10-16.
 
-Nothing here is implemented and nothing is scheduled. This document is kept
-because the costing is the expensive part and it is done — not because the
-work is queued. **anchord is Unix-only, deliberately, as of this date.**
+The reopen condition §8 named has been met, by decision rather than by
+discovery: **teleport is to rely on anchor fully, on every platform it
+ships.** That makes anchord's Unix-only status the thing blocking teleport's
+in-process PTY layer from ever being deleted, rather than the thing excusing
+it. anchor#13 is reopened; the costing below stands unchanged and is now a
+plan rather than an estimate.
 
-§7's Q1 (does anchor acquire an access-control model?) is therefore
-unanswered rather than decided. It would have to be answered before any of
-this starts.
+**Both of §7's questions are answered:**
 
-What would reopen it: a client that needs sessions on Windows and cannot
-use a Unix host. teleport is the obvious candidate — its `use_anchor` path
-cannot ship on Windows while this is deferred, which is a consequence worth
-knowing before anyone deletes its in-process PTY layer (§8).
+- **Q1 — does anchor acquire an access-control model? Yes: option (a), an
+  explicit owner-only DACL.** The pipe is created with a DACL granting the
+  creating user's SID and nothing else. This preserves anchor's existing
+  position rather than replacing it — the OS enforces access, anchor does
+  not authenticate — which is why it was preferred over a token. `0600` and
+  an owner-only DACL are the same sentence in two kernels' vocabularies.
+- **Q2 — is Windows in scope? Yes**, as M6, sequenced per §5 and gated step
+  by step. Nothing here is implemented yet.
+
+**Still true, and the reason §5's gating is not optional:** the hard part is
+free and the broad part is not started. §6 is the honest inventory.
 
 ## Goal
 
@@ -248,9 +256,13 @@ with no donor, an access-control model anchor has never had, a console-input
 path, and an autostart story that is unsolved upstream — is broad rather than
 deep, and none of it is started.
 
-## 7. Open questions — owner's call
+## 7. The two questions, answered 2026-10-19
 
-**Q1. Does anchor acquire an access-control model?**
+Both were the owner's call and both have been made. The reasoning is kept
+rather than replaced by the answer, because the options rejected here are
+the ones a future reader will be tempted to re-propose.
+
+**Q1. Does anchor acquire an access-control model? → Yes, (a).**
 
 Today `src/server.rs:4` can say "there is no auth" and mean it, because the
 filesystem says it instead. On Windows that sentence needs a DACL behind it.
@@ -267,20 +279,34 @@ Three options:
   acquiring authentication — a far larger scope change than (a), and it would
   make the Unix path's "no auth" claim obsolete too.
 
-**Recommendation: (a).** It preserves the existing position — the OS enforces
+**Decided: (a).** It preserves the existing position — the OS enforces
 access, anchor does not authenticate — rather than replacing it. (c) is the
-only option that changes what anchor *is*.
+only option that changes what anchor *is*, and it would make the Unix path's
+"no auth" claim obsolete as a side effect of a Windows port, which is too
+much to pay here.
 
-**Q2. Is Windows in scope at all, given §6?**
+Consequence to carry into §3.2 and §4.2: the DACL is what the pipe name's
+per-user rule leans on, so the two are designed together rather than in
+sequence.
 
-The honest framing: the hard part is free, the broad part is not started, and
-the autostart story is blocked upstream on a real `Access is denied`. A
-defensible answer is "anchord is unix-only, stated deliberately" — which is
-also an answer teleport needs, since its own `use_anchor` path cannot ship on
-Windows without this work.
+**Q2. Is Windows in scope at all, given §6? → Yes, as M6.**
 
-This document does not recommend one. It exists so the question is asked with
-the costs visible rather than discovered during a port.
+The framing has not changed: the hard part is free, the broad part is not
+started, and the autostart story is blocked upstream on a real `Access is
+denied`. What changed is the requirement. teleport is to rely on anchor
+fully, so "anchord is unix-only, stated deliberately" stops being a
+defensible answer and becomes a permanent cap on teleport — its in-process
+PTY layer could never be deleted, and Windows would never get session
+survival (§8).
+
+So the cost is accepted rather than argued down. §5's gating is the part
+that must not be skipped: it exists so that a port which stalls halfway
+leaves a daemon that *refuses* to run on Windows rather than one that boots,
+reports healthy and hosts nothing.
+
+**Autostart (§4.7) is explicitly allowed to end in "no autostart story on
+Windows."** It is the one step gated on an upstream failure nobody here can
+fix, and it is sequenced last so it cannot block the rest.
 
 ## 8. Consequence for teleport
 
@@ -305,33 +331,35 @@ build, by declaring four ungated `anchor_*` modules in
 `daemon/src/lib.rs:28-33`. anchor's integration took teleport's Windows build
 down, and this deferral leaves it down.
 
-**This also reverses the argument against the obvious fix.** `#[cfg(unix)]`
-on the anchor modules was rejected as self-defeating, correctly, *while the
-deletion was going ahead* — gating them is only right if the in-process layer
-stays as the Windows path, and the deletion would have removed it. With
-Windows deferred here, the in-process layer stays. The gate is now simply the
-fix, and it needs nothing from anchor.
+**M6 resolves this, but not quickly, so the two horizons must not be
+conflated.** The decision of 2026-10-19 is that anchord grows a Windows arm
+and teleport relies on it everywhere. That answers the *end state*. It does
+not unbreak teleport's build this week: M6 is gated work with an unsolved
+transport in the middle of it, and teleport's `windows-latest` job is red
+today.
 
-So the options are narrower than they look:
+So the two repos need different answers on different clocks:
 
-- **teleport keeps its in-process layer as the Windows path**, cfg-gates the
-  anchor modules, and the deletion becomes a Unix-only deletion rather than a
-  removal. This restores a build that used to work and depends on nothing
-  here.
-- **teleport states that teleportd is Unix-only too**, and the deletion
-  proceeds as specified — in which case the Windows CI job should be dropped
-  rather than left red, since a permanently failing job is a gate nobody can
-  read.
+- **Now, teleport's call and needing nothing from anchor:** `#[cfg(unix)]`
+  on the four `anchor_*` modules restores a build that worked until
+  `780ff74`. The gate was once rejected as self-defeating because it is only
+  correct while the in-process layer remains the Windows path — and under
+  M6 that is exactly what it remains, until anchord can host a session on
+  Windows. The objection expired; the fix did not.
+- **At the end of M6:** the gate comes off, teleport's Windows path becomes
+  anchord like every other platform, and only then does the in-process
+  deletion become a removal rather than a Unix-only deletion.
 
-Both are teleport's call, not anchor's. What anchor owes them is the fact,
-not the choice: anchord will not host a session on Windows, and no date is
-attached to that changing.
+What anchor owes teleport is the date it does not have: **anchord will not
+host a session on Windows until M6 lands, and M6 has gates rather than an
+estimate.** Nothing in teleport should wait on it that could instead be
+gated on `unix`.
 
-One practical consequence. teleport's deletion spec holds
-`ConptyDsrProbe` and `pty_primitive_windows.rs` as transfers rather than
-deletions, released only once the behaviour is under test in anchor (§5,
-step 3). That gate is now indefinite. If teleport deletes its in-process
-layer and anchor never ports the probe, that code should be preserved
-deliberately — it is the only proven ConPTY exit-handshake work in either
-repo, and §1's negative knowledge is not recoverable by reading the code
-that remains.
+One practical consequence, now resolved in M6's favour. teleport's deletion
+spec holds `ConptyDsrProbe` and `pty_primitive_windows.rs` as transfers
+rather than deletions, released only once the behaviour is under test in
+anchor (§5, step 3). That gate is no longer indefinite — §5 step 3 *is* M6's
+third gate, and it is the step that releases them. Until it fires they must
+be preserved deliberately — it is the only proven ConPTY exit-handshake work
+in either repo, and §1's negative knowledge is not recoverable by reading the
+code that remains.

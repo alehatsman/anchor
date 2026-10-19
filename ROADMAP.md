@@ -109,12 +109,54 @@ teleport's in-process PTY layer.
 
 ---
 
+## M6 — Windows, so teleport can rely on anchor everywhere
+
+Scheduled 2026-10-19, reversing the deferral of 2026-10-16. The costing is
+[docs/09-windows.md](docs/09-windows.md); both of its §7 questions are now
+answered — anchord acquires an **owner-only DACL** on the named pipe rather
+than a token, and Windows is in scope.
+
+Why it came back: teleport is to rely on anchor fully, on every platform it
+ships. While anchord is Unix-only, teleport's in-process PTY layer can never
+be deleted and Windows never gets session survival. The deferral was not
+neutral — it was a permanent cap on the thing anchor exists to do.
+
+Scope, and the order *is* the specification. Each step is gated on the one
+above it ([docs/09-windows.md](docs/09-windows.md) §5):
+
+1. a Windows runner in CI that **executes a deliberately failing test**.
+   Nothing else starts until a red is observable there.
+2. the PTY layer behind `#[cfg(windows)]`, lifted from teleport along with
+   `pty_primitive_windows.rs`. Serialized, or the suite oversubscribes its
+   own runner.
+3. an **ungated** assertion that fails when the Windows fixtures do not
+   execute. A count gate is insufficient: the count is never zero.
+4. transport (named pipe + DACL), CLI console input, ACL permissions.
+5. autostart, **or** a written statement that Windows has no autostart
+   story. Blocked upstream on a real `Access is denied`, so it is last and
+   may legitimately end in the statement.
+
+Step 3 before step 4 is deliberate: the PTY layer carries the invariant that
+an exit is observed exactly once, and it gets defended before breadth is
+piled on top of it.
+
+Exit: **anchord hosts a session on Windows with the same guarantees it makes
+on Unix** — above all that an exit is observed exactly once and reported
+accurately. Then, and only then, teleport's in-process PTY layer becomes
+deletable rather than Unix-only-deletable (#16).
+
+Risk retired, and it is a different shape from M1's. The hard part is
+already free: ConPTY exit detection is solved and proven on real Windows in
+teleport. What is unproven is breadth — the transport has **no prior art in
+either repo**, and anchor acquires an access-control model it has so far
+been able to decline to have. A Windows build where exits are unreliable is
+worse than no Windows build, which is why step 1 is a runner and step 3 is
+a tripwire rather than a count.
+
+---
+
 ## Later, unscheduled
 
-- Windows — **deferred, 2026-10-16**, by decision rather than by blocker.
-  teleport's `#W1` was resolved on 2026-09-05; the cost is specced in
-  [docs/09-windows.md](docs/09-windows.md) and the consequence for
-  teleport is tracked in #16.
 - non-PTY sessions (only with a real consumer — see scope doc)
 - crash survival via per-PTY broker processes (explicitly deferred)
 
@@ -129,4 +171,5 @@ M2  labels      ← the new capability
 M3  protocol    ← the surface
 M4  teleport    ← proof against a real consumer
 M5  flip        ← the payoff, demonstrated
+M6  windows     ← the last platform teleport cannot yet hand over
 ```
