@@ -54,6 +54,26 @@ jobs:
       # Clippy on both too: the platform conditionals live in pty.rs, and a
       # lint that only fires under one cfg is only seen under one runner.
       - run: cargo clippy --all-targets -- -D warnings
+      # `cargo test` is green when a suite is cfg-gated down to nothing -- the
+      # history the comment on the clippy step above describes. Count what
+      # would run, the way scripts/check-citations.py refuses to pass having
+      # found no citations. The floor is deliberately below today's count
+      # (169 on both runners at the time of writing): it exists to catch a suite vanishing, not to
+      # make deleting a test a CI edit. Raise it when the count grows.
+      - name: the suite must not pass by not running
+        shell: bash
+        run: |
+          cargo test -- --list 2>/dev/null | grep ': test$' > tests.list
+          n=$(wc -l < tests.list)
+          echo "$n tests listed on $RUNNER_OS"
+          [ "$n" -ge 140 ] || { echo "::error::only $n tests listed; a suite is gated out"; exit 1; }
+          # The two halves of the disassociate_ctty() split, each on its own OS.
+          case "$RUNNER_OS" in
+            Linux) want=eof_and_exit_are_independent_signals ;;
+            macOS) want=eof_follows_the_session_leaders_exit_even_with_a_live_grandchild ;;
+            *) echo "::error::unexpected runner OS $RUNNER_OS"; exit 1 ;;
+          esac
+          grep -q "^$want: test$" tests.list || { echo "::error::$want is not listed on $RUNNER_OS"; exit 1; }
       - run: cargo test
 
   citations:

@@ -17,16 +17,6 @@ use std::time::{Duration, Instant};
 use anchor::client::Client;
 use serde_json::json;
 
-fn bin(name: &str) -> PathBuf {
-    // target/debug/deps/<test binary> -> target/debug/<name>
-    let mut path = std::env::current_exe().expect("test binary path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join(name)
-}
-
 /// A short-lived data dir under /tmp, kept short enough for a socket path.
 struct DataDir(PathBuf);
 
@@ -54,7 +44,7 @@ struct Daemon(Child);
 
 impl Daemon {
     fn start(dir: &DataDir) -> Self {
-        let child = Command::new(bin("anchord"))
+        let child = Command::new(env!("CARGO_BIN_EXE_anchord"))
             .env("XDG_DATA_HOME", &dir.0)
             .env("XDG_RUNTIME_DIR", dir.0.join("run"))
             .env("ANCHOR_LOG", "warn")
@@ -77,18 +67,27 @@ impl Drop for Daemon {
     }
 }
 
-/// Connects once the socket is accepting, or panics.
-fn connect(socket: &Path) -> Client {
-    let deadline = Instant::now() + Duration::from_secs(10);
+/// Waits for anchord to bind, on the condition rather than on a clock.
+///
+/// A fixed ten-second budget asserts the box was fast, not that the daemon
+/// came up: a cold anchord on a loaded runner takes longer than that, and a
+/// dead one would be reported only after the whole budget ran out. So check
+/// for death directly, and keep the deadline as a backstop against hanging
+/// the suite (docs/08-testing.md; same shape as tests/cli_attach.rs).
+fn connect(daemon: &mut Daemon, socket: &Path) -> Client {
+    let deadline = Instant::now() + Duration::from_secs(120);
     loop {
+        if let Some(status) = daemon.0.try_wait().expect("polling anchord") {
+            panic!("anchord exited before binding its socket: {status}");
+        }
         if let Ok(client) = Client::connect(socket) {
             return client;
         }
         assert!(
             Instant::now() < deadline,
-            "anchord never accepted connections"
+            "anchord is still running but never bound its socket"
         );
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -108,7 +107,7 @@ fn log_bytes(client: &mut Client, id: &str) -> Vec<u8> {
 fn a_sigkilled_daemon_recovers_sessions_as_lost_with_readable_logs() {
     let dir = DataDir::new("lost");
     let mut daemon = Daemon::start(&dir);
-    let mut client = connect(&dir.socket());
+    let mut client = connect(&mut daemon, &dir.socket());
 
     let created = client
         .call(
@@ -146,7 +145,7 @@ fn a_sigkilled_daemon_recovers_sessions_as_lost_with_readable_logs() {
     drop(client);
 
     let mut daemon = Daemon::start(&dir);
-    let mut client = connect(&dir.socket());
+    let mut client = connect(&mut daemon, &dir.socket());
 
     let session = client
         .call("get", json!({ "session": &id }))
@@ -192,9 +191,9 @@ fn a_sigkilled_daemon_recovers_sessions_as_lost_with_readable_logs() {
 fn a_second_daemon_refuses_to_displace_a_live_one() {
     let dir = DataDir::new("single");
     let mut daemon = Daemon::start(&dir);
-    let _client = connect(&dir.socket());
+    let _client = connect(&mut daemon, &dir.socket());
 
-    let second = Command::new(bin("anchord"))
+    let second = Command::new(env!("CARGO_BIN_EXE_anchord"))
         .env("XDG_DATA_HOME", &dir.0)
         .env("XDG_RUNTIME_DIR", dir.0.join("run"))
         .env("ANCHOR_LOG", "error")
@@ -217,7 +216,7 @@ fn a_second_daemon_refuses_to_displace_a_live_one() {
 fn a_second_daemon_does_not_touch_the_live_one_s_sessions() {
     let dir = DataDir::new("no-steal");
     let mut daemon = Daemon::start(&dir);
-    let mut client = connect(&dir.socket());
+    let mut client = connect(&mut daemon, &dir.socket());
 
     let created = client
         .call(
@@ -241,7 +240,7 @@ fn a_second_daemon_does_not_touch_the_live_one_s_sessions() {
     // bind check means an accidental second launch — a stray `anchord` in a
     // shell, a supervisor racing itself — tells the running daemon's
     // clients their sessions are gone while the PTYs are still running.
-    let second = Command::new(bin("anchord"))
+    let second = Command::new(env!("CARGO_BIN_EXE_anchord"))
         .env("XDG_DATA_HOME", &dir.0)
         .env("XDG_RUNTIME_DIR", dir.0.join("run"))
         .env("ANCHOR_LOG", "error")
@@ -280,7 +279,7 @@ fn a_daemon_that_loses_the_bind_never_opens_the_database() {
     let dir = DataDir::new("bind-first");
     let _held = std::os::unix::net::UnixListener::bind(dir.socket()).expect("holding the socket");
 
-    let refused = Command::new(bin("anchord"))
+    let refused = Command::new(env!("CARGO_BIN_EXE_anchord"))
         .env("XDG_DATA_HOME", &dir.0)
         .env("XDG_RUNTIME_DIR", dir.0.join("run"))
         .env("ANCHOR_LOG", "error")
@@ -320,7 +319,7 @@ fn a_signal_during_database_open_is_handled_not_fatal() {
     blocker.execute_batch("BEGIN IMMEDIATE;").expect("lock");
 
     let mut daemon = Daemon::start(&dir);
-    let _client = connect(&dir.socket());
+    let _client = connect(&mut daemon, &dir.socket());
     // Bound and connectable; still stuck behind the lock.
     assert!(
         daemon.0.try_wait().expect("polling anchord").is_none(),

@@ -4,8 +4,8 @@
 //! The part of the offset model that needs no PTY -- deliberately not
 //! `cfg(unix)`-gated, so it stays checkable on any platform anchord is ever
 //! built for, while the fixtures that spawn `/bin/sh` (`session_replay.rs`)
-//! are Unix-only. There is no CI matrix today; this is a property of the
-//! file, not a claim that something runs it elsewhere.
+//! are Unix-only. CI runs it on both ubuntu and macos (.github/workflows/ci.yml);
+//! being ungated is what would let it run anywhere else.
 
 use std::path::PathBuf;
 

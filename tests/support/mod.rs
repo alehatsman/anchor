@@ -73,7 +73,13 @@ pub(crate) async fn catch_up(replay: Replay, round_delay: Duration) -> (Vec<u8>,
 /// stalled/total-round clamp D1's own fixture in `session_catchup.rs`
 /// exercises deliberately. Always paced at `Duration::ZERO`: a storm client
 /// is modeling "reconnect as fast as possible," not a slow network.
-pub(crate) fn catch_up_allow_clamp(replay: Replay) -> (Vec<u8>, Attach, u32) {
+///
+/// `progress` is bumped by every round's byte count, so a caller running many
+/// of these at once can tell "slow" from "stuck" without a total-time budget.
+pub(crate) fn catch_up_allow_clamp(
+    replay: Replay,
+    progress: &std::sync::atomic::AtomicU64,
+) -> (Vec<u8>, Attach, u32) {
     let mut acc = Vec::new();
     let mut next = replay.replay_from;
     let mut rounds = 0u32;
@@ -88,6 +94,7 @@ pub(crate) fn catch_up_allow_clamp(replay: Replay) -> (Vec<u8>, Attach, u32) {
                 assert_eq!(offset, next, "catch-up rounds must be contiguous");
                 next = offset + bytes.len() as u64;
                 acc.extend_from_slice(&bytes);
+                progress.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 rounds += 1;
                 assert!(
                     rounds <= MAX_TEST_ROUNDS,

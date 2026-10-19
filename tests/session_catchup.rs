@@ -1,7 +1,6 @@
 //! **The D1 gate.** Attaching far behind a session that is still producing
 //! must complete -- no `1013`, no gap, no duplicate --
-//! docs/04-protocol.md and
-//! ROADMAP.md
+//! docs/04-protocol.md and the ported M1 fixtures listed in ROADMAP.md.
 //!
 //! The failure this guards against is a livelock, not a crash: register the
 //! subscriber first and it spends its whole queue buffering live output for
@@ -56,7 +55,6 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anchor::model::SpawnSpec;
@@ -84,17 +82,6 @@ const ROUND_LATENCY: Duration = Duration::from_millis(50);
 /// the batch rather than by what `fork` costs on this OS. Only has to be
 /// non-zero now.
 const TICKS_PER_SLEEP: u32 = 4;
-
-fn sessions_root(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "anchor-catchup-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before 1970")
-            .as_nanos()
-    ))
-}
 
 /// A session in exactly the shape D1 is about: a large backlog already on
 /// disk, and a child that is *still emitting* while the client catches up.
@@ -142,7 +129,8 @@ fn spawn_backlog_then_trickle(
 
 #[tokio::test]
 async fn attaching_far_behind_a_producing_session_reaches_live() {
-    let manager = SessionManager::new(sessions_root("d1"));
+    let dir = tempfile::tempdir().expect("a tempdir");
+    let manager = SessionManager::new(dir.path().to_path_buf());
     let session = spawn_backlog_then_trickle(&manager);
 
     // Wait for the backlog to actually exist -- attaching before it does

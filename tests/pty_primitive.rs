@@ -28,12 +28,21 @@ fn temp_dir() -> PathBuf {
 /// chunks into an unbounded `mpsc` channel -- non-blocking `send`, satisfying
 /// the "never block the reader" contract.
 fn spawn_sh(script: &str, cols: u16, rows: u16) -> (pty::SpawnedSession, Receiver<Vec<u8>>) {
+    spawn_sh_in(script, cols, rows, &temp_dir())
+}
+
+/// [`spawn_sh`] with an explicit working directory.
+fn spawn_sh_in(
+    script: &str,
+    cols: u16,
+    rows: u16,
+    cwd: &std::path::Path,
+) -> (pty::SpawnedSession, Receiver<Vec<u8>>) {
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
-    let cwd = temp_dir();
     let spec = SpawnSpec {
         program: "/bin/sh",
         args: &["-c".to_string(), script.to_string()],
-        cwd: &cwd,
+        cwd,
         env: &[],
         cols,
         rows,
@@ -125,8 +134,32 @@ fn contains(acc: &[u8], needle: &str) -> bool {
 #[test]
 fn echo_roundtrip() {
     let (spawned, out_rx) = spawn_interactive_sh(24, 80);
-    spawned.session.write(b"echo hello\n").unwrap();
+    // The line discipline echoes what is typed before the shell runs
+    // anything, so asking for "hello" back would be satisfied by the echo
+    // alone. The quotes make the output differ from the input: only
+    // execution turns `hel''lo` into `hello`.
+    spawned.session.write(b"echo hel''lo\n").unwrap();
     recv_until(&out_rx, DEFAULT_TIMEOUT, |acc| contains(acc, "hello"));
+}
+
+/// `docs/01-scope.md` lists the working directory in the spawn spec. Every
+/// other fixture hands `temp_dir()` to a child nobody asks where it is, so
+/// without this one deleting the `cwd` line from `pty::spawn` is green.
+#[test]
+fn the_child_runs_in_the_requested_directory() {
+    let dir = tempfile::tempdir().expect("a tempdir");
+    // Canonicalised: on macOS the tempdir is under /var, a symlink to
+    // /private/var, and `pwd -P` reports the real path.
+    let want = dir.path().canonicalize().expect("canonical tempdir");
+    let (_spawned, out_rx) = spawn_sh_in("echo CWD:$(pwd -P):END", 80, 24, dir.path());
+    let acc = recv_until(&out_rx, DEFAULT_TIMEOUT, |acc| contains(acc, ":END"));
+    let text = String::from_utf8_lossy(&acc);
+    let printed = text
+        .split("CWD:")
+        .nth(1)
+        .and_then(|rest| rest.split(":END").next())
+        .expect("the child should have printed its directory");
+    assert_eq!(std::path::Path::new(printed), want);
 }
 
 #[test]
@@ -184,20 +217,27 @@ fn large_burst_read_drops_nothing() {
 
 #[test]
 fn resize_is_observed_by_the_child() {
-    let (spawned, out_rx) = spawn_interactive_sh(24, 80);
+    let (spawned, out_rx) = spawn_interactive_sh(80, 24);
     spawned.session.resize(120, 40).unwrap();
     // resize() hands off to the control thread and returns immediately
     // (docs/03-pty.md#resize-and-the-control-lease: "short and non-blocking") -- it carries
-    // no ack, so give it a moment to land before asking the child to query
-    // its size, rather than racing the control thread against the writer
-    // thread on two independent channels.
-    std::thread::sleep(Duration::from_millis(200));
-    spawned.session.write(b"stty size\n").unwrap();
-    let acc = recv_until(&out_rx, DEFAULT_TIMEOUT, |acc| contains(acc, "40 120"));
-    assert!(
-        contains(&acc, "40 120"),
-        "stty size should report the resized rows/cols"
-    );
+    // no ack. So ask until the answer changes, rather than guessing how long
+    // landing takes: the first reply may still be the old size.
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    loop {
+        spawned.session.write(b"stty size\n").unwrap();
+        let acc = recv_until(&out_rx, DEFAULT_TIMEOUT, |acc| {
+            contains(acc, "24 80") || contains(acc, "40 120")
+        });
+        if contains(&acc, "40 120") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child never saw the resize; its size is still 24 80"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -317,11 +357,8 @@ fn eof_and_exit_are_independent_signals() {
         .exit_rx
         .recv_timeout(DEFAULT_TIMEOUT)
         .expect("exit_rx should fire promptly");
-    let exit_latency = t0.elapsed();
-    assert!(
-        exit_latency < Duration::from_millis(500),
-        "wait() should not wait on the grandchild: took {exit_latency:?}"
-    );
+    // No latency bound on the exit: what shows wait() did not wait on the
+    // grandchild is the liveness probe below finding it still running.
     assert_eq!(exit.status.unwrap().exit_code(), 0);
 
     let acc = recv_until(&out_rx, DEFAULT_TIMEOUT, |acc| {
@@ -371,16 +408,12 @@ fn eof_follows_the_session_leaders_exit_even_with_a_live_grandchild() {
         80,
     );
 
-    let t0 = Instant::now();
     let exit = spawned
         .exit_rx
         .recv_timeout(DEFAULT_TIMEOUT)
         .expect("exit_rx should fire promptly");
-    let exit_latency = t0.elapsed();
-    assert!(
-        exit_latency < Duration::from_millis(500),
-        "wait() should not wait on the grandchild: took {exit_latency:?}"
-    );
+    // No latency bound on the exit: what shows wait() did not wait on the
+    // grandchild is the liveness probe below finding it still running.
     assert_eq!(exit.status.unwrap().exit_code(), 0);
 
     // The pid still reaches us despite the revoke: XNU drains the tty before
@@ -402,11 +435,6 @@ fn eof_follows_the_session_leaders_exit_even_with_a_live_grandchild() {
         .eof_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("EOF should follow the session leader's exit, well inside the grandchild's sleep");
-    let eof_latency = t0.elapsed();
-    assert!(
-        eof_latency < Duration::from_secs(2),
-        "EOF should coincide with the session leader's exit on macOS, not lag it: {eof_latency:?}"
-    );
 
     // SAFETY: kill(pid, 0) is a pure liveness probe, sends no signal.
     let rc = unsafe { libc::kill(pid, 0) };
@@ -451,7 +479,7 @@ fn terminate_reaches_exited_within_the_bounded_policy() {
 #[test]
 fn terminate_hard_kills_a_child_that_ignores_hup_and_term() {
     let (spawned, out_rx) = spawn_sh(
-        "trap '' HUP TERM; echo TRAPPED; while :; do sleep 1; done",
+        "trap '' HUP TERM; echo TRAPPED; i=0; while [ $i -lt 120 ]; do sleep 1; i=$((i+1)); done",
         24,
         80,
     );

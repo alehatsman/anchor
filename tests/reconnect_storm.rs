@@ -1,5 +1,5 @@
 //! N4 -- reconnect-storm load test
-//! (ROADMAP.md).
+//! (listed under M1 in ROADMAP.md).
 //!
 //! Catch-up ([04](../../docs/04-protocol.md))
 //! reads history off the same `Mutex<Fanout>` the PTY reader thread locks on every
@@ -29,7 +29,7 @@
 //! invisible there) and un-gated all three to `cfg(unix)`. Rather than
 //! re-guess, measured on real macOS hardware (Darwin 24.6.0, arm64): 20/20
 //! green, 6.77-6.84s wall clock, storm/baseline ratio 0.966-1.094 -- no
-//! measurable degradation, and nowhere near `STORM_CLIENT_TIMEOUT`.
+//! measurable degradation, and nowhere near `STORM_STALL`.
 //!
 //! It ports because of how this fixture is built, which is worth stating so
 //! the gate is not reintroduced by reflex: the hard assertions are invariants
@@ -47,7 +47,7 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -55,14 +55,15 @@ use anchor::model::SpawnSpec;
 use anchor::session::{Session, SessionManager};
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
-/// Bound on how long any one storm client's whole catch-up may take. A
-/// client that is definitively losing ground is expected to hit
-/// `MAX_STALLED_ROUNDS` (session/replay.rs) and register within a handful of
-/// rounds; this is a loud, bounded backstop against the pathological case --
-/// a client that keeps gaining a little ground every round without ever
-/// converging -- rather than an open-ended `.await` that hangs CI if the
-/// clamp logic itself regresses.
-const STORM_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the storm as a whole may go without ANY client catching up
+/// another byte. Not a budget for the catch-up: 40 clients each replaying
+/// 12 MiB takes as long as the machine takes, and a total deadline would
+/// measure that rather than whether anything is stuck. A client that is
+/// definitively losing ground is expected to hit `MAX_STALLED_ROUNDS`
+/// (session/replay.rs) and register within a handful of rounds; this is the
+/// loud, bounded backstop if the clamp logic itself regresses and the storm
+/// simply stops moving.
+const STORM_STALL: Duration = Duration::from_secs(10);
 /// How long to measure the control subscriber's throughput before, and then
 /// during, the storm. Long enough to average out scheduling noise, short
 /// enough that CI doesn't pay minutes for a measurement fixture.
@@ -81,17 +82,6 @@ const STORM_SIZE: usize = 40;
 /// the per-client work this fixture wants `STORM_SIZE` clients doing
 /// concurrently.
 const BACKLOG: u64 = 12 * 1024 * 1024;
-
-fn sessions_root(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "anchor-reconnect-storm-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before 1970")
-            .as_nanos()
-    ))
-}
 
 /// A session with a static `BACKLOG`-byte backlog already on disk, followed
 /// by a slow, bounded trickle -- exactly `session_catchup.rs`'s own
@@ -183,7 +173,8 @@ async fn drain_for(
 /// of the real CI run this needs (`cargo test -- --nocapture`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn control_subscriber_survives_a_concurrent_reconnect_storm() {
-    let manager = SessionManager::new(sessions_root("n4"));
+    let dir = tempfile::tempdir().expect("a tempdir");
+    let manager = SessionManager::new(dir.path().to_path_buf());
     let session = spawn_hot_session(&manager);
 
     // Wait for the *entire* backlog to land before anyone attaches -- not
@@ -230,12 +221,17 @@ async fn control_subscriber_survives_a_concurrent_reconnect_storm() {
     // makes one lose ground -- that is an acceptable outcome, not what this
     // fixture is checking; only the control subscriber's own survival and
     // continuity are asserted.
+    let progress = Arc::new(AtomicU64::new(0));
     let storm_tasks: Vec<_> = (0..STORM_SIZE)
         .map(|_| {
             let session = Arc::clone(&session);
-            tokio::spawn(async move {
+            let progress = Arc::clone(&progress);
+            // Blocking work, so on the blocking pool: as plain tasks, a client
+            // that got stuck would hold a worker, and enough of them would
+            // starve the very loop below that is there to notice.
+            tokio::task::spawn_blocking(move || {
                 let replay = session.attach(0).expect("storm client attach");
-                let (_acc, _attach, rounds) = support::catch_up_allow_clamp(replay);
+                let (_acc, _attach, rounds) = support::catch_up_allow_clamp(replay, &progress);
                 rounds
             })
         })
@@ -252,11 +248,24 @@ async fn control_subscriber_survives_a_concurrent_reconnect_storm() {
     )
     .await;
 
+    // Wait for every client, failing only if the storm as a whole stops
+    // moving: the deadline resets whenever any client catches up more bytes.
+    let mut seen = 0;
+    let mut stall_deadline = Instant::now() + STORM_STALL;
+    while !storm_tasks.iter().all(|t| t.is_finished()) {
+        let now_seen = progress.load(Ordering::Relaxed);
+        if now_seen > seen {
+            seen = now_seen;
+            stall_deadline = Instant::now() + STORM_STALL;
+        }
+        assert!(
+            Instant::now() < stall_deadline,
+            "no storm client made progress for {STORM_STALL:?} ({seen} bytes caught up in all)"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     for task in storm_tasks {
-        tokio::time::timeout(STORM_CLIENT_TIMEOUT, task)
-            .await
-            .expect("a storm client did not converge within the bounded timeout")
-            .expect("storm client task panicked");
+        task.await.expect("storm client task panicked");
     }
 
     // The invariant: the control subscriber was never disconnected and never

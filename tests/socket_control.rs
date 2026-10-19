@@ -289,11 +289,10 @@ async fn an_oversized_line_is_answered_then_the_connection_is_closed() {
     let mut client = Client::connect(&socket);
 
     // Well-formed JSON, just far too much of it: the size is what is being
-    // refused, not the contents.
-    // Well-formed JSON, just far too much of it: the size is what is being
-    // refused, not the contents.
+    // refused, not the contents. (A raw string would have kept `\n` as two
+    // literal characters; the terminator is appended as a real newline.)
     let padding = "x".repeat(2 * 1024 * 1024);
-    let line = format!(r#"{{"id":7,"op":"ping","pad":"{padding}"}}\n"#);
+    let line = format!(r#"{{"id":7,"op":"ping","pad":"{padding}"}}"#) + "\n";
 
     // The write is expected to fail partway: the daemon answers and closes
     // at the cap, long before the client has finished sending. A client
