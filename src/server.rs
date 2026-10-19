@@ -4,6 +4,12 @@
 //! 0600: filesystem permissions are the security boundary, so there is no
 //! auth and no TCP.
 //!
+//! **Anything that can wait on disk, a child process or a blocked pty goes
+//! through `spawn_blocking`.** A worker held by one connection stalls every
+//! other connection scheduled on it. `create` (it may run the login shell),
+//! `terminate`, `purge` and `log` follow the rule; the attached connection's
+//! input path is in `stream.rs`.
+//!
 //! [`bind`] is deliberately synchronous and returns a `std` listener, so a
 //! caller can claim the socket — and fail loudly if another daemon already
 //! holds it — before any runtime exists. [`serve`] adopts it.
@@ -405,7 +411,7 @@ async fn dispatch(line: &str, state: &State) -> Value {
 
     match request.op.as_str() {
         "ping" => proto::ok(request.id, json!({ "pong": true })),
-        "create" => op_create(request.id, line, state),
+        "create" => op_create(request.id, line, state).await,
         "list" => op_list(request.id, line, state),
         "get" => op_get(request.id, line, state),
         "label" => op_label(request.id, line, state),
@@ -441,7 +447,7 @@ struct CreateReq {
     labels: BTreeMap<String, String>,
 }
 
-fn op_create(id: u64, line: &str, state: &State) -> Value {
+async fn op_create(id: u64, line: &str, state: &State) -> Value {
     let req: CreateReq = match parse(id, line) {
         Ok(r) => r,
         Err(e) => return e,
@@ -451,7 +457,17 @@ fn op_create(id: u64, line: &str, state: &State) -> Value {
         Err(e) => return proto::error(id, ErrorCode::InvalidSpec, format!("resolving cwd: {e}")),
     };
 
-    match state.manager.create(&spec, req.labels) {
+    // Off the worker: `create` may run the user's login shell to completion
+    // to resolve the command, then writes the store and opens the pty. A
+    // slow `.zshrc` would otherwise hold a runtime worker, and every other
+    // connection on it, for as long as the shell takes to start.
+    let manager = Arc::clone(&state.manager);
+    let labels = req.labels;
+    let created = match tokio::task::spawn_blocking(move || manager.create(&spec, labels)).await {
+        Ok(created) => created,
+        Err(e) => return proto::error(id, ErrorCode::Internal, format!("create: {e}")),
+    };
+    match created {
         Ok(session) => proto::ok(
             id,
             json!({
