@@ -19,15 +19,15 @@
 //! mutate the process-wide `SHELL` var -- cargo runs the #[test] fns *within*
 //! one file's binary in parallel, and this file has exactly one, so there is
 //! nothing else in this process for that mutation to race against. Same
-//! tradeoff `pty_term_default.rs` and `presets.rs` already accepted rather
-//! than pulling in a serialization dependency.
+//! tradeoff `pty_term_default.rs` already accepted rather than pulling in
+//! a serialization dependency.
 
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anchor::pty::{self, SpawnSpec};
 
@@ -102,22 +102,18 @@ fn spawn(
     (spawned, out_rx)
 }
 
+/// Collects output until `pred` holds, failing only if the child goes
+/// `stall` without producing anything. A total-elapsed deadline would
+/// measure how fast this machine runs a cold `/bin/sh` (a login shell reads
+/// the user's profile first), not whether the output ever arrives.
 fn recv_until(
     rx: &Receiver<Vec<u8>>,
-    timeout: Duration,
+    stall: Duration,
     mut pred: impl FnMut(&[u8]) -> bool,
 ) -> String {
-    let deadline = Instant::now() + timeout;
     let mut acc = Vec::new();
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "timed out waiting for predicate; got {} bytes: {:?}",
-            acc.len(),
-            String::from_utf8_lossy(&acc)
-        );
-        match rx.recv_timeout(remaining) {
+        match rx.recv_timeout(stall) {
             Ok(chunk) => {
                 acc.extend_from_slice(&chunk);
                 if pred(&acc) {
@@ -125,7 +121,7 @@ fn recv_until(
                 }
             }
             Err(e) => panic!(
-                "output channel closed before predicate matched ({e}); got {} bytes: {:?}",
+                "no output for {stall:?} before the predicate matched ({e}); got {} bytes: {:?}",
                 acc.len(),
                 String::from_utf8_lossy(&acc)
             ),
