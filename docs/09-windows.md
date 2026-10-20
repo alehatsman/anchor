@@ -1,16 +1,16 @@
 # 09 — Windows
 
-Status: **implemented, 2026-10-20, on branch `feat/windows-m6`; every gate
-run on a real Windows 11 Pro box (build 26200), as a standard
-non-elevated user.** Scheduled as M6 on 2026-10-19, reversing the deferral
-of 2026-10-16. Not yet merged, and **the Windows CI job has not yet run on
-GitHub** — the branch is unpushed. Everything below that says "verified"
-means verified on that box, by the commands or tests named beside it; the
-CI job runs the same steps.
+Status: **done, merged to main 2026-10-20 (#33); every gate run on a real
+Windows 11 Pro box (build 26200), as a standard non-elevated user, and the
+Windows CI job green on GitHub.** Scheduled as M6 on 2026-10-19, reversing
+the deferral of 2026-10-16. Everything below that says "verified" means
+verified on that box, by the commands or tests named beside it; the CI job
+runs the same steps, and its first runs caught two things the box could not
+(§5, gate 1).
 
 | §5 gate | state | how it was checked |
 |---|---|---|
-| 1. a Windows runner that can go red | job written | its steps run locally: `cargo clippy` failed with 39 errors before any port |
+| 1. a Windows runner that can go red | done | its steps run locally: `cargo clippy` failed with 39 errors before any port; on GitHub, red twice on the PR, then green |
 | 2. the PTY layer | done | `tests/pty_primitive_windows.rs`, 12 fixtures, real ConPTY; revert-checked |
 | 3. the fixtures cannot pass by not running | done | a ledger plus an ungated checker; red on an early return and on a gated-out module |
 | 4. transport, console input, permissions | done | `tests/windows_transport.rs`, `client.rs` unit tests, `icacls`; revert-checked |
@@ -449,14 +449,24 @@ behaviour is **under test in anchor**. That gate is this document's step 3.
 ### As it landed, 2026-10-20
 
 Each gate is its own commit on `feat/windows-m6`, in this order, and each
-was run on the Windows box before the next began.
+was run on the Windows box before the next began. The branch merged as #33.
 
 1. **The runner.** `.github/workflows/ci.yml`'s `windows` job. Before any
    port its steps failed on this box at `cargo clippy` — 39 compile errors —
    which is a red, but one from the build rather than from an executed
    test. That is the one way this gate is weaker than written: the lib did
-   not compile on Windows, so no test could run to fail until step 2. The
-   job has not run on GitHub; the branch is unpushed.
+   not compile on Windows, so no test could run to fail until step 2.
+   On GitHub the job then went red on executed tests, twice, for runner
+   differences the box could not show, before going green. First,
+   `the_child_runs_in_the_requested_directory`: the runner's `TEMP` is
+   spelled with an 8.3 short name (`runner~1`), so the child's `cd` printed
+   a different string for the same directory; the fixture now compares
+   canonical paths (`6397968`). Second, two permission tests on a correct
+   descriptor: the runner is the built-in Administrator (RID 500), which
+   SDDL writes as the alias `LA` rather than the SID string; the tests now
+   ask how SDDL spells this user (`c8398cc`). The same PR run also caught a
+   Linux reset race on an oversized line, present on main before it
+   (`09b3900`).
 2. **The PTY layer.** Twelve fixtures, serialized on a lock. Every wait is
    a stall bound rather than teleport's 30 s / 60 s volume budgets
    ([08-testing.md](08-testing.md)). With `ConptyDsrProbe` removed, `exit 0`
@@ -495,7 +505,7 @@ built. What it still does not buy:
   handled and unwind cleanly; `TerminateProcess` — Task Manager, `taskkill
   /F`, `uninstall` — cannot be caught, so the periodic fsync bounds the
   loss, as SIGKILL does on Unix.
-- **An observed logon trigger** (§4.7) and **an observed CI run** (gate 1).
+- **An observed logon trigger** (§4.7).
 
 ## 7. The two questions, answered 2026-10-19
 
@@ -607,11 +617,9 @@ code that remains.
 
 ### Where this stands, 2026-10-20
 
-**The anchor side of "at the end of M6" exists, on a branch.** anchord
+**The anchor side of "at the end of M6" exists, on main** (#33). anchord
 hosts sessions on Windows, so the reason for teleport's `unix` gate on its
-`anchor_*` modules expires when `feat/windows-m6` merges — not before,
-because until then the anchord a teleport build would find is one that
-refuses to run on Windows.
+`anchor_*` modules has expired; lifting it is teleport's call.
 
 What teleport's Windows client needs is one page:
 [04-protocol.md](04-protocol.md#windows-a-named-pipe). The wire protocol is
@@ -621,7 +629,6 @@ differs. tokio's `ClientOptions` already opens at
 
 **§5 step 3 has fired.** `ConptyDsrProbe` and `pty_primitive_windows.rs`
 are under test here, with a tripwire against their silently not running,
-so teleport's transfer-not-delete hold on them can be released once this
-merges. Both keep their teleport provenance in their doc comments, and the
-negative knowledge in §1 is restated in the fixture file's module doc
+so teleport's transfer-not-delete hold on them can be released. Both keep
+their teleport provenance in their doc comments, and the negative knowledge in §1 is restated in the fixture file's module doc
 rather than left to be rediscovered.

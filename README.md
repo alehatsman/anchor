@@ -26,11 +26,10 @@ noticed. That is the entire pitch.
 `use_anchor=true`. That flag is opt-in: teleport's default is still its
 in-process PTY layer (`use_anchor: false`, teleport `daemon/src/config.rs:140`,
 as of teleport `d7f34e9`), and flipping it is not yet scheduled. **M6 —
-Windows — is implemented on `feat/windows-m6`** and every gate of it was
-run on a real Windows 11 box: anchord serves a named pipe with an
-owner-only DACL, and hosts ConPTY sessions whose exit is observed exactly
-once with the code the child exited with. Not yet merged, and the Windows
-CI job has not yet run on GitHub
+Windows — is done**, merged 2026-10-20 (#33): every gate of it was run on
+a real Windows 11 box, and the Windows CI job is green on GitHub. anchord
+serves a named pipe with an owner-only DACL, and hosts ConPTY sessions
+whose exit is observed exactly once with the code the child exited with
 ([docs/09-windows.md](docs/09-windows.md)).
 
 `anchord` owns real PTY
@@ -60,12 +59,13 @@ noticed. See
 
 ```sh
 cargo test                # ported fixtures, protocol, CLI, restart recovery
-                          # CI runs this on Linux and macOS both: they differ
-                          # in ways the suite has already caught
+                          # CI runs this on Linux, macOS and Windows: they
+                          # differ in ways the suite has already caught
 cargo run --bin anchord   # or: anchor daemon
 
-anchor service install    # register anchord with launchd/systemd, so it
-                          # outlives every client (docs/07-lifecycle.md)
+anchor service install    # register anchord with launchd/systemd, or Task
+                          # Scheduler on Windows, so it outlives every
+                          # client (docs/07-lifecycle.md)
 anchor service status
 ```
 
@@ -73,7 +73,8 @@ anchor service status
 client has the client's lifetime, which is the whole property anchor exists
 to break. `anchor service install` registers it with the user's own service
 manager instead — a launchd user agent on macOS, a systemd user unit on
-Linux, both login-scoped and needing no root.
+Linux, a per-user scheduled task on Windows, all login-scoped and needing
+no root.
 
 It is being extracted from [teleport](https://github.com/alehatsman/teleport),
 which already runs this subsystem in production as part of a larger product.

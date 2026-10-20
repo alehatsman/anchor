@@ -27,7 +27,8 @@ sensible candidate is the OS's own per-user service manager.
 anchor service install     register anchord with the user's service manager
 anchor service uninstall   remove it
 anchor service status      what is registered; on macOS, only whether it is loaded
-                           in launchd (not whether anchord is running)
+                           in launchd (not whether anchord is running); on
+                           Windows, whether anchord answers on this user's pipe
 ```
 
 - **macOS** — a launchd **user agent** in `~/Library/LaunchAgents`.
@@ -83,7 +84,7 @@ client restarts and reconnects by offset
 
 ## Stopping
 
-Both service managers stop a service by sending **SIGTERM** and escalating to
+launchd and systemd both stop a service by sending **SIGTERM** and escalating to
 SIGKILL if it does not go. anchord therefore has to treat SIGTERM as an
 instruction, not an accident: it stops accepting, lets the runtime unwind,
 and **exits 0**. SIGINT is handled identically, because a daemon run in the
