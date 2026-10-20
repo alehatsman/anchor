@@ -126,13 +126,15 @@ until Windows has an anchord it is a deletion teleport cannot afford.
 
 ## M6 — Windows, so teleport can rely on anchor everywhere
 
-> **Implemented 2026-10-20 on `feat/windows-m6`; not yet merged.** All five
-> steps landed in order, one commit each, every one run on a real Windows
-> 11 Pro box (build 26200) as a standard user before the next began:
+> **Done 2026-10-20, merged as #33.** All five steps landed in order, one
+> commit each, every one run on a real Windows 11 Pro box (build 26200) as
+> a standard user before the next began:
 >
 > 1. the `windows` CI job — red before the port (39 compile errors) when
->    its steps were run on that box; **not yet observed on GitHub**, the
->    branch being unpushed
+>    its steps were run on that box; on GitHub it went red twice on the PR
+>    for things that box could not show (an 8.3 short path in the runner's
+>    `TEMP`, and SDDL spelling the runner's built-in Administrator as `LA`),
+>    then green
 > 2. the ConPTY layer and `tests/pty_primitive_windows.rs`, 12 fixtures;
 >    removing `ConptyDsrProbe` reproduces `#W1`, and a fixture the donor
 >    lacked tells the graceful step from the hard kill
@@ -152,7 +154,7 @@ until Windows has an anchord it is a deletion teleport cannot afford.
 > quiet, found still running, reattached with its scrollback, and its exit
 > observed exactly once with the code the child exited with — an `NTSTATUS`
 > above `i32::MAX` included. Windows suite green; the Linux suite unchanged
-> and green (WSL). What remains is merge, a green GitHub run, and then
+> and green (WSL); all three CI platforms green on GitHub. What remains is
 > teleport's side: lifting its `unix` gate and the in-process deletion.
 > Detail and evidence: [docs/09-windows.md](docs/09-windows.md).
 

@@ -371,10 +371,12 @@ exceeds it is closed the same way and for the same reason.
 A thin client over the same socket, for humans and scripts.
 
 ```text
-anchor ls [--label k=v]...        list sessions
+anchor ls [--label k=v]... [--json]
+                                  list sessions
 anchor create -- <cmd> [args]     spawn (--cwd, --label, --size, --login-shell)
 anchor get <id>                   one session as JSON
 anchor attach <id>                raw-mode passthrough, ~. to detach
+                                  (--observe: no control lease; --from N)
 anchor logs <id> [--from N]       dump output
 anchor kill <id>                  terminate
 anchor purge <id>                 forget: row, labels and output
@@ -383,6 +385,10 @@ anchor daemon                     run anchord in the foreground
 anchor service install|uninstall|status
                                   register anchord with the user's
                                   service manager (07-lifecycle.md)
+
+--socket <path>                   on any command: the socket to connect to, or
+                                  for `daemon` to bind; `service` ignores it.
+                                  On Windows a pipe path, \\.\pipe\<name>
 ```
 
 A `terminate` reply normally means the child is dead **and** the exit is

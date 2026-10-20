@@ -87,8 +87,8 @@ jobs:
     # the unix-only `pty` module, `tokio::net::UnixStream`, termios,
     # `PermissionsExt`). Reproduced by running these steps on a real Windows
     # 11 box (build 26200). Every later gate was run there the same way
-    # before it was committed; the first run of this job on GitHub is still
-    # to come.
+    # before it was committed. On GitHub it then caught two runner
+    # differences that box could not show (docs/09-windows.md §5, gate 1).
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
