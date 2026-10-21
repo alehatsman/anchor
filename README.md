@@ -1,5 +1,9 @@
 # anchor
 
+[![ci](https://github.com/alehatsman/anchor/actions/workflows/ci.yml/badge.svg)](https://github.com/alehatsman/anchor/actions/workflows/ci.yml)
+
+![A stone anchor with a lit terminal set into its ring, three translucent terminal windows tethered to it by glowing lines, beside the words "anchor - clients come and go, processes stay"](docs/hero.png)
+
 A local daemon that owns long-running PTY processes so the things watching them
 can come and go.
 
