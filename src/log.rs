@@ -120,7 +120,12 @@ pub struct OutputLog {
     /// Shared with every [`SyncHandle`] handed out for this log, so the
     /// background syncer flushes the same open file without taking the
     /// caller's lock. Writes go through `&File`, which is `Write`.
-    file: Arc<File>,
+    ///
+    /// `None` once the writer has been released at EOF. The log stays fully
+    /// readable — `reader()` opens the path, never this handle — so what is
+    /// given up is only the ability to append, which EOF has already made
+    /// impossible (docs/02-model.md).
+    file: Option<Arc<File>>,
     limits: LogLimits,
     /// Authoritative output offset. Never rewinds -- not on a cap, not across
     /// a restart (docs/02-model.md#startup-sequence).
@@ -165,7 +170,7 @@ impl OutputLog {
 
         Ok(Self {
             path,
-            file: Arc::new(file),
+            file: Some(Arc::new(file)),
             limits,
             next_offset: file_len,
             file_len,
@@ -195,9 +200,20 @@ impl OutputLog {
             let fits = room.min(bytes.len());
 
             if fits > 0 {
-                match (&*self.file).write_all(&bytes[..fits]) {
-                    Ok(()) => self.file_len += fits as u64,
-                    Err(e) => self.fail(&mut events, &e),
+                match self.file.as_deref() {
+                    Some(file) => match (&*file).write_all(&bytes[..fits]) {
+                        Ok(()) => self.file_len += fits as u64,
+                        Err(e) => self.fail(&mut events, &e),
+                    },
+                    // The writer is released at EOF, where no byte can
+                    // follow. A byte arriving afterwards means that
+                    // guarantee broke upstream, and this module's rule is
+                    // that a hole is recorded rather than silently
+                    // interleaved into a stream whose offsets are an index.
+                    None => self.fail(
+                        &mut events,
+                        &io::Error::other("append after the log writer was released"),
+                    ),
                 }
             }
 
@@ -256,11 +272,21 @@ impl OutputLog {
     /// A handle for flushing this log to disk from somewhere that is not the
     /// reader thread -- see [`LogSyncer`]. Cheap; hand one to whoever needs
     /// to sync on close.
-    pub fn sync_handle(&self) -> SyncHandle {
-        SyncHandle {
-            file: Arc::clone(&self.file),
+    pub fn sync_handle(&self) -> Option<SyncHandle> {
+        Some(SyncHandle {
+            file: Arc::clone(self.file.as_ref()?),
             path: self.path.clone(),
-        }
+        })
+    }
+
+    /// Releases the write handle. Called at EOF, where this module's own
+    /// precondition — no byte will ever follow — is already established.
+    ///
+    /// The descriptor closes once the last [`SyncHandle`] for it is gone
+    /// too; both own the same open file. Replay is unaffected, because
+    /// [`reader`](Self::reader) opens `path`. Idempotent.
+    pub fn close_writer(&mut self) {
+        self.file = None;
     }
 
     /// Persistence stopped and it is not coming back for this log. Setting
@@ -279,7 +305,11 @@ impl OutputLog {
         // really there, or the cap understates the file and `file_length ==
         // min(next_offset, log_capped_at)` is false on exactly the failure
         // this module exists to handle.
-        self.file_len = self.file.metadata().map_or(self.file_len, |m| m.len());
+        self.file_len = self
+            .file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map_or(self.file_len, |m| m.len());
         self.log_capped_at = Some(self.file_len);
         events.push(LogEvent::IoError {
             at: self.file_len,
@@ -481,7 +511,7 @@ mod tests {
 
         // Swap in a read-only handle to the same file: writes now fail the
         // way a full disk or a revoked mount would, without needing either.
-        log.file = Arc::new(File::open(log.path()).expect("reopen read-only"));
+        log.file = Some(Arc::new(File::open(log.path()).expect("reopen read-only")));
 
         let appended = log.append(b"and the ones that did not");
         assert_eq!(appended.start, 22, "the offset is still handed out");
@@ -534,7 +564,7 @@ mod tests {
         let syncer = LogSyncer::new(Duration::from_millis(20));
 
         let mut log = OutputLog::open(&dir, LogLimits::default()).expect("open");
-        syncer.register(&log.sync_handle());
+        syncer.register(&log.sync_handle().expect("an open log yields a sync handle"));
         log.append(b"flush me");
 
         std::thread::sleep(Duration::from_millis(80));

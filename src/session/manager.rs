@@ -127,8 +127,13 @@ impl SessionManager {
         let created_at = crate::now_ms();
 
         let log = OutputLog::open(&self.root.join(&id), self.limits)?;
+        // A log opened for writing always yields a handle; the `None` arm
+        // only exists for one already released at EOF.
         let sync = log.sync_handle();
-        self.syncer.register(&sync);
+        if let Some(sync) = &sync {
+            self.syncer.register(sync);
+        }
+        let sync = Mutex::new(sync);
         let fanout = Arc::new(Mutex::new(Fanout::new(log)));
 
         // The row exists before the child can produce a byte. Best effort: a
@@ -209,7 +214,7 @@ impl SessionManager {
             id: id.clone(),
             spec: spec.clone(),
             labels: Mutex::new(labels),
-            pty: spawned.session,
+            pty: Mutex::new(Some(spawned.session)),
             pid: spawned.pid,
             fanout,
             runtime: Mutex::new(Runtime {
@@ -481,6 +486,13 @@ fn spawn_exit_listener(
                 runtime.lost_reason = reason;
                 runtime.exited_at = Some(exited_at);
             }
+            // Step 7 of docs/03-pty.md#termination, and the reason it is a
+            // step: the record outlives the process by design and stays
+            // listed until an explicit purge, so leaving release to whoever
+            // drops the record last binds a PTY's lifetime to a caller's
+            // bookkeeping. Taken after the `runtime` guard above has gone
+            // out of scope -- these two locks are never nested (anchor#19).
+            session.release_pty();
             session.sync_log();
 
             if let Some(store) = &store {
@@ -520,6 +532,12 @@ fn spawn_eof_listener(
             // from somewhere else, which is exactly the kind of implicit
             // contract that gets a trailing chunk dropped.
             session.close_subscribers();
+
+            // The log half of docs/03-pty.md#termination step 7, and it
+            // belongs here rather than beside the PTY half: EOF is the point
+            // where no byte can follow, and `EXITED` is not — a descendant
+            // holding the master outlives the child it was forked from.
+            session.release_log_writer();
         })
         .map(|_| ())
 }
