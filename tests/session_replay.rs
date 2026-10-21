@@ -265,10 +265,19 @@ async fn repeated_attach_against_a_concurrent_writer_never_gaps() {
 }
 
 /// A client holding an offset the daemon never handed out -- a purged log, or
-/// a stale client after a `lost` session. Error, not a panic, and it reports
-/// where the daemon actually is (docs/04-protocol.md).
+/// a stale client after a `lost` session. `AttachError::OffsetAhead`, not a
+/// panic, and it reports where the daemon actually is.
+///
+/// `next_offset` itself is the boundary and is *legal*: both halves are here
+/// because an off-by-one either way is the mistake worth catching, and only
+/// the pair pins which side the head falls on.
+///
+/// This is the library call, so what it observes is the error variant. The
+/// wire refusal is a separate decision made by `attach_check`
+/// (`src/server.rs`) before this is ever reached, and it answers
+/// `invalid_spec` (docs/04-protocol.md).
 #[tokio::test]
-async fn attaching_past_next_offset_is_offset_ahead() {
+async fn attaching_past_next_offset_is_refused_and_at_it_replays_nothing() {
     const BURST: u64 = 1024;
 
     let dir = tempfile::tempdir().expect("a tempdir");
