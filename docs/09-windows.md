@@ -4,9 +4,11 @@ Status: **done, merged to main 2026-10-20 (#33); every gate run on a real
 Windows 11 Pro box (build 26200), as a standard non-elevated user, and the
 Windows CI job green on GitHub.** Scheduled as M6 on 2026-10-19, reversing
 the deferral of 2026-10-16. Everything below that says "verified" means
-verified on that box, by the commands or tests named beside it; the CI job
-runs the same steps, and its first runs caught two things the box could not
-(§5, gate 1).
+verified on that box, by the commands or tests named beside it. The CI job
+runs the same steps but not as the same user: GitHub's runner is the
+built-in Administrator (RID 500), not a standard user, so the standard-user
+runs are the box's alone and CI does not stand in for them. Its first runs
+caught two things the box could not (§5, gate 1).
 
 | §5 gate | state | how it was checked |
 |---|---|---|
@@ -456,8 +458,13 @@ behaviour is **under test in anchor**. That gate is this document's step 3.
 
 ### As it landed, 2026-10-20
 
-Each gate is its own commit on `feat/windows-m6`, in this order, and each
-was run on the Windows box before the next began. The branch merged as #33.
+The gates landed on `feat/windows-m6` in this order, each run on the
+Windows box before the next began: gate 1 `bab7432`, gate 2 `e1c51d0`,
+gate 3 `80d2e98`, gate 4 in three (`0134e38` the contract, `457ed11`,
+`fdd9645`), gate 5 `9511851`. Three fixes from the PR's CI runs followed
+(`6397968` and `c8398cc` change gate 2's and gate 4's tests; `09b3900`),
+so a gate's commit is where it landed, not where its test ends. The branch
+merged as #33.
 
 1. **The runner.** `.github/workflows/ci.yml`'s `windows` job. Before any
    port its steps failed on this box at `cargo clippy` — 39 compile errors —
@@ -638,5 +645,6 @@ differs. tokio's `ClientOptions` already opens at
 **§5 step 3 has fired.** `ConptyDsrProbe` and `pty_primitive_windows.rs`
 are under test here, with a tripwire against their silently not running,
 so teleport's transfer-not-delete hold on them can be released. Both keep
-their teleport provenance in their doc comments, and the negative knowledge in §1 is restated in the fixture file's module doc
-rather than left to be rediscovered.
+their teleport provenance in their doc comments, and the negative
+knowledge in §1 is restated in the fixture file's module doc rather than
+left to be rediscovered.

@@ -31,7 +31,9 @@ noticed. That is the entire pitch.
 in-process PTY layer (`use_anchor: false`, teleport `daemon/src/config.rs:140`,
 as of teleport `d7f34e9`), and flipping it is not yet scheduled. **M6 —
 Windows — is done**, merged 2026-10-20 (#33): every gate of it was run on
-a real Windows 11 box, and the Windows CI job is green on GitHub. anchord
+a real Windows 11 box, and the Windows CI job is green on GitHub. One
+part is unobserved: the autostart task registers and its watchdog runs,
+but its logon trigger has not been seen to fire. anchord
 serves a named pipe with an owner-only DACL, and hosts ConPTY sessions
 whose exit is observed exactly once with the code the child exited with
 ([docs/09-windows.md](docs/09-windows.md)).
