@@ -44,6 +44,24 @@ Four, not two. `read()`, `write()` and `wait()` block independently:
 `resize` and `terminate` share the control thread — both bounded, and
 `terminate`'s own bounded wait belongs there.
 
+**Every one of the six retires on an edge the child drives.** State the exit
+condition with the thread, because a thread whose only exit condition is "a
+sender dropped somewhere" has its lifetime set by whoever holds that sender,
+and that is how anchor#37 happened:
+
+| thread | retires when |
+|---|---|
+| reaper | `child.wait()` returns |
+| reader | EOF on the master |
+| control | `ChildExited`, or the terminate policy completing |
+| writer | the handle is released at step 7 of [Termination](#termination) |
+| `session-exit` | the one exit message arrives |
+| `session-eof` | the one EOF message arrives |
+
+The writer is the one with no edge of its own: `write_all` can block
+indefinitely by design, so it cannot poll a flag, and a child that died is not
+an event a blocked `recv` can see. Step 7 is what makes its row true.
+
 Threads reach async code only through channels. Reader → subscribers uses
 `try_send`, **never** `blocking_send`.
 
@@ -138,6 +156,26 @@ Policy:
 6. on the reaper's `wait()` returning: flush + fsync log, record
    `exited_at`, `exit_code`, emit `exit` to subscribers, close them. Reader
    EOF only closes subscribers; it records nothing ([02-model.md](02-model.md): EXITED fires off the reaper)
+7. **release the PTY handle.** Dropping it drops every sender the threads
+   are parked on, and they retire. The session holds no fd and no thread
+   from here ([02-model.md](02-model.md): `EXITED` and `LOST` hold nothing)
+
+**Step 7 is a step, not a consequence.** It runs in the same transition that
+writes `exit_code`, and it names no thread: whatever the layer holds at that
+moment is what it releases, so a fifth thread added later is covered by
+construction. Leaving release to ownership instead binds it to whoever drops
+the handle last — the *record*, which lives until `purge` and is
+caller-driven. That is anchor#37: three of the four threads retire on an edge
+the child drives, and the writer, whose only edge is `write_tx` dropping,
+outlived every session by design-by-accident. One orphaned thread and one
+`dup()` of a dead master each, until anchord hit `EMFILE` and every spawn
+began to fail.
+
+**A session that has exited rejects writes at the top and must hold nothing at
+the bottom.** Once the control thread sets the exited state, `PtySession::write`
+refuses every call, so the write channel is provably empty forever. A thread
+blocked on a channel nothing may ever send to is not idle, it is unreachable —
+and it was holding a file descriptor.
 
 **`portable-pty` 0.9's `kill()` is not a hard kill on Unix.** The
 `ChildKiller` handle sends only `SIGHUP`. A child ignoring HUP and TERM
