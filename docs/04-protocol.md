@@ -183,7 +183,11 @@ exactly like the daemon dying.
 
 `attach` takes a byte `from` offset and a `control` flag.
 
-- the daemon replies `{"id":8,"ok":true,"offset":N,"control":true|false}`
+- the daemon replies
+  `{"id":8,"ok":true,"offset":N,"control":true|false,"next_offset":M,"cols":120,"rows":40}`
+  — the whole of it, not a prefix. `next_offset` and the size are as
+  load-bearing as `control` and are described below; a client that learns the
+  shape from here and not from the prose would never ask for them.
 - it then **catches the client up** from `from` to the live head before
   registering it as a subscriber (see [03-pty.md](03-pty.md))
 - the connection then carries binary frames

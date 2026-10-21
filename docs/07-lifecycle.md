@@ -107,9 +107,9 @@ uninstall`) ends the process outright, as SIGKILL does.
 What it deliberately does **not** do:
 
 - **It does not unlink the socket.** The next daemon already probes a socket
-  file it finds and replaces it when nothing answers
-  ([04-protocol.md](04-protocol.md)); unlinking on the way out adds a second
-  path to the same outcome and a way to remove a file that is no longer ours.
+  file it finds and replaces it when nothing answers (the staleness probe in
+  `bind()`, `src/server.rs`); unlinking on the way out adds a second path to
+  the same outcome and a way to remove a file that is no longer ours.
 - **It does not mark sessions `lost`.** Startup does that, has to do it
   anyway for the crash case, and is the only place that decides what a live
   row means (see the bind-before-recovery note in `daemon.rs`).
