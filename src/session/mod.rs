@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
@@ -92,7 +92,18 @@ pub struct Session {
     pub spec: SpawnSpec,
     /// Caller-owned key/value. anchor never interprets a label.
     pub labels: Mutex<std::collections::BTreeMap<String, String>>,
-    pty: PtySession,
+    /// The live PTY, or `None` once the session has exited.
+    ///
+    /// `None` *is* "this session holds nothing": taking it drops `write_tx`
+    /// and `control_tx`, which is the edge the writer thread is parked on,
+    /// and the writer's `dup()` of the master closes with it
+    /// (docs/03-pty.md#termination step 7).
+    ///
+    /// Not a cache of the state — it is the resource itself, and the two are
+    /// the same fact. A session in `EXITED` or `LOST` holding a `Some` here
+    /// is the bug this type exists to make unrepresentable
+    /// (docs/02-model.md#two-lifetimes-and-only-one-of-them-is-the-record).
+    pty: Mutex<Option<PtySession>>,
     pid: Option<u32>,
     fanout: Arc<Mutex<Fanout>>,
     runtime: Mutex<Runtime>,
@@ -124,7 +135,11 @@ pub struct Session {
     /// Flushes the log without touching `fanout`. Deliberately not reached
     /// through that lock: an fsync held under the mutex the reader thread
     /// takes would stall the PTY behind disk latency.
-    sync: SyncHandle,
+    ///
+    /// `None` once released at EOF. Dropping it is the second half of
+    /// closing the log's descriptor — `OutputLog` owns the other
+    /// (docs/02-model.md).
+    sync: Mutex<Option<SyncHandle>>,
 }
 
 impl Session {
@@ -214,9 +229,13 @@ impl Session {
         (runtime.cols, runtime.rows)
     }
 
-    /// Writes input to the PTY. Rejected once the session is closing.
+    /// Writes input to the PTY. Rejected once the session is closing, and
+    /// once it has exited there is no PTY to write to.
     pub fn write(&self, bytes: &[u8]) -> Result<()> {
-        self.pty.write(bytes)
+        match self.pty.lock().as_ref() {
+            Some(pty) => pty.write(bytes),
+            None => bail!("session has exited; input rejected"),
+        }
     }
 
     /// Applies a new PTY size, coalesced to at most one per
@@ -294,7 +313,10 @@ impl Session {
 
     /// The size actually reaching the PTY.
     fn apply_resize(&self, cols: u16, rows: u16) -> Result<()> {
-        self.pty.resize(cols, rows)?;
+        match self.pty.lock().as_ref() {
+            Some(pty) => pty.resize(cols, rows)?,
+            None => bail!("session has exited; resize rejected"),
+        }
         {
             let mut runtime = self.runtime.lock();
             runtime.cols = cols;
@@ -331,14 +353,59 @@ impl Session {
                 runtime.state = State::Closing;
             }
         }
-        self.pty.terminate()
+        // Held across the policy's bounded wait on purpose. The only other
+        // taker is `release_pty`, and the exit listener cannot run it until
+        // the child has exited -- which is the same instant this returns, so
+        // the contention window is the handoff itself, not the 7s.
+        match self.pty.lock().as_ref() {
+            Some(pty) => pty.terminate(),
+            // Idempotent: nothing to terminate is not a failure to
+            // terminate it.
+            None => Ok(()),
+        }
+    }
+
+    /// Releases the PTY: step 7 of docs/03-pty.md#termination.
+    ///
+    /// Drops every sender the PTY threads are parked on, so they retire and
+    /// their file descriptors close. Called from the exit listener, in the
+    /// transition that records the final state -- release is a step there,
+    /// not a consequence of whoever drops the record last. Idempotent.
+    pub(crate) fn release_pty(&self) {
+        drop(self.pty.lock().take());
     }
 
     /// fsyncs the output log. Never called under the fan-out lock.
     pub fn sync_log(&self) {
-        if let Err(e) = self.sync.sync() {
+        let handle = self.sync.lock().clone();
+        // Already released at EOF, which syncs on its way out. Nothing is
+        // unflushed and there is nothing left to flush it with.
+        let Some(handle) = handle else { return };
+        if let Err(e) = handle.sync() {
             tracing::warn!(session = %self.id, error = %e, "fsync of the output log failed");
         }
+    }
+
+    /// Releases the output log's write handle: the log half of
+    /// docs/03-pty.md#termination step 7.
+    ///
+    /// Called from the EOF listener rather than the exit listener, and that
+    /// is the whole subtlety. Exit and EOF are independent signals — a
+    /// descendant that inherited the PTY can keep the master open long after
+    /// the child is reaped (docs/02-model.md) — so bytes may still arrive
+    /// after `EXITED`. EOF is where "no byte will ever follow" is actually
+    /// established, and therefore the only point at which giving up the
+    /// ability to append is free.
+    ///
+    /// fsyncs before releasing, so the tail is on disk rather than waiting
+    /// on a syncer tick that will now never find this log. Idempotent.
+    pub(crate) fn release_log_writer(&self) {
+        if let Some(handle) = self.sync.lock().take() {
+            if let Err(e) = handle.sync() {
+                tracing::warn!(session = %self.id, error = %e, "final fsync of the output log failed");
+            }
+        }
+        self.fanout.lock().log.close_writer();
     }
 
     /// Resolves once the session has exited. A late caller still sees it.
