@@ -47,6 +47,34 @@ writes never stayed rejected for 10s, so the pty writer thread never
 wedged and this test would prove nothing
 ```
 
+### What nothing asserts, nothing holds
+
+Before anchor#37 the suite had no assertion about a file descriptor or a
+thread anywhere in it. `grep -rn leak tests/` found three hits and all three
+meant a leaked *process*. So a session could retire holding an orphaned thread
+and a `dup()` of its dead child's master, every test stayed green, and the
+count climbed for three days until anchord hit its open-file ceiling and spawns
+started failing `EMFILE`.
+
+A resource invariant is only an invariant if something counts. The claim in
+[02-model.md](02-model.md) — `EXITED` and `LOST` hold nothing — is testable
+directly:
+
+```
+spawn N, let them exit, assert the fd and thread counts
+return to the pre-spawn baseline
+```
+
+**Do not purge first.** Purging is what used to mask it: dropping the record
+dropped the handle and the counts came back, so a test that purges before it
+counts asserts only that teardown happens *eventually*, which was never in
+doubt. The claim is that an exited session holds nothing *while still listed*,
+and the unpurged count is the only thing that can fail on it.
+
+Baseline-relative, never absolute: the number of threads a daemon runs at rest
+is an implementation detail, and pinning it writes a test that fails on
+unrelated work. The leak is a slope, so measure the slope.
+
 ## Wait on the condition, not on the clock
 
 Preconditions wait on the *condition*; assertions measure the thing they

@@ -88,6 +88,60 @@ that inherited the PTY can hold the master open long after the child is gone.
 These are two independent signals and conflating them is a known bug — see
 teleport `docs/15-open-questions.md#s2--eof-is-not-exit`.
 
+### Two lifetimes, and only one of them is the record
+
+Every state above is a statement about **what the daemon knows**. That axis is
+necessary and it is not sufficient: a daemon also **holds things** — a master
+fd, four OS threads, a `dup()` of that fd per thread that took one, an
+append-only log fd — and nothing above says when it stops holding them.
+
+So state it directly, because it is an invariant and not an implementation
+note:
+
+> **`RUNNING` and `CLOSING` hold a PTY. `EXITED` and `LOST` hold nothing.**
+> A session that is not running is resource-free by definition, whether or
+> not anyone has purged it.
+
+A session therefore has two lifetimes, and they end on different events:
+
+| | begins | ends | bounded by |
+|---|---|---|---|
+| **process lifetime** — PTY master, the four threads, the child | `spawn` | the reaper's `wait()` returns, or termination completes | the child |
+| **record lifetime** — id, labels, state, exit code, output log | `create` | `purge` | the caller, never |
+
+The record outliving the process is the whole point: `anchor ls` can still say
+how a session ended an hour later, and its log still replays. The process
+lifetime outliving the child is always a bug.
+
+**Release is a step, not a consequence.** It belongs to the transition into
+`EXITED`/`LOST` — the same critical section that writes `exit_code` — and not
+to whatever drops last. Leaving it to ownership binds it to the record's
+lifetime, which is unbounded and caller-driven, and the two have nothing to do
+with each other.
+
+Both halves of "holds nothing" were measured. Purging 75 stale records
+returned 56 ptmx fds **and** 56 log fds — one of each per session, because the
+log handle hangs off the record exactly as the PTY handle does. The log is
+append-only and its child is dead; nothing will ever write to it again. The
+invariant is deliberately about *resources*, not about the PTY, so a second
+handle added later is covered by the same sentence.
+
+This was not true until anchor#37. `PtySession` was a field on `Session`, so
+its `write_tx` lived until `purge`, so `writer_thread_main` never saw its
+channel close and never retired — one orphaned thread holding one `dup()` of a
+dead child's master, per session, for the life of the daemon. It cost ~119 fds
+across ~105 sessions and took anchord to its open-file ceiling — 256,
+launchd's default — where every subsequent spawn failed `EMFILE`. Three of the
+four PTY threads were already correct; they retire on an edge the child
+drives. The writer was wired to an edge the *caller* drives, and no second
+signal existed.
+
+The tell was in the API. `PtySession` carried a `state` atomic so `write`,
+`resize` and `terminate` could each check a flag and refuse — three call sites
+paying, on every call, to answer "is this handle still real?". A handle
+released at death needs no flag: absence carries it structurally. **A liveness
+flag on a handle is evidence the handle outlives its own validity.**
+
 ## Storage
 
 SQLite, WAL, single writer. `$XDG_DATA_HOME/anchor/anchor.db`.
