@@ -92,8 +92,8 @@ teleport `docs/15-open-questions.md#s2--eof-is-not-exit`.
 
 Every state above is a statement about **what the daemon knows**. That axis is
 necessary and it is not sufficient: a daemon also **holds things** — a master
-fd, four OS threads, a `dup()` of that fd per thread that took one — and
-nothing above says when it stops holding them.
+fd, four OS threads, a `dup()` of that fd per thread that took one, an
+append-only log fd — and nothing above says when it stops holding them.
 
 So state it directly, because it is an invariant and not an implementation
 note:
@@ -118,6 +118,13 @@ lifetime outliving the child is always a bug.
 to whatever drops last. Leaving it to ownership binds it to the record's
 lifetime, which is unbounded and caller-driven, and the two have nothing to do
 with each other.
+
+Both halves of "holds nothing" were measured. Purging 75 stale records
+returned 56 ptmx fds **and** 56 log fds — one of each per session, because the
+log handle hangs off the record exactly as the PTY handle does. The log is
+append-only and its child is dead; nothing will ever write to it again. The
+invariant is deliberately about *resources*, not about the PTY, so a second
+handle added later is covered by the same sentence.
 
 This was not true until anchor#37. `PtySession` was a field on `Session`, so
 its `write_tx` lived until `purge`, so `writer_thread_main` never saw its
