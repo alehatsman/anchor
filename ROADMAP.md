@@ -126,9 +126,11 @@ until Windows has an anchord it is a deletion teleport cannot afford.
 
 ## M6 — Windows, so teleport can rely on anchor everywhere ✅
 
-> **Done 2026-10-20, merged as #33.** All five steps landed in order, one
-> commit each, every one run on a real Windows 11 Pro box (build 26200) as
-> a standard user before the next began:
+> **Done 2026-10-20, merged as #33.** All five steps landed in order,
+> every one run on a real Windows 11 Pro box (build 26200) as a standard
+> user before the next began — seven commits, step 4 taking three, then
+> three fixes from the PR's CI runs
+> ([09-windows.md §5](docs/09-windows.md)):
 >
 > 1. the `windows` CI job — red before the port (39 compile errors) when
 >    its steps were run on that box; on GitHub it went red twice on the PR
