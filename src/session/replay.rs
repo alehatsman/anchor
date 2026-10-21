@@ -293,7 +293,10 @@ impl Replay {
 pub enum AttachError {
     /// The client holds an offset the daemon never handed out -- a purged
     /// log, or a stale client after a `lost` session. Rendered on the wire as
-    /// the `offset_ahead` error (docs/04-protocol.md).
+    /// `invalid_spec` (docs/04-protocol.md): the request parsed and its
+    /// contents are wrong, which is what that code means. On the control
+    /// path `attach_check` (`src/server.rs`) makes the same refusal before
+    /// this variant is ever constructed.
     #[error("requested offset {requested} is ahead of next_offset {next_offset}")]
     OffsetAhead {
         /// The offset the client asked to resume from.
@@ -308,7 +311,8 @@ pub enum AttachError {
     /// A `read_range` call failed partway through catch-up -- history-round
     /// or the final post-registration stretch alike. Distinct from `Open` so
     /// an incident doesn't read a mid-walk read failure as though the
-    /// initial open never succeeded (issue #1 finding 4).
+    /// initial open never succeeded. Pinned by
+    /// `open_and_read_failures_report_distinct_messages`.
     ///
     /// `offset` is where this round was about to read from -- nothing at or
     /// past it was served. The `Replay` itself is gone (a transient failure
@@ -316,7 +320,8 @@ pub enum AttachError {
     /// along with the error, same as any other `?`), but `offset` is
     /// everything `Session::attach` needs to pick the walk back up: a fresh
     /// `attach(offset)` resumes exactly where this one left off, replaying
-    /// nothing twice, losing nothing before it (issue #1 finding 6). A
+    /// nothing twice, losing nothing before it. Pinned by
+    /// `read_failure_carries_the_offset_to_resume_at`. A
     /// caller that already tracks how much it has written could derive this
     /// itself from prior rounds, but only for a round that isn't the first;
     /// carrying it here means that isn't a special case.
@@ -513,7 +518,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Issue #1 finding 5: `HistoryReplay::written` is the only way to reach
+    /// The write-before-the-next-round rule, enforced rather than asked for:
+    /// `HistoryReplay::written` is the only way to reach
     /// the next `ReplayStep`, and it takes this round's bytes as an
     /// argument rather than being reachable off bare `self` -- so a caller
     /// that tries to advance without holding the right bytes (a pre-fetch,
@@ -557,7 +563,7 @@ mod tests {
         );
     }
 
-    /// Issue #1 finding 4: `Open` (the initial `fanout.log.reader()` call)
+    /// `Open` (the initial `fanout.log.reader()` call)
     /// and `Read` (any `read_range` during catch-up) must stay distinct. As
     /// one variant with the open case's message, a read failure several
     /// rounds into a large backlog read as though the log had never opened
@@ -579,7 +585,7 @@ mod tests {
         assert_ne!(open, read);
     }
 
-    /// Issue #1 finding 6: `AttachError::Read` carries the offset to resume
+    /// `AttachError::Read` carries the offset to resume
     /// at, so recovery does not depend on the caller having kept count --
     /// which it cannot have done on the very first round, where there is no
     /// prior successful round to derive an offset from. Pins the message

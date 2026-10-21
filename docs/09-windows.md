@@ -124,12 +124,17 @@ around the bind, then an explicit `set_permissions(0o600)`. The data directory i
 transcripts, credentials included (`Paths::ensure_dirs`).
 
 **A named pipe has no 0600.** Windows access control is a DACL on the pipe
-object, and anchor would be acquiring an access-control model for the first
-time — something it has so far been able to *decline* to have. That is a
-scope change, not a port, and §7 asks it as a question rather than answering
-it here.
+object, so anchor had to acquire an access-control model for the first time —
+something it had so far been able to *decline* to have. That was a scope
+change rather than a port, which is why it gated everything else here.
 
-Everything else in this spec is contingent on that answer.
+**Decided 2026-10-19, and shipped: option (a), an explicit owner-only DACL**
+— the pipe is created granting the creating user's SID and nothing else
+(`src/winsec.rs`, `src/server.rs`). The model it acquires is the one it
+already had: the OS enforces access and anchor still does not authenticate.
+`0600` and an owner-only DACL are the same sentence in two kernels'
+vocabularies, which is why this was preferred over a token check. §7 carries
+the question, the options weighed, and why this one won.
 
 ## 3. Interfaces
 
@@ -199,7 +204,10 @@ No environment variable moves it. Unix needs `XDG_RUNTIME_DIR` because a
 socket is a file and has to live somewhere writable; a pipe has no
 directory. `--socket` keeps its meaning on Windows as "the endpoint", takes
 a full `\\.\pipe\…` path, and refuses anything else — a filesystem path
-there would be a mistake, not a choice.
+there would be a mistake, not a choice. Both the name and that `--socket`
+meaning were settled with the rest of §7's Q1 and are implemented:
+`Paths::resolve` builds the name (`src/paths.rs`) and `bind` rejects
+anything without the `\\.\pipe\` prefix (`src/server.rs`).
 
 **Server identity is the pipe's owner.** anchord writes its own user SID as
 the owner of the pipe's security descriptor; the client reads the owner off
