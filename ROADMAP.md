@@ -187,10 +187,11 @@ Step 3 before step 4 is deliberate: the PTY layer carries the invariant that
 an exit is observed exactly once, and it gets defended before breadth is
 piled on top of it.
 
-Exit: **anchord hosts a session on Windows with the same guarantees it makes
-on Unix** — above all that an exit is observed exactly once and reported
-accurately. Then, and only then, teleport's in-process PTY layer becomes
-deletable rather than Unix-only-deletable (#16).
+Exit, met: **anchord hosts a session on Windows with the same guarantees it
+makes on Unix** — above all that an exit is observed exactly once and
+reported accurately. anchor's half of the condition on teleport's in-process
+PTY layer is therefore satisfied; that deletion becomes a removal rather than
+a Unix-only deletion once teleport lifts its own `unix` gate (#16).
 
 Risk retired, and it was a different shape from M1's. The hard part was
 free going in: ConPTY exit detection was already solved and proven on real
