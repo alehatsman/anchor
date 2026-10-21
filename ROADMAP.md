@@ -124,7 +124,7 @@ until Windows has an anchord it is a deletion teleport cannot afford.
 
 ---
 
-## M6 — Windows, so teleport can rely on anchor everywhere
+## M6 — Windows, so teleport can rely on anchor everywhere ✅
 
 > **Done 2026-10-20, merged as #33.** All five steps landed in order, one
 > commit each, every one run on a real Windows 11 Pro box (build 26200) as
@@ -158,10 +158,10 @@ until Windows has an anchord it is a deletion teleport cannot afford.
 > teleport's side: lifting its `unix` gate and the in-process deletion.
 > Detail and evidence: [docs/09-windows.md](docs/09-windows.md).
 
-Scheduled 2026-10-19, reversing the deferral of 2026-10-16. The costing is
-[docs/09-windows.md](docs/09-windows.md); both of its §7 questions are now
-answered — anchord acquires an **owner-only DACL** on the named pipe rather
-than a token, and Windows is in scope.
+Scheduled 2026-10-19, reversing the deferral of 2026-10-16. The costing was
+[docs/09-windows.md](docs/09-windows.md); both of its §7 questions were
+answered the day it was scheduled — anchord takes an **owner-only DACL** on
+the named pipe rather than a token, and Windows is in scope.
 
 Why it came back: teleport is to rely on anchor fully, on every platform it
 ships. While anchord is Unix-only, teleport's in-process PTY layer can never
@@ -192,13 +192,20 @@ on Unix** — above all that an exit is observed exactly once and reported
 accurately. Then, and only then, teleport's in-process PTY layer becomes
 deletable rather than Unix-only-deletable (#16).
 
-Risk retired, and it is a different shape from M1's. The hard part is
-already free: ConPTY exit detection is solved and proven on real Windows in
-teleport. What is unproven is breadth — the transport has **no prior art in
-either repo**, and anchor acquires an access-control model it has so far
-been able to decline to have. A Windows build where exits are unreliable is
-worse than no Windows build, which is why step 1 is a runner and step 3 is
-a tripwire rather than a count.
+Risk retired, and it was a different shape from M1's. The hard part was
+free going in: ConPTY exit detection was already solved and proven on real
+Windows in teleport. The risk was breadth — the transport had **no prior art
+in either repo**, and anchor was taking on an access-control model it had so
+far been able to decline to have. A Windows build where exits are unreliable
+is worse than no Windows build, which is why step 1 was a runner and step 3 a
+tripwire rather than a count.
+
+Both halves of that breadth are now built and under test. The named pipe and
+its owner-only DACL live in `src/server.rs`, `src/client.rs` and
+`src/winsec.rs`; `tests/windows_transport.rs` covers them by asking the
+kernel for the SDDL it holds rather than the string the descriptor was built
+from, so the access-control claim is checked against the OS and not against
+itself.
 
 ---
 
@@ -222,5 +229,5 @@ M2  labels      ← the new capability
 M3  protocol    ← the surface
 M4  teleport    ← proof against a real consumer
 M5  payoff      ← demonstrated behind use_anchor=true; the default flip is not done
-M6  windows     ← the last platform teleport cannot yet hand over
+M6  windows     ← done; the handover now waits on teleport's unix gate
 ```
